@@ -36,6 +36,7 @@ from safetensors.torch import save_file
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
+from verl.workers.rollout.async_server import TokenOutput
 
 try:
     # for torch 2.5+
@@ -1845,6 +1846,25 @@ class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
         sampling_params: dict[str, Any],
         request_id: str,
         image_data: Optional[list[Any]] = None,
-    ) -> list[int]:
+    ) -> TokenOutput:
         ret = await self.rollout.generate(prompt_ids, sampling_params, request_id, image_data=image_data)
         return ret
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
+    async def abort_request(self, request_id: str) -> list[int]:
+        ret = await self.rollout.abort_request(request_id)
+        return ret
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    async def wake_up(self):
+        if self.config.rollout.free_cache_engine:
+            await self.rollout.wake_up()
+        # return something to block the caller
+        return True
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    async def sleep(self):
+        if self.config.rollout.free_cache_engine:
+            await self.rollout.sleep()
+        # return something to block the caller
+        return True

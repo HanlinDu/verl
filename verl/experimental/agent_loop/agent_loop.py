@@ -32,6 +32,7 @@ from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
+from verl.experimental.agent_loop.utils import AgentLoopOutput, agent_loop_perf, agent_loop_postprocess
 from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayWorkerGroup
 from verl.trainer.ppo.reward import load_reward_manager
@@ -111,6 +112,7 @@ class AsyncLLMServerManager:
         return output
 
 
+# NOTE to DHL: 这里不挪到 utils 中是否也没问题？
 class AgentLoopMetrics(BaseModel):
     """Agent loop performance metrics."""
 
@@ -372,6 +374,28 @@ class RewardManagerWorker:
             data = data.union(res)
 
         return self.reward_manager(data, return_dict)
+
+
+# NOTE to DHL: 疑似 deprecated
+def get_registry_keys():
+    """Get agent loop registry keys.
+
+    Returns:
+        List[str]: agent loop registry keys.
+    """
+    return _agent_loop_registry.keys()
+
+
+def get_registry_detail(key):
+    """Get agent loop config.
+
+    Args:
+        key (str): agent loop name.
+
+    Returns:
+        DictConfig: agent loop config.
+    """
+    return _agent_loop_registry[key]
 
 
 @ray.remote
@@ -872,32 +896,10 @@ class AgentLoopManager:
 
         # calculate performance metrics
         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
-        timing = self._performance_metrics(metrics, output)
+        timing = agent_loop_perf(metrics, output)
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
         return output
-
-    def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
-        timing = {}
-        t_generate_sequences = np.array([metric["generate_sequences"] for chunk in metrics for metric in chunk])
-        t_tool_calls = np.array([metric["tool_calls"] for chunk in metrics for metric in chunk])
-        timing["agent_loop/generate_sequences/min"] = t_generate_sequences.min()
-        timing["agent_loop/generate_sequences/max"] = t_generate_sequences.max()
-        timing["agent_loop/generate_sequences/mean"] = t_generate_sequences.mean()
-        timing["agent_loop/tool_calls/min"] = t_tool_calls.min()
-        timing["agent_loop/tool_calls/max"] = t_tool_calls.max()
-        timing["agent_loop/tool_calls/mean"] = t_tool_calls.mean()
-
-        # batch sequence generation is bounded by the slowest sample
-        slowest = np.argmax(t_generate_sequences + t_tool_calls)
-        attention_mask = output.batch["attention_mask"][slowest]
-        prompt_length = output.batch["prompts"].shape[1]
-        timing["agent_loop/slowest/generate_sequences"] = t_generate_sequences[slowest]
-        timing["agent_loop/slowest/tool_calls"] = t_tool_calls[slowest]
-        timing["agent_loop/slowest/prompt_length"] = attention_mask[:prompt_length].sum().item()
-        timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
-
-        return timing
 
     def wake_up(self):
         """Wake up all rollout server instances."""
