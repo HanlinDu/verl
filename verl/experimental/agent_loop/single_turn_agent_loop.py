@@ -33,34 +33,42 @@ class SingleTurnAgentLoop(AgentLoopBase):
         self.response_length = self.config.actor_rollout_ref.rollout.response_length
         self.apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
 
-    async def run(
-        self, messages: list[dict[str, Any]], sampling_params: dict[str, Any], token_ids: list[int]
-    ) -> AgentLoopOutput:
-        # NOTE to DHL: 这里改成了显式传入 messages, token_ids, 但后面的 commit 又改回来了
-    # async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
-        # messages = list(kwargs["raw_prompt"])
+    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+        messages = list(kwargs["raw_prompt"])
+        token_ids = kwargs.get("token_ids", None)
+        partial_rollout = False
+        prompt_token_ids = kwargs.get("prompt_token_ids", None)
 
         metrics = {}
         request_id = uuid4().hex
-
-        if token_ids:
-            prompt_ids = token_ids
-        else:
-            prompt_ids = await self.loop.run_in_executor(
-                None, 
-                lambda: self.tokenizer.apply_chat_template(
-                    messages, add_generation_prompt=True, tokenize=True, **self.apply_chat_template_kwargs
-                )
+        prompt_token_ids = await self.loop.run_in_executor(
+            None,
+            lambda: self.tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=True, sampling_params=sampling_params
             )
+        )
+        if token_ids:
+            # partial rollout case:
+            prompt_ids = prompt_token_ids + token_ids
+            partial_rollout = True
+        else:
+            prompt_ids = prompt_token_ids
 
         with simple_timer("generate_sequences", metrics):
             # NOTE to DHL: genrate 的返回值变了，但需要确认是否还包括 interrupted
+            # NOTE to DHL: interrupted 在 partial 的 commit 中不需要了，直接用 abort 接口
             # response_ids, interrupted = await self.server_manager.generate(
             token_output = await self.server_manager.generate(    
                 request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params
             )
-            interrupted = token_output.interrupted
-        response_mask = [1] * len(token_output.token_ids)
+        response_ids = token_output.token_ids
+        if partial_rollout:
+            # NOTE to DHL: 此处的 bug 已经 fixed，后续合并时注意
+            original_prompt_len = len(prompt_ids) - len(token_ids)
+            response_ids = prompt_ids[original_prompt_len :] + response_ids
+            # prompt as original
+            prompt_ids = prompt_ids[: original_prompt_len]
+        response_mask = [1] * len(response_ids)
 
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
@@ -70,6 +78,5 @@ class SingleTurnAgentLoop(AgentLoopBase):
             multi_modal_data={},
             num_turns=2,
             metrics=metrics,
-            interrupt=interrupted,
         )
         return output

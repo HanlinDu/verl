@@ -282,7 +282,8 @@ class AsyncvLLMServer(AsyncServerBase):
             max_model_len=self.max_model_len,
             max_num_seqs=config.max_num_seqs,
             load_format="dummy" if config.load_format.startswith("dummy") else config.load_format,
-            disable_log_stats=config.disable_log_stats,
+            disable_log_stats=False,
+            # disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=True,
@@ -337,7 +338,6 @@ class AsyncvLLMServer(AsyncServerBase):
 
         return vllm_config
 
-    @with_cancellation
     async def chat_completion(self, raw_request: Request):
         """OpenAI-compatible HTTP endpoint.
 
