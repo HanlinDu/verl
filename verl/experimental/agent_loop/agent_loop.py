@@ -28,11 +28,10 @@ import ray
 import torch
 from cachetools import LRUCache
 from omegaconf import DictConfig, OmegaConf
-from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
-from verl.experimental.agent_loop.utils import AgentLoopOutput, agent_loop_perf, agent_loop_postprocess
+from verl.experimental.agent_loop.utils import AgentLoopOutput, _InternalAgentLoopOutput, agent_loop_perf
 from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayWorkerGroup
 from verl.trainer.ppo.reward import load_reward_manager
