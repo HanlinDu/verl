@@ -37,7 +37,6 @@ class SingleTurnAgentLoop(AgentLoopBase):
         messages = list(kwargs["raw_prompt"])
         token_ids = kwargs.get("token_ids", None)
         partial_rollout = False
-        prompt_token_ids = kwargs.get("prompt_token_ids", None)
 
         metrics = {}
         request_id = uuid4().hex
@@ -49,10 +48,8 @@ class SingleTurnAgentLoop(AgentLoopBase):
         )
         if token_ids:
             # partial rollout case:
-            prompt_ids = prompt_token_ids + token_ids
+            prompt_ids = prompt_ids + token_ids
             partial_rollout = True
-        else:
-            prompt_ids = prompt_token_ids
 
         with simple_timer("generate_sequences", metrics):
             # NOTE to DHL: genrate 的返回值变了，但需要确认是否还包括 interrupted
