@@ -34,7 +34,7 @@ from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.experimental.one_step_off_policy.utils import need_critic
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
-from verl.single_controller.ray.base import create_colocated_worker_cls
+from verl.single_controller.ray.base import create_colocated_worker_cls, split_resource_pool
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics
@@ -112,6 +112,11 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
         self.validation_generations_logger = ValidationGenerationsLogger()
+        # Track active worker groups per role for dynamic switching.
+        self.role_groups: dict[Role, dict[str, RayWorkerGroup]] = {
+            Role.Actor: {},
+            Role.Rollout: {},
+        }
 
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
         if lora_rank <= 0:
@@ -194,14 +199,14 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
             self.resource_pool_to_cls[resource_pool][str(Role.RewardModel)] = rm_cls
 
-    def _init_worker_groups(self):
-        # initialize WorkerGroup
-        # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
-        # you should not use `create_colocated_worker_cls`.
-        # Instead, directly pass different resource pool to different worker groups.
-        # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
-        all_wg = {}
-        wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
+    def _get_detached_workers_cfg(self) -> dict | None:
+        cfg = OmegaConf.select(self.config.trainer, "detached_workers")
+        if cfg is None:
+            return None
+        return OmegaConf.to_container(cfg, resolve=True)
+
+    def _get_worker_group_kwargs(self) -> dict:
+        wg_kwargs = {}
         if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
             wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
         if OmegaConf.select(self.config.global_profiler, "steps") is not None:
@@ -216,16 +221,64 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                     OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
                 )
         wg_kwargs["device_name"] = self.device_name
+        return wg_kwargs
 
-        for resource_pool, class_dict in self.resource_pool_to_cls.items():
-            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
-            wg_dict = self.ray_worker_group_cls(
-                resource_pool=resource_pool,
-                ray_cls_with_init=worker_dict_cls,
-                **wg_kwargs,
-            )
-            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
-            all_wg.update(spawn_wg)
+    def _init_worker_groups(self):
+        detached_cfg = self._get_detached_workers_cfg()
+
+        # initialize WorkerGroup
+        # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
+        # you should not use `create_colocated_worker_cls`.
+        # Instead, directly pass different resource pool to different worker groups.
+        # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
+        all_wg = {}
+        wg_kwargs = self._get_worker_group_kwargs()
+
+        # detached ray workers
+        if detached_cfg and detached_cfg.get("enable"):
+            name_prefix = detached_cfg.get("name_prefix", "verl_detached_")
+            attach_only = detached_cfg.get("attach_only", False)
+            worker_names_map = detached_cfg.get("worker_names", {}) or {}
+
+            pool_name_map = {pool: name for name, pool in self.resource_pool_manager.resource_pool_dict.items()}
+
+            for resource_pool, class_dict in self.resource_pool_to_cls.items():
+                worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+                pool_name = pool_name_map.get(resource_pool, "default")
+                pool_worker_names = worker_names_map.get(pool_name)
+
+                if pool_worker_names:
+                    wg_dict = self.ray_worker_group_cls.from_detached(
+                        name_prefix=name_prefix,
+                        worker_names=pool_worker_names,
+                        ray_cls_with_init=worker_dict_cls,
+                        **wg_kwargs,
+                    )
+                else:
+                    if attach_only:
+                        raise ValueError(
+                            f"detached_workers.attach_only is True but worker_names missing for pool '{pool_name}'"
+                        )
+                    wg_dict = self.ray_worker_group_cls(
+                        resource_pool=resource_pool,
+                        ray_cls_with_init=worker_dict_cls,
+                        name_prefix=name_prefix,
+                        detached=True,
+                        **wg_kwargs,
+                    )
+                spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+                all_wg.update(spawn_wg)
+        # normal ray workers
+        else:
+            for resource_pool, class_dict in self.resource_pool_to_cls.items():
+                worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+                wg_dict = self.ray_worker_group_cls(
+                    resource_pool=resource_pool,
+                    ray_cls_with_init=worker_dict_cls,
+                    **wg_kwargs,
+                )
+                spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+                all_wg.update(spawn_wg)
         self.all_wg = all_wg
 
     def _init_models(self):
@@ -247,9 +300,130 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self.actor_wg.init_model()
         self.rollout_wg.init_model()
         self.actor_rollout_wg = self.actor_wg
+        # Register the initial groups as the default targets.
+        self.role_groups[Role.Actor] = {"primary": self.actor_wg}
+        self.role_groups[Role.Rollout] = {"primary": self.rollout_wg}
         weights_info = self.actor_wg.get_actor_weights_info()[0]
         self.rollout_wg.set_actor_weights_info(weights_info)
         self._create_weight_sync_group()
+
+    def _build_role_group(
+        self,
+        role: Role,
+        *,
+        resource_pool=None,
+        name_prefix: str | None = None,
+        detached: bool = False,
+    ) -> RayWorkerGroup:
+        # Build a single-role group to keep dynamic add/switch logic reusable.
+        resource_pool = resource_pool or self.resource_pool_manager.get_resource_pool(role)
+        role_cls = RayClassWithInitArgs(
+            cls=self.role_worker_mapping[role],
+            config=self.config.actor_rollout_ref,
+            role=str(role),
+        )
+        worker_dict_cls = create_colocated_worker_cls(class_dict={str(role): role_cls})
+        wg_dict = self.ray_worker_group_cls(
+            resource_pool=resource_pool,
+            ray_cls_with_init=worker_dict_cls,
+            name_prefix=name_prefix,
+            detached=detached,
+            **self._get_worker_group_kwargs(),
+        )
+        return wg_dict.spawn(prefix_set=[str(role)])[str(role)]
+
+    def add_role_group(
+        self,
+        role: Role,
+        *,
+        name: str | None = None,
+        resource_pool=None,
+        detached: bool = False,
+        name_prefix: str | None = None,
+    ) -> RayWorkerGroup:
+        role_wg = self._build_role_group(
+            role,
+            resource_pool=resource_pool,
+            name_prefix=name_prefix,
+            detached=detached,
+        )
+        role_wg.init_model()
+        group_map = self.role_groups.setdefault(role, {})
+        group_name = name or f"{role.value.lower()}_group_{len(group_map)}"
+        group_map[group_name] = role_wg
+        return role_wg
+
+    def switch_role_group(
+        self,
+        role: Role,
+        role_wg: RayWorkerGroup,
+        *,
+        resume_from_path: str | None = None,
+        release_old: bool = False,
+    ) -> None:
+        # Switch the active group and sync weights/manager as needed.
+        if role == Role.Actor:
+            old_wg = self.actor_wg
+            if resume_from_path is not None:
+                role_wg.load_checkpoint(
+                    resume_from_path,
+                    del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
+                )
+            else:
+                weights_info = old_wg.get_actor_weights_info()[0]
+                role_wg.set_actor_weights_info(weights_info)
+
+            self.actor_wg = role_wg
+            self.actor_rollout_wg = role_wg
+            weights_info = role_wg.get_actor_weights_info()[0]
+            self.rollout_wg.set_actor_weights_info(weights_info)
+
+        elif role == Role.Rollout:
+            old_wg = self.rollout_wg
+            if resume_from_path is not None:
+                print("Warning: rollout group does not support checkpoint restore; ignoring resume_from_path")
+            weights_info = self.actor_wg.get_actor_weights_info()[0]
+            role_wg.set_actor_weights_info(weights_info)
+            self.rollout_wg = role_wg
+            # Rollout manager must be rebuilt to bind the new rollout workers.
+            self._init_async_rollout_manager()
+
+        else:
+            raise ValueError(f"Unsupported role for switch: {role}")
+
+        self._create_weight_sync_group()
+
+        if release_old:
+            self.remove_role_group(role, old_wg)
+
+    def remove_role_group(self, role: Role, role_wg: RayWorkerGroup) -> None:
+        for group_name, group in list(self.role_groups.get(role, {}).items()):
+            if group is role_wg:
+                self.role_groups[role].pop(group_name)
+                break
+        for worker in role_wg.workers:
+            try:
+                ray.kill(worker)
+            except Exception as exc:  # pragma: no cover - best effort cleanup
+                print(f"Warning: failed to kill {role} worker {worker}: {exc}")
+
+    def add_actor_group(self, **kwargs) -> RayWorkerGroup:
+        return self.add_role_group(Role.Actor, **kwargs)
+
+    def switch_actor_group(self, actor_wg: RayWorkerGroup, **kwargs) -> None:
+        return self.switch_role_group(Role.Actor, actor_wg, **kwargs)
+
+    def remove_actor_group(self, actor_wg: RayWorkerGroup) -> None:
+        return self.remove_role_group(Role.Actor, actor_wg)
+
+    def add_rollout_group(self, **kwargs) -> RayWorkerGroup:
+        return self.add_role_group(Role.Rollout, **kwargs)
+
+    def switch_rollout_group(self, rollout_wg: RayWorkerGroup, **kwargs) -> None:
+        return self.switch_role_group(Role.Rollout, rollout_wg, **kwargs)
+
+    def remove_rollout_group(self, rollout_wg: RayWorkerGroup) -> None:
+        return self.remove_role_group(Role.Rollout, rollout_wg)
 
     def _create_weight_sync_group(self):
         from verl.utils.device import get_nccl_backend
@@ -299,6 +473,100 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self.async_rollout_manager = OneStepOffAgentLoopManager(
             config=self.config, worker_group=self.rollout_wg, rm_resource_pool=rm_resource_pool
         )
+
+    def _resolve_role_pool(self, role: Role, pool_spec: dict | None):
+        if not pool_spec:
+            return None
+
+        mode = pool_spec.get("mode", "pool")
+        if mode == "pool":
+            # Directly pick a named pool (or the role default if name is omitted).
+            pool_name = pool_spec.get("name")
+            if pool_name is None:
+                return self.resource_pool_manager.get_resource_pool(role)
+            return self.resource_pool_manager.resource_pool_dict[pool_name]
+
+        if mode == "split":
+            # Split a base pool into sub-pools and select one by index.
+            split_size = pool_spec.get("size")
+            split_index = pool_spec.get("index", 0)
+            # NOTE: split only partitions the base pool's existing world_size.
+            # To switch from 4/4 -> 6/2, base_pool must be an 8-GPU pool
+            # (e.g., shared_pool). Splitting a 4-GPU pool can never yield 6.
+            base_pool_name = pool_spec.get("from_pool")
+            if base_pool_name is not None:
+                base_pool = self.resource_pool_manager.resource_pool_dict[base_pool_name]
+            else:
+                base_role = pool_spec.get("from_role", role)
+                if isinstance(base_role, str):
+                    base_role = Role[base_role]
+                base_pool = self.resource_pool_manager.get_resource_pool(base_role)
+            assert not (base_pool_name == "shared_pool" and isinstance(split_size, list)) or sum(split_size) == base_pool.world_size, (
+                f"shared_pool world_size {base_pool.world_size} != sum(split_plan) {sum(split_size)}"
+            )
+            sub_pools = split_resource_pool(base_pool, split_size)
+            if split_index >= len(sub_pools):
+                raise IndexError(f"split index {split_index} out of range for {len(sub_pools)} sub-pools")
+            return sub_pools[split_index]
+
+        raise ValueError(f"Unsupported pool spec mode: {mode}")
+
+    def _maybe_dynamic_resize(self):
+        # Execute scheduled resize steps driven by config.trainer.dynamic_resize.
+        # Example schedule item:
+        #   - step: 1000
+        #     actor_pool: {mode: split, size: [4,4], index: 0}
+        #     rollout_pool: {mode: split, size: [4,4], index: 1}
+        #     release_old: true
+        cfg = OmegaConf.select(self.config.trainer, "dynamic_resize")
+        if cfg is None:
+            return
+        cfg = OmegaConf.to_container(cfg, resolve=True)
+        if not cfg.get("enable", True):
+            return
+        schedule = cfg.get("schedule", []) or []
+
+        # FIXME(HanlinDu): this looped check seems heavy and unnecessary to do at every step
+        for item in schedule:
+            if item.get("step") != self.global_steps:
+                continue
+
+            actor_spec = item.get("actor_pool")
+            rollout_spec = item.get("rollout_pool")
+            release_old = item.get("release_old", True)
+            detached = item.get("detached", False)
+            actor_resume_path = item.get("actor_resume_from_path")
+
+            actor_pool = self._resolve_role_pool(Role.Actor, actor_spec)
+            rollout_pool = self._resolve_role_pool(Role.Rollout, rollout_spec)
+
+            new_actor = self.add_role_group(
+                Role.Actor,
+                name=item.get("actor_group_name"),
+                resource_pool=actor_pool,
+                detached=detached,
+                name_prefix=item.get("name_prefix"),
+            )
+            new_rollout = self.add_role_group(
+                Role.Rollout,
+                name=item.get("rollout_group_name"),
+                resource_pool=rollout_pool,
+                detached=detached,
+                name_prefix=item.get("name_prefix"),
+            )
+
+            self.switch_role_group(
+                Role.Actor,
+                new_actor,
+                resume_from_path=actor_resume_path,
+                release_old=release_old,
+            )
+            self.switch_role_group(
+                Role.Rollout,
+                new_rollout,
+                release_old=release_old,
+            )
+
 
     def _post_load_checkpoint_for_switch(self) -> None:
         self.sync_rollout_weights()
@@ -708,6 +976,10 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                     print("Force saving checkpoint: ESI instance expiration approaching.")
                 with marked_timer("save_checkpoint", timing_raw, color="green"):
                     self._save_checkpoint()
+
+            # dynamic resize of actor/rollout pool
+            # NOTE(HanlinDu): this may be executed asynchronously with _save_checkpoint()
+            self._maybe_dynamic_resize()
 
             with marked_timer("stop_profile", timing_raw):
                 next_step_profile = (
