@@ -19,6 +19,7 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 import asyncio
 import os
 import socket
+from copy import deepcopy
 
 import hydra
 import ray
@@ -70,6 +71,41 @@ def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
         mapping[Role.Rollout] = "rollout_pool"
 
     return ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+
+
+def switch_to_new_resource_pool(
+    trainer: OneStepOffRayTrainer,
+    config,
+    role_worker_mapping: dict,
+    ray_worker_group_cls,
+    *,
+    trainer_n_gpus_per_node: int | None = None,
+    trainer_nnodes: int | None = None,
+    rollout_n_gpus_per_node: int | None = None,
+    rollout_nnodes: int | None = None,
+    release_old: bool = True,
+):
+    """Switch to a new placement group with updated resource pool sizes.
+
+    This saves a checkpoint, rebuilds a new resource pool, restores state,
+    and optionally releases the old PG.
+    """
+    new_config = deepcopy(config)
+    if trainer_n_gpus_per_node is not None:
+        new_config.trainer.n_gpus_per_node = trainer_n_gpus_per_node
+    if trainer_nnodes is not None:
+        new_config.trainer.nnodes = trainer_nnodes
+    if rollout_n_gpus_per_node is not None:
+        new_config.rollout.n_gpus_per_node = rollout_n_gpus_per_node
+    if rollout_nnodes is not None:
+        new_config.rollout.nnodes = rollout_nnodes
+
+    new_resource_pool_manager = create_resource_pool_manager(new_config, role_worker_mapping.keys())
+    return trainer.switch_resource_pool(
+        new_resource_pool_manager,
+        new_config=new_config,
+        release_old=release_old,
+    )
 
 
 def create_role_worker_mapping(config):

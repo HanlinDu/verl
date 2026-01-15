@@ -300,6 +300,11 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             config=self.config, worker_group=self.rollout_wg, rm_resource_pool=rm_resource_pool
         )
 
+    def _post_load_checkpoint_for_switch(self) -> None:
+        self.sync_rollout_weights()
+        if self.async_rollout_manager is not None:
+            asyncio.run(self.async_rollout_manager.clear_kv_cache())
+
     def sync_rollout_weights(self):
         self.actor_wg.sync_rollout_weights()
         ray.get(self.rollout_wg.sync_rollout_weights())

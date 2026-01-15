@@ -1130,6 +1130,95 @@ class RayPPOTrainer:
             if self.use_rm and not self.use_reward_loop:
                 self.rm_wg.stop_profile()
 
+    def _post_load_checkpoint_for_switch(self) -> None:
+        """Hook for subclasses to run extra steps after checkpoint load in a switch."""
+        return None
+
+    def _save_checkpoint_and_get_path(self) -> str:
+        self._save_checkpoint()
+        return os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
+
+    def _release_worker_groups(self) -> None:
+        worker_groups = [
+            getattr(self, "actor_rollout_wg", None),
+            getattr(self, "actor_wg", None),
+            getattr(self, "rollout_wg", None),
+            getattr(self, "critic_wg", None),
+            getattr(self, "ref_policy_wg", None),
+            getattr(self, "rm_wg", None),
+        ]
+        for worker_group in worker_groups:
+            if worker_group is None:
+                continue
+            for worker in worker_group.workers:
+                try:
+                    ray.kill(worker)
+                except Exception as exc:  # pragma: no cover - best effort cleanup
+                    print(f"Warning: failed to kill worker {worker}: {exc}")
+
+    def _release_resource_pools(self) -> None:
+        for resource_pool in self.resource_pool_manager.resource_pool_dict.values():
+            if resource_pool is None:
+                continue
+            for pg in resource_pool.get_placement_groups(device_name=self.device_name):
+                try:
+                    ray.util.remove_placement_group(pg)
+                except Exception as exc:  # pragma: no cover - best effort cleanup
+                    print(f"Warning: failed to remove placement group {pg.id}: {exc}")
+
+    def switch_resource_pool(
+        self,
+        new_resource_pool_manager: ResourcePoolManager,
+        *,
+        new_config=None,
+        resume_from_path: str | None = None,
+        release_old: bool = True,
+    ) -> "RayPPOTrainer":
+        """Switch to a new placement group/resource pool.
+
+        This creates a new trainer instance on the new resource pool, restores
+        state from checkpoint, and optionally releases the old workers and PGs.
+
+        Args:
+            new_resource_pool_manager: New resource pool manager with updated PGs.
+            resume_from_path: Optional checkpoint path. If None, save and use latest.
+            release_old: Whether to release old worker groups and placement groups.
+
+        Returns:
+            RayPPOTrainer: The new trainer instance attached to the new PG.
+        """
+        checkpoint_path = resume_from_path or self._save_checkpoint_and_get_path()
+
+        new_config = deepcopy(new_config if new_config is not None else self.config)
+        with open_dict(new_config):
+            new_config.trainer.resume_mode = "resume_path"
+            new_config.trainer.resume_from_path = checkpoint_path
+
+        new_trainer = self.__class__(
+            config=new_config,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            role_worker_mapping=self.role_worker_mapping,
+            resource_pool_manager=new_resource_pool_manager,
+            ray_worker_group_cls=self.ray_worker_group_cls,
+            reward_fn=self.reward_fn,
+            val_reward_fn=self.val_reward_fn,
+            train_dataset=self.train_dataset,
+            val_dataset=self.val_dataset,
+            collate_fn=self.train_dataloader.collate_fn,
+            train_sampler=self.train_dataloader.sampler,
+            device_name=self.device_name,
+        )
+        new_trainer.init_workers()
+        new_trainer._load_checkpoint()
+        new_trainer._post_load_checkpoint_for_switch()
+
+        if release_old:
+            self._release_worker_groups()
+            self._release_resource_pools()
+
+        return new_trainer
+
     def _get_dp_size(self, worker_group, role: str) -> int:
         """Get data parallel size from worker group dispatch info.
 
