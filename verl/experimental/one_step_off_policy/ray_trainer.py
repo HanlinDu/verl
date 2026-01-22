@@ -330,6 +330,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             detached=detached,
             **self._get_worker_group_kwargs(),
         )
+        # Build and spawn new worker group.
         return wg_dict.spawn(prefix_set=[str(role)])[str(role)]
 
     def add_role_group(

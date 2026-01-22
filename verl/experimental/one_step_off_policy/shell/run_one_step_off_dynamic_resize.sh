@@ -10,13 +10,14 @@ MODEL_PATH=${MODEL_PATH:-${HOME}/models/${MODEL_ID}}
 TRAIN_FILE=${TRAIN_FILE:-${HOME}/data/gsm8k/train.parquet}
 VAL_FILE=${VAL_FILE:-${HOME}/data/gsm8k/test.parquet}
 
-n_gpus_rollout=${N_GPUS_ROLLOUT:-4}
-n_gpus_training=$((NUM_GPUS - n_gpus_rollout))
-resize_step=${RESIZE_STEP:-1}
-shared_pool_gpus=${SHARED_POOL_GPUS:-${NUM_GPUS}}
+# Dynamic resize params
+shared_pool_gpus=8
+n_gpus_rollout=4
+n_gpus_training=$((shared_pool_gpus - n_gpus_rollout))
+resize_step=-1
 split_plan=${SPLIT_PLAN:-"[6,2]"}
-actor_split_index=${ACTOR_SPLIT_INDEX:-0}
-rollout_split_index=${ROLLOUT_SPLIT_INDEX:-1}
+actor_split_index=0
+rollout_split_index=1
 split_from_pool=${SPLIT_FROM_POOL:-shared_pool}
 
 python3 -m verl.experimental.one_step_off_policy.main_ppo \

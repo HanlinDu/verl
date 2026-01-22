@@ -36,7 +36,15 @@ trainer:
       nnodes: 1
       n_gpus_per_node: 8
     schedule:
-      - step: 1000
-        actor_pool: {}
-        rollout_pool: {}
+      - step: -1
+        actor_pool:
+          mode: split
+          size: [4, 4]
+          index: 0
+          from_pool: shared_pool
+        rollout_pool:
+          mode: split
+          size: [4, 4]
+          index: 1
+          from_pool: shared_pool
         release_old: false
