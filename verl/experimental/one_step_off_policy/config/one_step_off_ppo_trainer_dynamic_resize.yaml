@@ -36,7 +36,8 @@ trainer:
       nnodes: 1
       n_gpus_per_node: 8
     schedule:
-      - step: -1
+      stage0:
+        step: -1
         actor_pool:
           mode: split
           size: [4, 4]

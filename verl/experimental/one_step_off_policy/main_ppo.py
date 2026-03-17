@@ -48,6 +48,22 @@ def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
     resource_pool_spec = {}
     mapping = {}
 
+    shared_pool_cfg = config.trainer.get("dynamic_resize", {}).get("shared_pool", {})
+    shared_pool_enabled = shared_pool_cfg.get("enable", False)
+
+    if shared_pool_enabled:
+        total_gpus_per_node = shared_pool_cfg.get(
+            "n_gpus_per_node",
+            config.trainer.n_gpus_per_node + config.rollout.n_gpus_per_node,
+        )
+        total_nnodes = shared_pool_cfg.get("nnodes", config.trainer.nnodes)
+        resource_pool_spec["shared_pool"] = [total_gpus_per_node] * total_nnodes
+
+        for role in roles:
+            mapping[role] = "shared_pool"
+
+        return ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+
     # Actor/Critic resource pool
     if any(role in roles for role in [Role.Actor, Role.Critic, Role.RefPolicy, Role.RewardModel]):
         assert config.trainer.n_gpus_per_node > 0, "config.trainer.n_gpus_per_node must be greater than 0"
@@ -69,16 +85,6 @@ def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
         rollout_pool = [config.rollout.n_gpus_per_node] * config.rollout.nnodes
         resource_pool_spec["rollout_pool"] = rollout_pool
         mapping[Role.Rollout] = "rollout_pool"
-
-    # Optional shared pool used as a base for split (e.g., 8 -> 6/2) in dynamic resize.
-    shared_pool_cfg = config.trainer.get("dynamic_resize", {}).get("shared_pool", {})
-    if shared_pool_cfg.get("enable", False):
-        total_gpus_per_node = shared_pool_cfg.get(
-            "n_gpus_per_node",
-            config.trainer.n_gpus_per_node + config.rollout.n_gpus_per_node,
-        )
-        total_nnodes = shared_pool_cfg.get("nnodes", config.trainer.nnodes)
-        resource_pool_spec["shared_pool"] = [total_gpus_per_node] * total_nnodes
 
     return ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
