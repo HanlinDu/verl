@@ -26,6 +26,7 @@ from verl.experimental.one_step_off_policy.distributed_utils import vllm_statele
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import (
     get_device_name,
+    get_nccl_backend,
     get_torch_device,
 )
 from verl.utils.fsdp_utils import (
@@ -53,16 +54,74 @@ class DetachSync(AsyncActorRolloutRefWorker):
     def _get_actor_params(self):
         pass
 
+    def _maybe_init_collective_group(self, group_name: str = "actor_rollout") -> None:
+        if device_name == "npu":
+            return
+        rank = getattr(self, "_actor_rollout_collective_rank", None)
+        world_size = getattr(self, "_actor_rollout_collective_world_size", None)
+        if rank is None or world_size is None:
+            return
+        try:
+            if hasattr(collective, "is_group_initialized") and collective.is_group_initialized(group_name=group_name):
+                return
+        except Exception:  # pragma: no cover - best effort
+            pass
+
+        try:
+            collective.init_collective_group(
+                world_size=world_size,
+                rank=rank,
+                backend=get_nccl_backend(),
+                group_name=group_name,
+            )
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.warning("Failed to init Ray collective group '%s': %s", group_name, exc)
+
+    def _get_collective_rank_world_size(self, group_name: str):
+        try:
+            if hasattr(collective, "get_rank"):
+                collective_rank = collective.get_rank(group_name=group_name)
+            else:  # pragma: no cover - debug-only
+                collective_rank = "unavailable"
+        except Exception as exc:  # pragma: no cover - debug-only
+            collective_rank = f"error:{exc}"
+
+        try:
+            if hasattr(collective, "get_world_size"):
+                collective_world_size = collective.get_world_size(group_name=group_name)
+            elif hasattr(collective, "get_group_size"):
+                collective_world_size = collective.get_group_size(group_name=group_name)
+            else:  # pragma: no cover - debug-only
+                collective_world_size = "unavailable"
+        except Exception as exc:  # pragma: no cover - debug-only
+            collective_world_size = f"error:{exc}"
+
+        try:
+            if hasattr(collective, "is_group_initialized"):
+                group_initialized = collective.is_group_initialized(group_name=group_name)
+            else:  # pragma: no cover - debug-only
+                group_initialized = "unavailable"
+        except Exception as exc:  # pragma: no cover - debug-only
+            group_initialized = f"error:{exc}"
+
+        return collective_rank, collective_world_size, group_initialized
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size):
         rank = torch.distributed.get_rank() + rank_offset
-        self._weight_sync_group = vllm_stateless_init_process_group(
-            master_address,
-            master_port,
-            rank,
-            world_size,
-            get_torch_device().current_device(),
-        )
+        self._actor_rollout_collective_rank = rank
+        self._actor_rollout_collective_world_size = world_size
+
+        if device_name == "npu":
+            self._weight_sync_group = vllm_stateless_init_process_group(
+                master_address,
+                master_port,
+                rank,
+                world_size,
+                get_torch_device().current_device(),
+            )
+        else:
+            self._maybe_init_collective_group(group_name="actor_rollout")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def sync_rollout_weights(self):
@@ -71,7 +130,11 @@ class DetachSync(AsyncActorRolloutRefWorker):
 
         if self._is_actor and self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
-        params = self._get_actor_params() if self._is_actor else None
+
+        if self._is_actor:
+            params = self._get_actor_params()
+        else:
+            params = None
 
         rollout_name = self.config.rollout.name
         if self._is_rollout:
@@ -85,7 +148,17 @@ class DetachSync(AsyncActorRolloutRefWorker):
             else:
                 raise NotImplementedError(f"Unknown rollout name: {rollout_name}")
         loop = get_event_loop()
-        for key, shape, dtype in self._weights_info:
+
+        dynamic_resize_cfg = getattr(self.config, "dynamic_resize", None)
+        dynamic_resize_enabled = bool(getattr(dynamic_resize_cfg, "enable", False))
+        if device_name != "npu":
+            self._maybe_init_collective_group(group_name="actor_rollout")
+
+        collective_rank, collective_world_size, collective_initialized = self._get_collective_rank_world_size(
+            group_name="actor_rollout"
+        )
+
+        for idx, (key, shape, dtype) in enumerate(self._weights_info):
             tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
             if self._is_actor:
                 assert key in params
@@ -98,7 +171,15 @@ class DetachSync(AsyncActorRolloutRefWorker):
             if device_name == "npu":
                 self._weight_sync_group.broadcast(tensor, src=0, stream=get_torch_device().current_stream())
             else:
-                collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
+                if dynamic_resize_enabled:
+                    torch.distributed.broadcast(tensor, src=0)
+                else:
+                    if not collective_initialized:
+                        raise RuntimeError(
+                            "Ray collective group 'actor_rollout' is not initialized. "
+                            "Please ensure create_weight_sync_group is called on all actor/rollout workers."
+                        )
+                    collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
 
             if self._is_rollout:
                 if rollout_name == "vllm":

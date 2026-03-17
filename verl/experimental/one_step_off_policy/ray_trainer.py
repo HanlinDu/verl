@@ -19,6 +19,8 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import asyncio
+import contextlib
+import os
 import uuid
 from pprint import pprint
 
@@ -131,11 +133,57 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
+    def _maybe_patch_reward_metadata(self, non_tensor_batch) -> None:
+        # Keep this fallback intentionally narrow. We only synthesize reward
+        # metadata for samples that already look like GSM8K-style supervised
+        # examples (i.e. they contain `answer`). This avoids silently forcing a
+        # GSM8K router onto unrelated datasets while still unblocking the
+        # one-step-off path that currently depends on the shared reward-loop
+        # contract.
+        answers = non_tensor_batch.get("answer")
+        if answers is None:
+            return
+
+        if "data_source" not in non_tensor_batch:
+            non_tensor_batch["data_source"] = np.array(["openai/gsm8k"] * len(answers), dtype=object)
+
+        if "reward_model" not in non_tensor_batch:
+            non_tensor_batch["reward_model"] = np.array(
+                [{"ground_truth": answer, "style": "rule"} for answer in answers],
+                dtype=object,
+            )
+
     def _validate(self):
+        @contextlib.contextmanager
+        def _patched_val_dataloader():
+            original_val_dataloader = self.val_dataloader
+
+            def _iter_with_required_reward_fields():
+                for test_data in original_val_dataloader:
+                    # One-step-off validation still delegates to the shared PPO
+                    # validation pipeline. That shared path assumes each sample
+                    # already carries reward-routing metadata (`data_source`) and
+                    # rule/model reward metadata (`reward_model`). Some validation
+                    # datasets used by this experimental trainer only contain the
+                    # textual fields (for example `prompt` and `answer`), so we
+                    # patch the missing metadata here instead of changing the base
+                    # trainer's contract for all PPO variants.
+                    self._maybe_patch_reward_metadata(test_data)
+
+                    yield test_data
+
+            self.val_dataloader = _iter_with_required_reward_fields()
+            try:
+                yield
+            finally:
+                self.val_dataloader = original_val_dataloader
+
         self.actor_rollout_wg = self.rollout_wg
-        ret = super()._validate()
-        self.actor_rollout_wg = self.actor_wg
-        return ret
+        try:
+            with _patched_val_dataloader():
+                return super()._validate()
+        finally:
+            self.actor_rollout_wg = self.actor_wg
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -270,15 +318,22 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 all_wg.update(spawn_wg)
         # normal ray workers
         else:
+            # IMPORTANT:
+            # We intentionally avoid using `spawn(prefix_set=...)` here.
+            # `spawn` creates multiple WorkerGroups that share the same underlying Ray Actors
+            # (via from_detached), which will make actor/rollout overlap on the same ActorID.
+            # That overlap will deadlock weight sync (broadcast) in detached / dynamic resize mode.
             for resource_pool, class_dict in self.resource_pool_to_cls.items():
-                worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
-                wg_dict = self.ray_worker_group_cls(
-                    resource_pool=resource_pool,
-                    ray_cls_with_init=worker_dict_cls,
-                    **wg_kwargs,
-                )
-                spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
-                all_wg.update(spawn_wg)
+                for role_name, role_cls in class_dict.items():
+                    worker_dict_cls = create_colocated_worker_cls(class_dict={role_name: role_cls})
+                    wg = self.ray_worker_group_cls(
+                        resource_pool=resource_pool,
+                        ray_cls_with_init=worker_dict_cls,
+                        **wg_kwargs,
+                    )
+                    # The returned dict is keyed by the role name.
+                    spawn_wg = wg.spawn(prefix_set=[role_name])
+                    all_wg.update(spawn_wg)
         self.all_wg = all_wg
 
     def _init_models(self):
@@ -458,6 +513,24 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 backend=get_nccl_backend(),
                 group_name="actor_rollout",
             )
+            # NOTE(HanlinDu): collective init not finished before broadcast, so we init here to avoid potential issues
+            # may not be necessary for all cases, but safer to have it
+            master_address = ray.get(self.actor_wg.workers[0]._get_node_ip.remote()).strip("[]")
+            master_port = ray.get(self.actor_wg.workers[0]._get_free_port.remote())
+            self.actor_wg.create_weight_sync_group(
+                master_address,
+                master_port,
+                0,
+                n_workers,
+            )
+            ray.get(
+                self.rollout_wg.create_weight_sync_group(
+                    master_address,
+                    master_port,
+                    len(self.actor_wg.workers),
+                    n_workers,
+                )
+            )
 
     def _init_async_rollout_manager(self):
         # create async rollout manager and request scheduler
@@ -514,11 +587,11 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
     def _maybe_dynamic_resize(self):
         # Execute scheduled resize steps driven by config.trainer.dynamic_resize.
-        # Example schedule item:
-        #   - step: 1000
-        #     actor_pool: {mode: split, size: [4,4], index: 0}
-        #     rollout_pool: {mode: split, size: [4,4], index: 1}
-        #     release_old: true
+        # Accept both of the config shapes currently seen in experiments:
+        #   1) a list of schedule items
+        #   2) a named mapping such as {stage0: {...}, stage1: {...}}
+        # The latter is convenient in YAML, but iterating over it directly
+        # yields string keys, so normalize it before processing.
         cfg = OmegaConf.select(self.config.trainer, "dynamic_resize")
         if cfg is None:
             return
@@ -526,9 +599,18 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         if not cfg.get("enable", True):
             return
         schedule = cfg.get("schedule", []) or []
+        if isinstance(schedule, dict):
+            schedule = list(schedule.values())
+        elif not isinstance(schedule, list):
+            raise TypeError(f"trainer.dynamic_resize.schedule must be a list or dict, got {type(schedule).__name__}")
 
         # FIXME(HanlinDu): this looped check seems heavy and unnecessary to do at every step
         for item in schedule:
+            if not isinstance(item, dict):
+                raise TypeError(
+                    "Each trainer.dynamic_resize.schedule item must be a dict, "
+                    f"got {type(item).__name__}: {item!r}"
+                )
             if item.get("step") != self.global_steps:
                 continue
 
@@ -555,18 +637,53 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 detached=detached,
                 name_prefix=item.get("name_prefix"),
             )
-
-            self.switch_role_group(
-                Role.Actor,
+            self._switch_actor_rollout_groups(
                 new_actor,
+                new_rollout,
                 resume_from_path=actor_resume_path,
                 release_old=release_old,
             )
-            self.switch_role_group(
-                Role.Rollout,
-                new_rollout,
-                release_old=release_old,
+
+    def _switch_actor_rollout_groups(
+        self,
+        new_actor_wg: RayWorkerGroup,
+        new_rollout_wg: RayWorkerGroup,
+        *,
+        resume_from_path: str | None = None,
+        release_old: bool = False,
+    ) -> None:
+        # Dynamic resize must switch actor and rollout as one pair. Updating them
+        # one by one temporarily creates a mixed topology (new actor + old rollout
+        # or the reverse), and that intermediate state can hang weight sync /
+        # collective group setup. Stage both groups first, then publish them
+        # together and rebuild the dependent managers once.
+        old_actor_wg = self.actor_wg
+        old_rollout_wg = self.rollout_wg
+
+        if resume_from_path is not None:
+            new_actor_wg.load_checkpoint(
+                resume_from_path,
+                del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
             )
+        else:
+            weights_info = old_actor_wg.get_actor_weights_info()[0]
+            new_actor_wg.set_actor_weights_info(weights_info)
+
+        weights_info = new_actor_wg.get_actor_weights_info()[0]
+        new_rollout_wg.set_actor_weights_info(weights_info)
+
+        self.actor_wg = new_actor_wg
+        self.rollout_wg = new_rollout_wg
+        self.actor_rollout_wg = new_actor_wg
+
+        # Rollout manager and sync group both depend on the final actor/rollout pair,
+        # so rebuild them only after both references are updated.
+        self._init_async_rollout_manager()
+        self._create_weight_sync_group()
+
+        if release_old:
+            self.remove_role_group(Role.Actor, old_actor_wg)
+            self.remove_role_group(Role.Rollout, old_rollout_wg)
 
 
     def _post_load_checkpoint_for_switch(self) -> None:
@@ -575,8 +692,39 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             asyncio.run(self.async_rollout_manager.clear_kv_cache())
 
     def sync_rollout_weights(self):
-        self.actor_wg.sync_rollout_weights()
-        ray.get(self.rollout_wg.sync_rollout_weights())
+        actor_workers = getattr(self.actor_wg, "workers", [])
+        rollout_workers = getattr(self.rollout_wg, "workers", [])
+
+        # Safety guard: actor and rollout must NOT share the same underlying Ray Actor.
+        # Otherwise, broadcast will deadlock (rollout enters first and blocks the actor call).
+        try:
+            actor_ids = {getattr(w, "_actor_id", None) for w in actor_workers}
+            rollout_ids = {getattr(w, "_actor_id", None) for w in rollout_workers}
+            actor_ids.discard(None)
+            rollout_ids.discard(None)
+            overlap = actor_ids.intersection(rollout_ids)
+        except Exception:  # pragma: no cover - best effort
+            overlap = set()
+
+        if overlap:
+            raise RuntimeError(
+                "Actor/Rollout worker groups overlap on the same Ray ActorID(s): "
+                f"{list(overlap)[:6]} (showing up to 6). "
+                "This will deadlock sync_rollout_weights. "
+                "Please create actor/rollout as separate Ray Actors (no shared spawn/from_detached)."
+            )
+
+        rollout_refs = self.rollout_wg.sync_rollout_weights()
+        actor_refs = self.actor_wg.sync_rollout_weights()
+        if rollout_refs is None and actor_refs is None:
+            return
+        refs = []
+        if rollout_refs is not None:
+            refs.extend(rollout_refs if isinstance(rollout_refs, list) else [rollout_refs])
+        if actor_refs is not None:
+            refs.extend(actor_refs if isinstance(actor_refs, list) else [actor_refs])
+        if refs:
+            ray.get(refs)
 
     def _create_continuous_iterator(self):
         """
@@ -604,6 +752,13 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
         # Create the initial batch from the data loader
         batch = DataProto.from_single_dict(batch_dict)
+
+        # The async agent/reward loop reuses non-tensor fields from the original
+        # training batch. Some one-step-off datasets only provide prompt/answer
+        # style fields and omit the reward-routing metadata expected by the
+        # downstream reward loop worker. Patch the minimal fields here so the
+        # compatibility fix stays local to the experimental trainer.
+        self._maybe_patch_reward_metadata(batch.non_tensor_batch)
 
         # add uid to batch
         batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)

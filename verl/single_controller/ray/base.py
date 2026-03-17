@@ -47,11 +47,24 @@ def get_random_string(length: int) -> str:
 def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, blocking):
     class Functor:
         def __call__(this, *args, **kwargs):
+            debug_enabled = int(os.environ.get("VERL_DEBUG_ACTOR", "0")) == 1
+            if debug_enabled and method_name == "sync_rollout_weights":
+                print(
+                    " ---DHL: dispatch start, "
+                    f"wg={getattr(self, 'name_prefix', 'wg')}, method={method_name}, "
+                    f"workers={len(getattr(self, 'workers', []))}"
+                )
             args, kwargs = dispatch_fn(self, *args, **kwargs)
             padding_count = kwargs.pop(_padding_size_key, 0)
             output = execute_fn(method_name, *args, **kwargs)
             if blocking:
                 output = ray.get(output)
+            if debug_enabled and method_name == "sync_rollout_weights":
+                print(
+                    " ---DHL: dispatch done, "
+                    f"wg={getattr(self, 'name_prefix', 'wg')}, method={method_name}, "
+                    f"output_type={type(output).__name__}"
+                )
             output = collect_fn(self, output)
             if padding_count > 0:
                 if isinstance(output, DataProto):
@@ -634,11 +647,17 @@ class RayWorkerGroup(WorkerGroup):
 
         def _rebind_actor_methods(worker_group, actor_name):
             prefix: str = actor_name + "_"
+            debug_enabled = int(os.environ.get("VERL_DEBUG_ACTOR", "0")) == 1
             for method_name in dir(worker_group):
                 if method_name.startswith(prefix):
                     original_method_name = method_name.removeprefix(prefix)
                     method = getattr(worker_group, method_name)
                     setattr(worker_group, original_method_name, method)
+                    if debug_enabled and method_name.endswith("sync_rollout_weights"):
+                        print(
+                            " ---DHL: rebind worker method, "
+                            f"prefix={actor_name}, from={method_name} -> {original_method_name}"
+                        )
 
         new_worker_group_dict = {}
         for prefix in prefix_set:

@@ -12,8 +12,8 @@ MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-1.5B-Instruct}
 MODEL_PATH=${MODEL_PATH:-/file_system/common-models/Qwen/Qwen2.5-1.5B-Instruct}
 RESOLVED_MODEL_PATH="${MODEL_PATH}"
 
-TRAIN_FILE=${TRAIN_FILE:-/file_system/common-data/gsm8k/train.parquet}
-VAL_FILE=${VAL_FILE:-/file_system/common-data/gsm8k/test.parquet}
+TRAIN_FILE=${TRAIN_FILE:-/file_system/common-data/new_gsm8k/train.parquet}
+VAL_FILE=${VAL_FILE:-/file_system/common-data/new_gsm8k/test.parquet}
 
 n_gpus_rollout=${N_GPUS_ROLLOUT:-4}
 n_gpus_training=$((NUM_GPUS - n_gpus_rollout))
@@ -32,7 +32,7 @@ python3 -m verl.experimental.one_step_off_policy.main_ppo \
   rollout.nnodes=1 \
   rollout.n_gpus_per_node=${n_gpus_rollout} \
   trainer.total_training_steps=5 \
-  trainer.save_freq=1 \
+  trainer.save_freq=-1 \
   trainer.dynamic_resize.shared_pool.n_gpus_per_node=${shared_pool_gpus} \
   trainer.dynamic_resize.schedule.stage0.step=${resize_step} \
   trainer.dynamic_resize.schedule.stage0.actor_pool.size=${split_plan} \

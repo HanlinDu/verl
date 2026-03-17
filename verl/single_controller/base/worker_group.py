@@ -16,6 +16,7 @@ the class of WorkerGroup
 """
 
 import logging
+import os
 import signal
 import threading
 import time
@@ -235,6 +236,15 @@ class WorkerGroup:
                 except Exception:
                     print(f"execute_fn {wg_execute_fn_name} is invalid")
                     raise
+
+                debug_enabled = int(os.environ.get("VERL_DEBUG_ACTOR", "0")) == 1
+                if debug_enabled and method_name.endswith("sync_rollout_weights"):
+                    class_name = getattr(user_defined_cls, "__name__", user_defined_cls.__class__.__name__)
+                    print(
+                        " ---DHL: bind worker method, "
+                        f"class={class_name}, method={method_name}, "
+                        f"dispatch_mode={dispatch_mode}, execute_mode={execute_mode}, blocking={blocking}"
+                    )
 
                 # bind a new method to the RayWorkerGroup
                 func = func_generator(
