@@ -47,24 +47,11 @@ def get_random_string(length: int) -> str:
 def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, blocking):
     class Functor:
         def __call__(this, *args, **kwargs):
-            debug_enabled = int(os.environ.get("VERL_DEBUG_ACTOR", "0")) == 1
-            if debug_enabled and method_name == "sync_rollout_weights":
-                print(
-                    " ---DHL: dispatch start, "
-                    f"wg={getattr(self, 'name_prefix', 'wg')}, method={method_name}, "
-                    f"workers={len(getattr(self, 'workers', []))}"
-                )
             args, kwargs = dispatch_fn(self, *args, **kwargs)
             padding_count = kwargs.pop(_padding_size_key, 0)
             output = execute_fn(method_name, *args, **kwargs)
             if blocking:
                 output = ray.get(output)
-            if debug_enabled and method_name == "sync_rollout_weights":
-                print(
-                    " ---DHL: dispatch done, "
-                    f"wg={getattr(self, 'name_prefix', 'wg')}, method={method_name}, "
-                    f"output_type={type(output).__name__}"
-                )
             output = collect_fn(self, output)
             if padding_count > 0:
                 if isinstance(output, DataProto):
@@ -379,9 +366,14 @@ class RayWorkerGroup(WorkerGroup):
             ray_wait_register_center_timeout: Timeout for waiting on register center
             **kwargs: Additional keyword arguments
         """
-        self._master_addr = kwargs.pop("master_addr", None)
-        self._master_port = kwargs.pop("master_port", None)
+        init_master_addr = kwargs.pop("master_addr", None)
+        init_master_port = kwargs.pop("master_port", None)
         super().__init__(resource_pool=resource_pool, **kwargs)
+        # in dynamic-resize mode, addr and port will not set again when resize, they will be set in the 
+        # first created worker group but immediately set to None in super().__init__(). So we need to 
+        # pass them in the first created worker group and reuse in the following spawned worker groups.
+        self._master_addr = init_master_addr
+        self._master_port = init_master_port
         self.ray_cls_with_init = ray_cls_with_init
         self.name_prefix = get_random_string(length=6) if name_prefix is None else name_prefix
         self._ray_wait_register_center_timeout = ray_wait_register_center_timeout
@@ -539,7 +531,6 @@ class RayWorkerGroup(WorkerGroup):
                 worker_env=worker_env,
                 detached=detached,
             )
-
     def _create_worker(self, rank, pg_idx, pg, local_rank, resource_pool, ray_cls_with_init, worker_env, detached):
         world_size = resource_pool.world_size
         use_gpu = resource_pool.use_gpu
@@ -647,17 +638,11 @@ class RayWorkerGroup(WorkerGroup):
 
         def _rebind_actor_methods(worker_group, actor_name):
             prefix: str = actor_name + "_"
-            debug_enabled = int(os.environ.get("VERL_DEBUG_ACTOR", "0")) == 1
             for method_name in dir(worker_group):
                 if method_name.startswith(prefix):
                     original_method_name = method_name.removeprefix(prefix)
                     method = getattr(worker_group, method_name)
                     setattr(worker_group, original_method_name, method)
-                    if debug_enabled and method_name.endswith("sync_rollout_weights"):
-                        print(
-                            " ---DHL: rebind worker method, "
-                            f"prefix={actor_name}, from={method_name} -> {original_method_name}"
-                        )
 
         new_worker_group_dict = {}
         for prefix in prefix_set:

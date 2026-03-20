@@ -20,7 +20,11 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import asyncio
 import contextlib
+import inspect
+import logging
+import math
 import os
+import socket
 import uuid
 from pprint import pprint
 
@@ -28,6 +32,7 @@ import numpy as np
 import ray
 import torch
 from omegaconf import OmegaConf
+from ray.experimental.state.api import get_actor as ray_get_actor_state
 from ray.util.collective import collective
 from torch.utils.data import Dataset, Sampler
 from tqdm import tqdm
@@ -44,6 +49,7 @@ from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
     ResourcePoolManager,
     apply_kl_penalty,
+    calculate_workload,
     compute_advantage,
     compute_response_mask,
 )
@@ -53,10 +59,33 @@ from verl.utils import omega_conf_to_dataclass
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
+from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.tracking import ValidationGenerationsLogger
 
 
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
 class OneStepOffRayTrainer(RayPPOTrainer):
+    # Staged resize execution model for shared-pool in-place rebalance:
+    #
+    # Layer 1: static prepare
+    #   - parse resize spec / split pools / build plans
+    #   - do not consume new shared-pool worker slots yet
+    #
+    # Layer 2: resource transition
+    #   - release the shrinking side first (e.g. old rollout 4 -> 2 releases 2 slots)
+    #   - create the expanding side with the freed slots (e.g. actor 4 -> 6 consumes the 2 slots)
+    #
+    # Layer 3: final commit/publish
+    #   - commit new worker/model init
+    #   - restore/copy weights
+    #   - publish new actor/rollout pair and rebuild dependent managers/groups
+    #
+    # For the current shared-pool 4+4 -> 6+2 case on 8 GPUs, trying to build the
+    # full new 6-actor group before shrinking old rollout over-allocates the pool
+    # and leaves the new actors stuck in PENDING_CREATION.
     # TODO: support each role have individual ray_worker_group_cls,
     # i.e., support different backend of different role
     def __init__(
@@ -119,6 +148,13 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             Role.Actor: {},
             Role.Rollout: {},
         }
+        self._active_role_world_sizes: dict[Role, int] = {}
+        self._weight_sync_group_version = 0
+        self._active_weight_sync_group_name = "actor_rollout"
+        self._pending_weight_sync_group_cleanup: list[tuple[str, RayWorkerGroup, RayWorkerGroup]] = []
+        self._last_runtime_batch_plan: dict[str, int] | None = None
+        self._resize_padding_history: list[DataProto] = []
+        self._resize_padding_history_size = 8
 
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
         if lora_rank <= 0:
@@ -178,12 +214,184 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             finally:
                 self.val_dataloader = original_val_dataloader
 
-        self.actor_rollout_wg = self.rollout_wg
+        self.actor_rollout_wg = self.actor_wg
         try:
             with _patched_val_dataloader():
                 return super()._validate()
         finally:
             self.actor_rollout_wg = self.actor_wg
+
+    def _build_runtime_batch_plan(self, batch: DataProto) -> dict[str, int]:
+        total_samples = len(batch)
+        actor_world_size = max(self._active_role_world_sizes.get(Role.Actor, 1), 1)
+        critic_world_size = max(self._active_role_world_sizes.get(Role.Critic, actor_world_size), 1)
+
+        actor_micro = self.config.actor_rollout_ref.actor.get("ppo_micro_batch_size_per_gpu", None)
+        critic_micro = self.config.critic.get("ppo_micro_batch_size_per_gpu", None) if self.use_critic else None
+        actor_micro = actor_micro if actor_micro is not None else max(total_samples // actor_world_size, 1)
+        critic_micro = critic_micro if critic_micro is not None else max(total_samples // critic_world_size, 1)
+
+        actor_alignment = actor_world_size * actor_micro
+        critic_alignment = critic_world_size * critic_micro if self.use_critic else actor_alignment
+        target_alignment = math.lcm(actor_alignment, critic_alignment)
+
+        padded_total_samples = total_samples
+        pad_samples = 0
+        if total_samples % target_alignment != 0:
+            padded_total_samples = math.ceil(total_samples / target_alignment) * target_alignment
+            pad_samples = padded_total_samples - total_samples
+
+        actor_runtime_mini = max(actor_alignment, padded_total_samples // actor_world_size)
+        if actor_runtime_mini % actor_micro != 0:
+            actor_runtime_mini = math.ceil(actor_runtime_mini / actor_micro) * actor_micro
+
+        critic_runtime_mini = 0
+        if self.use_critic:
+            critic_runtime_mini = max(critic_alignment, padded_total_samples // critic_world_size)
+            if critic_runtime_mini % critic_micro != 0:
+                critic_runtime_mini = math.ceil(critic_runtime_mini / critic_micro) * critic_micro
+
+        return {
+            "original_total_samples": total_samples,
+            "padded_total_samples": padded_total_samples,
+            "pad_samples": pad_samples,
+            "target_alignment": target_alignment,
+            "actor_world_size": actor_world_size,
+            "actor_micro_batch_size_per_gpu": actor_micro,
+            "actor_runtime_mini_batch_size": actor_runtime_mini,
+            "critic_world_size": critic_world_size,
+            "critic_micro_batch_size_per_gpu": critic_micro if self.use_critic else 0,
+            "critic_runtime_mini_batch_size": critic_runtime_mini,
+            "padding_source": "none",
+            "global_step": self.global_steps,
+        }
+
+    def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
+        """Reorder the data on single controller such that each DP rank gets similar total tokens.
+
+        This mirrors the shared PPO trainer implementation, except the actor DP
+        size is queried from `actor_wg` directly because one-step-off keeps actor
+        and rollout as separate groups instead of a composite `actor_rollout_wg`.
+        """
+        attention_mask = batch.batch["attention_mask"]
+        batch_size = attention_mask.shape[0]
+        global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)
+        workload_lst = calculate_workload(global_seqlen_lst)
+        dp_size = self._get_dp_size(self.actor_wg, "actor")
+
+        if getattr(self, "use_prefix_grouper", False) and "uid" in batch.non_tensor_batch:
+            from verl.utils.seqlen_balancing import get_group_balanced_partitions
+
+            uid_list = list(batch.non_tensor_batch["uid"])
+            seqlen_list = global_seqlen_lst.tolist()
+            num_groups = len(set(uid_list))
+
+            if num_groups % dp_size != 0:
+                raise ValueError(
+                    f"PrefixGrouper with balance_batch requires num_uid_groups ({num_groups}) "
+                    f"% dp_size ({dp_size}) == 0. "
+                    f"This ensures each rank gets equal number of groups. "
+                    f"Current batch_size={batch_size}, adjust batch_size to be a multiple of "
+                    f"dp_size * rollout.n."
+                )
+
+            global_partition_lst = get_group_balanced_partitions(
+                seqlen_list=seqlen_list,
+                uid_list=uid_list,
+                k_partitions=dp_size,
+            )
+
+        elif keep_minibatch:
+            minibatch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size")
+            minibatch_num = len(workload_lst) // minibatch_size
+            global_partition_lst = [[] for _ in range(dp_size)]
+            for i in range(minibatch_num):
+                rearrange_minibatch_lst = get_seqlen_balanced_partitions(
+                    workload_lst[i * minibatch_size : (i + 1) * minibatch_size],
+                    k_partitions=dp_size,
+                    equal_size=True,
+                )
+                for j, part in enumerate(rearrange_minibatch_lst):
+                    global_partition_lst[j].extend([x + minibatch_size * i for x in part])
+        else:
+            global_partition_lst = get_seqlen_balanced_partitions(workload_lst, k_partitions=dp_size, equal_size=True)
+
+        if not getattr(self, "use_prefix_grouper", False):
+            for idx, partition in enumerate(global_partition_lst):
+                partition.sort(key=lambda x: (workload_lst[x], x))
+                ordered_partition = partition[::2] + partition[1::2][::-1]
+                global_partition_lst[idx] = ordered_partition
+
+        global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
+        batch.reorder(global_idx)
+        global_balance_stats = log_seqlen_unbalance(
+            seqlen_list=global_seqlen_lst.tolist(), partitions=global_partition_lst, prefix=logging_prefix
+        )
+        metrics.update(global_balance_stats)
+
+    def _maybe_record_resize_history_batch(self, batch: DataProto) -> None:
+        batch_size = len(batch)
+        if batch_size <= 0:
+            return
+        snapshot_size = min(batch_size, 64)
+        if batch_size == snapshot_size:
+            snapshot = batch[:snapshot_size]
+        else:
+            sample_indices = np.random.choice(batch_size, size=snapshot_size, replace=False)
+            snapshot = batch[sample_indices]
+        
+        # Clear meta_info to save memory, since we only care about the tensor data for padding.
+        snapshot = snapshot.select(meta_info_keys=[])
+
+        self._resize_padding_history.append(snapshot)
+        if len(self._resize_padding_history) > self._resize_padding_history_size:
+            self._resize_padding_history = self._resize_padding_history[-self._resize_padding_history_size :]
+
+    def _sample_padding_from_history(self, pad_samples: int) -> DataProto | None:
+        if pad_samples <= 0 or not self._resize_padding_history:
+            return None
+        history_pool = DataProto.concat(self._resize_padding_history)
+        if len(history_pool) <= 0:
+            return None
+        replace = len(history_pool) < pad_samples
+        indices = np.random.choice(len(history_pool), size=pad_samples, replace=replace)
+        padding_batch = history_pool[indices]
+        if "uid" in padding_batch.non_tensor_batch:
+            historical_uids = padding_batch.non_tensor_batch["uid"]
+            padding_batch.non_tensor_batch["uid"] = np.array(
+                [f"{uid}::histpad::step{self.global_steps}::{i}" for i, uid in enumerate(historical_uids)], dtype=object
+            )
+        return padding_batch
+
+    def _apply_runtime_batch_plan(self, batch: DataProto) -> DataProto:
+        existing_plan = batch.meta_info.get("runtime_batch_plan")
+        if existing_plan is not None:
+            self._last_runtime_batch_plan = existing_plan
+            return batch
+
+        plan = self._build_runtime_batch_plan(batch)
+        self._last_runtime_batch_plan = plan
+
+        if plan["pad_samples"] > 0:
+            repeat_indices = np.arange(plan["pad_samples"]) % plan["original_total_samples"]
+            padding_batch = batch[repeat_indices.tolist()]
+            plan["padding_source"] = "current"
+            batch = DataProto.concat([batch, padding_batch])
+
+            repeated_from = batch.non_tensor_batch.get("uid", None)
+            if repeated_from is not None:
+                original_uids = repeated_from[: plan["original_total_samples"]]
+                padded_uids = original_uids[repeat_indices]
+                padded_uids = np.array(
+                    [f"{uid}::currpad::step{self.global_steps}::{i}" for i, uid in enumerate(padded_uids)], dtype=object
+                )
+                batch.non_tensor_batch["uid"] = np.concatenate([original_uids, padded_uids])
+
+        batch.meta_info["runtime_batch_plan"] = plan
+        batch.meta_info["mini_batch_size"] = plan["actor_runtime_mini_batch_size"]
+        batch.meta_info["critic_mini_batch_size"] = plan["critic_runtime_mini_batch_size"]
+
+        return batch
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -271,6 +479,33 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         wg_kwargs["device_name"] = self.device_name
         return wg_kwargs
 
+    def _get_resize_worker_group_kwargs(self) -> dict:
+        wg_kwargs = self._get_worker_group_kwargs()
+
+        # For SubRayResourcePool overlap-resize, scheduling an extra helper task
+        # (`get_master_addr_port`) onto the reused placement group can block
+        # because the old topology may still occupy the bundles. Reusing the old
+        # worker group's rendezvous metadata is also unsafe because it couples the
+        # new group to the old process group's endpoint. Instead, allocate a fresh
+        # driver-side rendezvous endpoint and pass it explicitly to the new group.
+        master_addr = None
+        try:
+            if getattr(self.actor_wg, "workers", None):
+                master_addr = ray.get(self.actor_wg.workers[0]._get_node_ip.remote()).strip("[]")
+        except Exception as exc:
+            logger.warning("[one-step-off][resize] failed to query current actor node ip for new rendezvous: %s", exc)
+
+        if master_addr is None:
+            master_addr = ray.util.get_node_ip_address().strip("[]")
+
+        with socket.socket() as sock:
+            sock.bind(("", 0))
+            master_port = sock.getsockname()[1]
+
+        wg_kwargs["master_addr"] = str(master_addr)
+        wg_kwargs["master_port"] = str(master_port)
+        return wg_kwargs
+
     def _init_worker_groups(self):
         detached_cfg = self._get_detached_workers_cfg()
 
@@ -352,15 +587,57 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
         self.actor_wg = self.all_wg[str(Role.Actor)]
         self.rollout_wg = self.all_wg[str(Role.Rollout)]
-        self.actor_wg.init_model()
-        self.rollout_wg.init_model()
+        self._prepare_role_group_init(self.actor_wg, role=Role.Actor)
+        self._prepare_role_group_init(self.rollout_wg, role=Role.Rollout)
+        self._commit_role_group_init(self.actor_wg, role=Role.Actor)
+        self._commit_role_group_init(self.rollout_wg, role=Role.Rollout)
         self.actor_rollout_wg = self.actor_wg
         # Register the initial groups as the default targets.
         self.role_groups[Role.Actor] = {"primary": self.actor_wg}
         self.role_groups[Role.Rollout] = {"primary": self.rollout_wg}
-        weights_info = self.actor_wg.get_actor_weights_info()[0]
-        self.rollout_wg.set_actor_weights_info(weights_info)
+        self._initialize_active_topology_state()
+        weights_info = self._get_actor_weights_info(self.actor_wg)[0]
+        self._set_actor_weights_info(self.rollout_wg, weights_info)
         self._create_weight_sync_group()
+
+    def _pool_world_size_from_spec(self, role: Role, pool_spec: dict | None) -> int:
+        pool = self._resolve_role_pool(role, pool_spec)
+        if pool is None:
+            pool = self.resource_pool_manager.get_resource_pool(role)
+        world_size = getattr(pool, "world_size", None)
+        if world_size is None:
+            raise ValueError(f"Cannot determine world_size for role={role}, pool_spec={pool_spec}, pool={pool}")
+        return int(world_size)
+
+    def _initialize_active_topology_state(self) -> None:
+        cfg = OmegaConf.select(self.config.trainer, "dynamic_resize")
+        schedule = []
+        if cfg is not None:
+            cfg = OmegaConf.to_container(cfg, resolve=True)
+            schedule = cfg.get("schedule", []) or []
+            if isinstance(schedule, dict):
+                schedule = list(schedule.values())
+
+        initial_item = None
+        for item in schedule:
+            if not isinstance(item, dict):
+                continue
+            if item.get("step", 0) < 0 and item.get("actor_pool") and item.get("rollout_pool"):
+                initial_item = item
+                break
+
+        if initial_item is not None:
+            actor_spec = initial_item.get("actor_pool")
+            rollout_spec = initial_item.get("rollout_pool")
+            self._publish_active_topology_state(actor_spec=actor_spec, rollout_spec=rollout_spec)
+            return
+
+        self._active_role_world_sizes[Role.Actor] = self._pool_world_size_from_spec(Role.Actor, None)
+        self._active_role_world_sizes[Role.Rollout] = self._pool_world_size_from_spec(Role.Rollout, None)
+
+    def _publish_active_topology_state(self, *, actor_spec: dict | None, rollout_spec: dict | None) -> None:
+        self._active_role_world_sizes[Role.Actor] = self._pool_world_size_from_spec(Role.Actor, actor_spec)
+        self._active_role_world_sizes[Role.Rollout] = self._pool_world_size_from_spec(Role.Rollout, rollout_spec)
 
     def _build_role_group(
         self,
@@ -383,10 +660,103 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             ray_cls_with_init=worker_dict_cls,
             name_prefix=name_prefix,
             detached=detached,
-            **self._get_worker_group_kwargs(),
+            **self._get_resize_worker_group_kwargs(),
         )
-        # Build and spawn new worker group.
-        return wg_dict.spawn(prefix_set=[str(role)])[str(role)]
+        spawn_wg = wg_dict.spawn(prefix_set=[str(role)])
+        role_wg = spawn_wg[str(role)]
+        return role_wg
+
+    def _prepare_role_group_init(self, role_wg: RayWorkerGroup, *, role: Role) -> None:
+        """尽量提前执行不依赖最终切换发布的初始化准备。
+
+        对 one-step-off 实验 worker，优先调用显式 prepare 生命周期；
+        对未实现该接口的旧 worker，静默回退，保持兼容。
+        """
+        role_prefix = str(role)
+        for method_name in ("prepare_worker_init", "prepare_model_init"):
+            remote_method_name = f"{role_prefix}_{method_name}"
+            role_wg.execute_rank_zero_sync(remote_method_name)
+            role_wg.execute_all_sync(remote_method_name)
+
+    async def _prepare_role_group_init_async(self, role_wg: RayWorkerGroup, *, role: Role) -> None:
+        """异步 prepare 接口骨架。
+
+        当前实现先复用同步版本，统一 trainer 侧接口，便于后续把 prepare
+        真正下沉到后台任务/并发编排中。
+        """
+        result = self._prepare_role_group_init(role_wg, role=role)
+        if inspect.isawaitable(result):
+            await result
+
+    def _commit_role_group_init(self, role_wg: RayWorkerGroup, *, role: Role) -> None:
+        """执行依赖最终 worker/runtime 状态的初始化提交。
+
+        优先走新的显式 commit 生命周期；如果 worker 还未实现，回退到原始
+        `init_model()` 入口，确保非实验路径与已有逻辑不受影响。
+        """
+        role_prefix = str(role)
+        commit_worker_method = f"{role_prefix}_commit_worker_init"
+        commit_model_method = f"{role_prefix}_commit_model_init"
+        role_wg.execute_all_sync(commit_worker_method)
+        role_wg.execute_all_sync(commit_model_method)
+
+    async def _commit_role_group_init_async(self, role_wg: RayWorkerGroup, *, role: Role) -> None:
+        """异步 commit 接口骨架。
+
+        语义上该接口预留给“旧 worker 释放后再提交”的场景；当前阶段先同步执
+        行，保证调用链已成型，后续可以把真正的异步调度填进来。
+        """
+        result = self._commit_role_group_init(role_wg, role=role)
+        if inspect.isawaitable(result):
+            await result
+
+    def _get_actor_weights_info(self, actor_wg: RayWorkerGroup):
+        return actor_wg.execute_all_sync(f"{str(Role.Actor)}_get_actor_weights_info")
+
+    def _set_actor_weights_info(self, rollout_wg: RayWorkerGroup, weights_info) -> None:
+        rollout_wg.execute_all_sync(f"{str(Role.Rollout)}_set_actor_weights_info", weights_info)
+
+    def _create_actor_weight_sync_group(
+        self,
+        actor_wg: RayWorkerGroup,
+        master_address,
+        master_port,
+        rank_offset: int,
+        world_size: int,
+        group_name: str,
+    ):
+        return actor_wg.execute_all_sync(
+            f"{str(Role.Actor)}_create_weight_sync_group",
+            master_address,
+            master_port,
+            rank_offset,
+            world_size,
+            group_name,
+        )
+
+    def _create_rollout_weight_sync_group(
+        self,
+        rollout_wg: RayWorkerGroup,
+        master_address,
+        master_port,
+        rank_offset: int,
+        world_size: int,
+        group_name: str,
+    ):
+        return rollout_wg.execute_all_sync(
+            f"{str(Role.Rollout)}_create_weight_sync_group",
+            master_address,
+            master_port,
+            rank_offset,
+            world_size,
+            group_name,
+        )
+
+    def _destroy_actor_weight_sync_group(self, actor_wg: RayWorkerGroup, group_name: str):
+        return actor_wg.execute_all_sync(f"{str(Role.Actor)}_destroy_weight_sync_group", group_name)
+
+    def _destroy_rollout_weight_sync_group(self, rollout_wg: RayWorkerGroup, group_name: str):
+        return rollout_wg.execute_all_sync(f"{str(Role.Rollout)}_destroy_weight_sync_group", group_name)
 
     def add_role_group(
         self,
@@ -396,6 +766,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         resource_pool=None,
         detached: bool = False,
         name_prefix: str | None = None,
+        prepare_only: bool = False,
     ) -> RayWorkerGroup:
         role_wg = self._build_role_group(
             role,
@@ -403,9 +774,43 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             name_prefix=name_prefix,
             detached=detached,
         )
-        role_wg.init_model()
+        self._prepare_role_group_init(role_wg, role=role)
+        if not prepare_only:
+            self._commit_role_group_init(role_wg, role=role)
         group_map = self.role_groups.setdefault(role, {})
-        group_name = name or f"{role.value.lower()}_group_{len(group_map)}"
+        group_name = name or f"{str(role)}_group_{len(group_map)}"
+        group_map[group_name] = role_wg
+        return role_wg
+
+    async def add_role_group_async(
+        self,
+        role: Role,
+        *,
+        name: str | None = None,
+        resource_pool=None,
+        detached: bool = False,
+        name_prefix: str | None = None,
+        prepare_only: bool = False,
+    ) -> RayWorkerGroup:
+        """异步 role-group 创建接口骨架。
+
+        目标语义：
+        - 可以在旧 worker 生命周期未结束时，先把新 group spawn 出来并 prepare
+        - commit 则视调度策略稍后执行
+
+        当前阶段底层 spawn 仍是同步封装，因此这里先统一 async API 形态。
+        """
+        role_wg = self._build_role_group(
+            role,
+            resource_pool=resource_pool,
+            name_prefix=name_prefix,
+            detached=detached,
+        )
+        await self._prepare_role_group_init_async(role_wg, role=role)
+        if not prepare_only:
+            await self._commit_role_group_init_async(role_wg, role=role)
+        group_map = self.role_groups.setdefault(role, {})
+        group_name = name or f"{str(role)}_group_{len(group_map)}"
         group_map[group_name] = role_wg
         return role_wg
 
@@ -426,20 +831,20 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                     del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
                 )
             else:
-                weights_info = old_wg.get_actor_weights_info()[0]
-                role_wg.set_actor_weights_info(weights_info)
+                weights_info = self._get_actor_weights_info(old_wg)[0]
+                self._set_actor_weights_info(role_wg, weights_info)
 
             self.actor_wg = role_wg
             self.actor_rollout_wg = role_wg
-            weights_info = role_wg.get_actor_weights_info()[0]
-            self.rollout_wg.set_actor_weights_info(weights_info)
+            weights_info = self._get_actor_weights_info(role_wg)[0]
+            self._set_actor_weights_info(self.rollout_wg, weights_info)
 
         elif role == Role.Rollout:
             old_wg = self.rollout_wg
             if resume_from_path is not None:
                 print("Warning: rollout group does not support checkpoint restore; ignoring resume_from_path")
-            weights_info = self.actor_wg.get_actor_weights_info()[0]
-            role_wg.set_actor_weights_info(weights_info)
+            weights_info = self._get_actor_weights_info(self.actor_wg)[0]
+            self._set_actor_weights_info(role_wg, weights_info)
             self.rollout_wg = role_wg
             # Rollout manager must be rebuilt to bind the new rollout workers.
             self._init_async_rollout_manager()
@@ -481,28 +886,68 @@ class OneStepOffRayTrainer(RayPPOTrainer):
     def remove_rollout_group(self, rollout_wg: RayWorkerGroup) -> None:
         return self.remove_role_group(Role.Rollout, rollout_wg)
 
-    def _create_weight_sync_group(self):
+    def _next_weight_sync_group_name(self) -> str:
+        self._weight_sync_group_version += 1
+        return f"actor_rollout_v{self._weight_sync_group_version}"
+
+    def _register_weight_sync_group_for_cleanup(
+        self, group_name: str, actor_wg: RayWorkerGroup | None, rollout_wg: RayWorkerGroup | None
+    ) -> None:
+        if actor_wg is None or rollout_wg is None:
+            return
+        self._pending_weight_sync_group_cleanup.append((group_name, actor_wg, rollout_wg))
+
+    def _cleanup_pending_weight_sync_groups(self) -> None:
+        pending = self._pending_weight_sync_group_cleanup
+        self._pending_weight_sync_group_cleanup = []
+        for group_name, actor_wg, rollout_wg in pending:
+            try:
+                self._destroy_actor_weight_sync_group(actor_wg, group_name)
+            except Exception as exc:  # pragma: no cover - best effort cleanup
+                logger.warning(
+                    "[one-step-off][resize] warning: failed to destroy actor-side weight sync group "
+                    f"group_name={group_name}: {exc}"
+                )
+            try:
+                self._destroy_rollout_weight_sync_group(rollout_wg, group_name)
+            except Exception as exc:  # pragma: no cover - best effort cleanup
+                logger.warning(
+                    "[one-step-off][resize] warning: failed to destroy rollout-side weight sync group "
+                    f"group_name={group_name}: {exc}"
+                )
+            try:
+                collective.destroy_collective_group(group_name)
+            except Exception as exc:  # pragma: no cover - best effort cleanup
+                logger.warning(
+                    "[one-step-off][resize] warning: failed to destroy driver-side weight sync group "
+                    f"group_name={group_name}: {exc}"
+                )
+
+    def _create_weight_sync_group(self, *, group_name: str | None = None):
         from verl.utils.device import get_nccl_backend
 
         actor_rollout_workers = self.actor_wg.workers + self.rollout_wg.workers
         n_workers = len(actor_rollout_workers)
+        group_name = group_name or self._active_weight_sync_group_name
 
         if self.device_name == "npu":
             master_address = ray.get(self.actor_wg.workers[0]._get_node_ip.remote()).strip("[]")
             master_port = ray.get(self.actor_wg.workers[0]._get_free_port.remote())
-            self.actor_wg.create_weight_sync_group(
+            self._create_actor_weight_sync_group(
+                self.actor_wg,
                 master_address,
                 master_port,
                 0,
                 n_workers,
+                group_name,
             )
-            ray.get(
-                self.rollout_wg.create_weight_sync_group(
-                    master_address,
-                    master_port,
-                    len(self.actor_wg.workers),
-                    n_workers,
-                )
+            self._create_rollout_weight_sync_group(
+                self.rollout_wg,
+                master_address,
+                master_port,
+                len(self.actor_wg.workers),
+                n_workers,
+                group_name,
             )
         else:
             # Create Ray collective group for fallback communication
@@ -511,26 +956,55 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 n_workers,
                 list(range(0, n_workers)),
                 backend=get_nccl_backend(),
-                group_name="actor_rollout",
+                group_name=group_name,
             )
             # NOTE(HanlinDu): collective init not finished before broadcast, so we init here to avoid potential issues
             # may not be necessary for all cases, but safer to have it
             master_address = ray.get(self.actor_wg.workers[0]._get_node_ip.remote()).strip("[]")
             master_port = ray.get(self.actor_wg.workers[0]._get_free_port.remote())
-            self.actor_wg.create_weight_sync_group(
+            self._create_actor_weight_sync_group(
+                self.actor_wg,
                 master_address,
                 master_port,
                 0,
                 n_workers,
+                group_name,
             )
-            ray.get(
-                self.rollout_wg.create_weight_sync_group(
-                    master_address,
-                    master_port,
-                    len(self.actor_wg.workers),
-                    n_workers,
-                )
+            self._create_rollout_weight_sync_group(
+                self.rollout_wg,
+                master_address,
+                master_port,
+                len(self.actor_wg.workers),
+                n_workers,
+                group_name,
             )
+        self._active_weight_sync_group_name = group_name
+
+    def _switch_weight_sync_group(self, new_actor_wg: RayWorkerGroup, new_rollout_wg: RayWorkerGroup) -> None:
+        old_group_name = getattr(self, "_active_weight_sync_group_name", None)
+        old_actor_wg = getattr(self, "actor_wg", None)
+        old_rollout_wg = getattr(self, "rollout_wg", None)
+        new_group_name = self._next_weight_sync_group_name()
+
+        self.actor_wg = new_actor_wg
+        self.rollout_wg = new_rollout_wg
+        self.actor_rollout_wg = new_actor_wg
+        self._create_weight_sync_group(group_name=new_group_name)
+
+        if old_group_name is not None and old_actor_wg is not None and old_rollout_wg is not None:
+            self._register_weight_sync_group_for_cleanup(old_group_name, old_actor_wg, old_rollout_wg)
+
+    def _ensure_actor_training_group_binding(self) -> None:
+        """Keep shared PPO paths bound to the current actor-side group.
+
+        In one-step-off mode, rollout generation is handled explicitly by
+        `rollout_wg` / `async_rollout_manager`, while shared PPO helpers such as
+        `_balance_batch`, `compute_log_prob`, `update_actor`, profiling and
+        snapshot dumping still implicitly access `actor_rollout_wg` expecting an
+        actor-dispatch-capable group. Rebind it proactively to avoid stale or
+        rollout-only references leaking into those paths after resize.
+        """
+        self.actor_rollout_wg = self.actor_wg
 
     def _init_async_rollout_manager(self):
         # create async rollout manager and request scheduler
@@ -538,7 +1012,6 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         from verl.experimental.one_step_off_policy.agent_loop import OneStepOffAgentLoopManager
 
         self.async_rollout_mode = True
-
         if self.config.reward_model.enable and self.config.reward_model.enable_resource_pool:
             rm_resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
         else:
@@ -546,6 +1019,22 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
         self.async_rollout_manager = OneStepOffAgentLoopManager(
             config=self.config, worker_group=self.rollout_wg, rm_resource_pool=rm_resource_pool
+        )
+
+    async def _init_async_rollout_manager_async(self):
+        assert self.config.actor_rollout_ref.rollout.mode == "async"
+        from verl.experimental.one_step_off_policy.agent_loop import OneStepOffAgentLoopManager
+
+        self.async_rollout_mode = True
+        if self.config.reward_model.enable and self.config.reward_model.enable_resource_pool:
+            rm_resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+        else:
+            rm_resource_pool = None
+
+        self.async_rollout_manager = await OneStepOffAgentLoopManager.create(
+            config=self.config,
+            worker_group=self.rollout_wg,
+            rm_resource_pool=rm_resource_pool,
         )
 
     def _resolve_role_pool(self, role: Role, pool_spec: dict | None):
@@ -585,7 +1074,145 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
         raise ValueError(f"Unsupported pool spec mode: {mode}")
 
-    def _maybe_dynamic_resize(self):
+    def _is_split_resize_spec(self, pool_spec: dict | None) -> bool:
+        return bool(pool_spec) and pool_spec.get("mode", "pool") == "split"
+
+    def _should_use_staged_shared_pool_resize(self, item: dict) -> bool:
+        actor_spec = item.get("actor_pool")
+        rollout_spec = item.get("rollout_pool")
+        if not (self._is_split_resize_spec(actor_spec) and self._is_split_resize_spec(rollout_spec)):
+            logger.debug(
+                "[one-step-off][resize][staged-check] disabled: split spec mismatch, "
+                f"actor_spec={actor_spec}, rollout_spec={rollout_spec}"
+            )
+            return False
+
+        actor_size = actor_spec.get("size")
+        rollout_size = rollout_spec.get("size")
+        if not (isinstance(actor_size, list) and isinstance(rollout_size, list) and len(actor_size) == len(rollout_size)):
+            logger.debug(
+                "[one-step-off][resize][staged-check] disabled: size list mismatch, "
+                f"actor_size={actor_size}, rollout_size={rollout_size}"
+            )
+            return False
+
+        actor_target = actor_size[actor_spec.get("index", 0)]
+        rollout_target = rollout_size[rollout_spec.get("index", 0)]
+
+        # Only enable the staged path for the currently supported in-place rebalance:
+        # actor expands while rollout shrinks on the same shared split plan.
+        same_base_pool = actor_spec.get("from_pool") == rollout_spec.get("from_pool")
+        if not same_base_pool:
+            logger.debug(
+                "[one-step-off][resize][staged-check] disabled: actor/rollout base pool mismatch, "
+                f"actor_from={actor_spec.get('from_pool')}, rollout_from={rollout_spec.get('from_pool')}"
+            )
+            return False
+
+        old_actor = self._active_role_world_sizes.get(Role.Actor)
+        old_rollout = self._active_role_world_sizes.get(Role.Rollout)
+        if old_actor is None or old_rollout is None:
+            logger.debug(
+                "[one-step-off][resize][staged-check] disabled: active topology sizes missing, "
+                f"active_sizes={self._active_role_world_sizes}"
+            )
+            return False
+        enabled = same_base_pool and actor_target > old_actor and rollout_target < old_rollout
+        return enabled
+
+    async def _staged_resize_shared_pool(self, item: dict, *, actor_resume_path: str | None = None) -> None:
+        actor_spec = item["actor_pool"]
+        rollout_spec = item["rollout_pool"]
+        detached = item.get("detached", False)
+        name_prefix = item.get("name_prefix")
+
+        old_actor_wg = self.actor_wg
+        old_rollout_wg = self.rollout_wg
+        old_actor_count = self._active_role_world_sizes.get(Role.Actor)
+        old_rollout_count = self._active_role_world_sizes.get(Role.Rollout)
+        if old_actor_count is None or old_rollout_count is None:
+            raise ValueError(
+                "staged shared-pool resize requires active topology state before resize, got "
+                f"active_sizes={self._active_role_world_sizes}"
+            )
+
+        actor_target = actor_spec["size"][actor_spec.get("index", 0)]
+        rollout_target = rollout_spec["size"][rollout_spec.get("index", 0)]
+        actor_delta = actor_target - old_actor_count
+        rollout_delta = old_rollout_count - rollout_target
+
+        logger.info(
+            "[one-step-off][resize][staged] start: "
+            f"old_actor={old_actor_count}, old_rollout={old_rollout_count}, "
+            f"target_actor={actor_target}, target_rollout={rollout_target}, "
+            f"actor_delta={actor_delta}, rollout_delta={rollout_delta}"
+        )
+
+        if actor_delta <= 0 or rollout_delta <= 0:
+            raise ValueError(
+                "staged shared-pool resize currently only supports actor expansion + rollout shrink, got "
+                f"actor_delta={actor_delta}, rollout_delta={rollout_delta}"
+            )
+
+        if actor_delta > rollout_delta:
+            raise ValueError(
+                "staged shared-pool resize needs freed rollout slots to cover actor expansion, got "
+                f"actor_delta={actor_delta}, rollout_delta={rollout_delta}"
+            )
+
+        # Phase A: release the shrinking side first to free shared-pool slots.
+        self.remove_role_group(Role.Rollout, old_rollout_wg)
+
+        # Phase B: build the expanding side once resources are actually free.
+        actor_pool = self._resolve_role_pool(Role.Actor, actor_spec)
+        new_actor_wg = await self.add_role_group_async(
+            Role.Actor,
+            name=item.get("actor_group_name"),
+            resource_pool=actor_pool,
+            detached=detached,
+            name_prefix=name_prefix,
+            prepare_only=True,
+        )
+        await self._commit_role_group_init_async(new_actor_wg, role=Role.Actor)
+
+        if actor_resume_path is not None:
+            logger.info("[one-step-off][resize][staged] loading checkpoint into new actor")
+            new_actor_wg.load_checkpoint(
+                actor_resume_path,
+                del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
+            )
+        else:
+            logger.info(
+                "[one-step-off][resize][staged] new actor keeps its freshly initialized weights; "
+                "rollout weight metadata will be attached after rollout group commit"
+            )
+
+        # Phase D: create the final rollout group after actor is ready.
+        rollout_pool = self._resolve_role_pool(Role.Rollout, rollout_spec)
+        new_rollout_wg = await self.add_role_group_async(
+            Role.Rollout,
+            name=item.get("rollout_group_name"),
+            resource_pool=rollout_pool,
+            detached=detached,
+            name_prefix=name_prefix,
+            prepare_only=True,
+        )
+        await self._commit_role_group_init_async(new_rollout_wg, role=Role.Rollout)
+
+        weights_info = self._get_actor_weights_info(new_actor_wg)[0]
+        self._set_actor_weights_info(new_rollout_wg, weights_info)
+
+        # Publish the new pair together.
+        self._switch_weight_sync_group(new_actor_wg, new_rollout_wg)
+        self._publish_active_topology_state(actor_spec=actor_spec, rollout_spec=rollout_spec)
+
+        await self._init_async_rollout_manager_async()
+
+        self.remove_role_group(Role.Actor, old_actor_wg)
+        self._cleanup_pending_weight_sync_groups()
+        logger.info("[one-step-off][resize][staged] done")
+
+    async def _maybe_dynamic_resize(self):
         # Execute scheduled resize steps driven by config.trainer.dynamic_resize.
         # Accept both of the config shapes currently seen in experiments:
         #   1) a list of schedule items
@@ -614,43 +1241,67 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             if item.get("step") != self.global_steps:
                 continue
 
+            logger.info(
+                "[one-step-off][resize] trigger: "
+                f"global_step={self.global_steps}, item={item}"
+            )
+
             actor_spec = item.get("actor_pool")
             rollout_spec = item.get("rollout_pool")
             release_old = item.get("release_old", True)
             detached = item.get("detached", False)
             actor_resume_path = item.get("actor_resume_from_path")
 
+            staged_enabled = self._should_use_staged_shared_pool_resize(item)
+            if not release_old and staged_enabled:
+                logger.info("[one-step-off][resize] using staged shared-pool resize path")
+                await self._staged_resize_shared_pool(item, actor_resume_path=actor_resume_path)
+                logger.info("[one-step-off][resize] staged switch complete")
+                continue
+
             actor_pool = self._resolve_role_pool(Role.Actor, actor_spec)
             rollout_pool = self._resolve_role_pool(Role.Rollout, rollout_spec)
 
-            new_actor = self.add_role_group(
+            # 先只做新 group 的 prepare，给“旧 worker 仍存活时提前准备”预留时序。
+            new_actor = await self.add_role_group_async(
                 Role.Actor,
                 name=item.get("actor_group_name"),
                 resource_pool=actor_pool,
                 detached=detached,
                 name_prefix=item.get("name_prefix"),
+                prepare_only=True,
             )
-            new_rollout = self.add_role_group(
+            new_rollout = await self.add_role_group_async(
                 Role.Rollout,
                 name=item.get("rollout_group_name"),
                 resource_pool=rollout_pool,
                 detached=detached,
                 name_prefix=item.get("name_prefix"),
+                prepare_only=True,
             )
-            self._switch_actor_rollout_groups(
+            await self._switch_actor_rollout_groups(
                 new_actor,
                 new_rollout,
                 resume_from_path=actor_resume_path,
                 release_old=release_old,
+                actor_spec=actor_spec,
+                rollout_spec=rollout_spec,
+            )
+            logger.info(
+                "[one-step-off][resize] switch complete: actor=%s, rollout=%s",
+                len(getattr(new_actor, "workers", [])),
+                len(getattr(new_rollout, "workers", [])),
             )
 
-    def _switch_actor_rollout_groups(
+    async def _switch_actor_rollout_groups(
         self,
         new_actor_wg: RayWorkerGroup,
         new_rollout_wg: RayWorkerGroup,
         *,
         resume_from_path: str | None = None,
         release_old: bool = False,
+        actor_spec: dict | None = None,
+        rollout_spec: dict | None = None,
     ) -> None:
         # Dynamic resize must switch actor and rollout as one pair. Updating them
         # one by one temporarily creates a mixed topology (new actor + old rollout
@@ -660,36 +1311,62 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         old_actor_wg = self.actor_wg
         old_rollout_wg = self.rollout_wg
 
+        # Phase 1: 收缩旧拓扑。
+        # prepare 已经在旧 worker 存活时提前完成；如果当前策略允许释放旧 group，
+        # 则优先在切换窗口开始时回收旧资源，再执行新 group 的 commit。
+        if release_old:
+            self.remove_role_group(Role.Actor, old_actor_wg)
+            self.remove_role_group(Role.Rollout, old_rollout_wg)
+
+        # Phase 2: 提交新拓扑。
+        # 这一阶段执行真正依赖最终 worker/runtime 状态的初始化。
+        await self._commit_role_group_init_async(new_actor_wg, role=Role.Actor)
+        await self._commit_role_group_init_async(new_rollout_wg, role=Role.Rollout)
+
+        # Phase 3: 恢复/传递权重状态。
+        # actor 先恢复可训练状态，再把最新参数视图传给 rollout。
         if resume_from_path is not None:
+            logger.info("[one-step-off][resize] loading checkpoint into new actor")
             new_actor_wg.load_checkpoint(
                 resume_from_path,
                 del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
             )
         else:
-            weights_info = old_actor_wg.get_actor_weights_info()[0]
-            new_actor_wg.set_actor_weights_info(weights_info)
+            logger.info(
+                "[one-step-off][resize] new actor keeps its freshly initialized weights; "
+                "rollout weight metadata will be attached afterwards"
+            )
 
-        weights_info = new_actor_wg.get_actor_weights_info()[0]
-        new_rollout_wg.set_actor_weights_info(weights_info)
+        weights_info = self._get_actor_weights_info(new_actor_wg)[0]
+        self._set_actor_weights_info(new_rollout_wg, weights_info)
 
-        self.actor_wg = new_actor_wg
-        self.rollout_wg = new_rollout_wg
-        self.actor_rollout_wg = new_actor_wg
+        # Phase 4: 发布新拓扑。
+        # actor/rollout 必须作为一对同时对外可见，避免混合拓扑。
+        self._switch_weight_sync_group(new_actor_wg, new_rollout_wg)
+        self._publish_active_topology_state(actor_spec=actor_spec, rollout_spec=rollout_spec)
 
-        # Rollout manager and sync group both depend on the final actor/rollout pair,
-        # so rebuild them only after both references are updated.
-        self._init_async_rollout_manager()
-        self._create_weight_sync_group()
+        # Phase 5: 重建依赖最终拓扑的管理器和同步链路。
+        # Rollout manager 和 sync group 都依赖最终 actor/rollout 对，因此必须在
+        # publish 之后统一重建。
+        await self._init_async_rollout_manager_async()
 
-        if release_old:
+        # Phase 6: 兼容旧策略的延后清理。
+        # 当 release_old=False 时，保留旧语义：新拓扑发布完后再释放旧 group。
+        if not release_old:
             self.remove_role_group(Role.Actor, old_actor_wg)
             self.remove_role_group(Role.Rollout, old_rollout_wg)
+            self._cleanup_pending_weight_sync_groups()
 
 
     def _post_load_checkpoint_for_switch(self) -> None:
         self.sync_rollout_weights()
         if self.async_rollout_manager is not None:
-            asyncio.run(self.async_rollout_manager.clear_kv_cache())
+            self.async_rollout_manager.clear_kv_cache()
+
+    async def _post_load_checkpoint_for_switch_async(self) -> None:
+        self.sync_rollout_weights()
+        if self.async_rollout_manager is not None:
+            await self.async_rollout_manager.clear_kv_cache_async()
 
     def sync_rollout_weights(self):
         actor_workers = getattr(self.actor_wg, "workers", [])
@@ -739,6 +1416,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         """
         Call parameter synchronization and asynchronous sequence generation.
         """
+        self._ensure_actor_training_group_binding()
         try:
             epoch, batch_dict = next(continuous_iterator)
         except StopIteration:
@@ -776,6 +1454,13 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         # repeat to align with repeated responses in rollout
         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
         batch = batch.union(gen_batch_output)
+
+        # Dynamic-resize can change the active actor/critic topology between
+        # steps. Any downstream path that reasons about the current DP shape
+        # (for example `_balance_batch`) must therefore see a batch that has
+        # already been aligned to the active runtime topology. Keep this local
+        # to the one-step-off trainer so the shared PPO path remains unchanged.
+        batch = self._apply_runtime_batch_plan(batch)
 
         if "response_mask" not in batch.batch.keys():
             batch.batch["response_mask"] = compute_response_mask(batch)
@@ -858,6 +1543,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         )
 
         self.global_steps = 0
+        self._ensure_actor_training_group_binding()
 
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -898,6 +1584,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         batch_data_future = asyncio.create_task(self._async_gen_next_batch(continuous_iterator))
 
         while batch_data_future is not None:
+            self._ensure_actor_training_group_binding()
             do_profile = (
                 self.global_steps in self.config.global_profiler.steps
                 if self.config.global_profiler.steps is not None
@@ -1071,6 +1758,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                         norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                         config=self.config.algorithm,
                     )
+                    self._maybe_record_resize_history_batch(batch)
                 await asyncio.sleep(0)
 
                 # update critic
@@ -1135,7 +1823,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
             # dynamic resize of actor/rollout pool
             # NOTE(HanlinDu): this may be executed asynchronously with _save_checkpoint()
-            self._maybe_dynamic_resize()
+            await self._maybe_dynamic_resize()
 
             with marked_timer("stop_profile", timing_raw):
                 next_step_profile = (

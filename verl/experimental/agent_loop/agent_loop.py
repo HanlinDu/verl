@@ -860,12 +860,64 @@ class AgentLoopManager:
         if not hasattr(self, "agent_loop_workers_class"):
             self.agent_loop_workers_class = ray.remote(AgentLoopWorker)
 
+        print(
+            "[agent-loop][resize] AgentLoopManager init start: "
+            f"worker_group={'yes' if self.worker_group else 'no'}, "
+            f"reward_router_address={self.reward_router_address}"
+        )
         self._initialize_llm_servers()
+        print("[agent-loop][resize] AgentLoopManager llm servers initialized")
         self._init_agent_loop_workers()
+        print(
+            "[agent-loop][resize] AgentLoopManager workers initialized: "
+            f"num_workers={len(getattr(self, 'agent_loop_workers', []))}"
+        )
 
         # Initially we're in sleep mode.
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.sleep()
+
+    @classmethod
+    async def create(
+        cls, config: DictConfig, worker_group: RayWorkerGroup = None, rm_resource_pool: RayResourcePool = None
+    ):
+        instance = cls.__new__(cls)
+        await instance._async_init(config, worker_group, rm_resource_pool)
+        return instance
+
+    async def _async_init(
+        self, config: DictConfig, worker_group: RayWorkerGroup = None, rm_resource_pool: RayResourcePool = None
+    ):
+        self.config = config
+        self.worker_group = worker_group
+        self.reward_model_manager = None
+        self.reward_router_address = None
+        if self.config.reward_model.enable and self.config.reward_model.enable_resource_pool:
+            from verl.experimental.reward_loop import RewardModelManager
+
+            self.reward_model_manager = RewardModelManager(config.reward_model, rm_resource_pool)
+            self.reward_router_address = self.reward_model_manager.get_router_address()
+
+        if not hasattr(self, "rollout_replica_class"):
+            self.rollout_replica_class = get_rollout_replica_class(self.config.actor_rollout_ref.rollout.name)
+        if not hasattr(self, "agent_loop_workers_class"):
+            self.agent_loop_workers_class = ray.remote(AgentLoopWorker)
+
+        print(
+            "[agent-loop][resize] AgentLoopManager async init start: "
+            f"worker_group={'yes' if self.worker_group else 'no'}, "
+            f"reward_router_address={self.reward_router_address}"
+        )
+        await self._initialize_llm_servers_async()
+        print("[agent-loop][resize] AgentLoopManager llm servers initialized")
+        self._init_agent_loop_workers()
+        print(
+            "[agent-loop][resize] AgentLoopManager workers initialized: "
+            f"num_workers={len(getattr(self, 'agent_loop_workers', []))}"
+        )
+
+        if self.config.actor_rollout_ref.rollout.free_cache_engine:
+            await self.sleep_async()
 
     def _initialize_llm_servers(self):
         rollout_world_size = (
@@ -891,14 +943,21 @@ class AgentLoopManager:
             )
             for replica_rank in range(num_replicas)
         ]
+        print(
+            "[agent-loop][resize] _initialize_llm_servers: "
+            f"world_size={world_size}, rollout_world_size={rollout_world_size}, num_replicas={num_replicas}"
+        )
         if self.worker_group:
+            print("[agent-loop][resize] _initialize_llm_servers using init_hybrid")
             self._run_all([server.init_hybrid(self.worker_group) for server in self.rollout_replicas])
         else:
+            print("[agent-loop][resize] _initialize_llm_servers using init_standalone")
             self._run_all([server.init_standalone() for server in self.rollout_replicas])
         self.server_handles = [server._server_handle for server in self.rollout_replicas]
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
 
         print(f"AgentLoopManager: {self.server_addresses}")
+        print("[agent-loop][resize] _initialize_llm_servers done")
 
         # Update Prometheus configuration with server addresses
         if rollout_config.prometheus.enable:
@@ -906,14 +965,69 @@ class AgentLoopManager:
                 raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
             update_prometheus_config(rollout_config.prometheus, self.server_addresses, rollout_config.name)
 
+    async def _initialize_llm_servers_async(self):
+        rollout_world_size = (
+            self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
+            * self.config.actor_rollout_ref.rollout.data_parallel_size
+            * self.config.actor_rollout_ref.rollout.pipeline_model_parallel_size
+        )
+        world_size = (
+            self.worker_group.world_size
+            if self.worker_group
+            else self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
+        )
+        num_replicas = world_size // rollout_world_size
+
+        rollout_config = self.config.actor_rollout_ref.rollout
+        model_config = self.config.actor_rollout_ref.model
+        self.rollout_replicas = [
+            self.rollout_replica_class(
+                replica_rank=replica_rank,
+                config=rollout_config,
+                model_config=model_config,
+                gpus_per_node=self.config.trainer.n_gpus_per_node,
+            )
+            for replica_rank in range(num_replicas)
+        ]
+        print(
+            "[agent-loop][resize] _initialize_llm_servers_async: "
+            f"world_size={world_size}, rollout_world_size={rollout_world_size}, num_replicas={num_replicas}"
+        )
+        if self.worker_group:
+            print("[agent-loop][resize] _initialize_llm_servers_async using init_hybrid")
+            await asyncio.gather(*[server.init_hybrid(self.worker_group) for server in self.rollout_replicas])
+        else:
+            print("[agent-loop][resize] _initialize_llm_servers_async using init_standalone")
+            await asyncio.gather(*[server.init_standalone() for server in self.rollout_replicas])
+        self.server_handles = [server._server_handle for server in self.rollout_replicas]
+        self.server_addresses = [server._server_address for server in self.rollout_replicas]
+
+        print(f"AgentLoopManager: {self.server_addresses}")
+        print("[agent-loop][resize] _initialize_llm_servers_async done")
+
+        if rollout_config.prometheus.enable:
+            if rollout_config.disable_log_stats:
+                raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
+            await asyncio.to_thread(
+                update_prometheus_config, rollout_config.prometheus, self.server_addresses, rollout_config.name
+            )
+
     def _init_agent_loop_workers(self):
         self.agent_loop_workers = []
         num_workers = self.config.actor_rollout_ref.rollout.agent.num_workers
 
         node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
+        print(
+            "[agent-loop][resize] _init_agent_loop_workers start: "
+            f"num_workers={num_workers}, available_nodes={len(node_ids)}"
+        )
         for i in range(num_workers):
             # Round-robin scheduling over the all nodes
             node_id = node_ids[i % len(node_ids)]
+            print(
+                "[agent-loop][resize] creating agent loop worker: "
+                f"index={i}, node_id={node_id}, server_handles={len(self.server_handles)}"
+            )
             self.agent_loop_workers.append(
                 self.agent_loop_workers_class.options(
                     name=f"agent_loop_worker_{i}" + f"_{uuid4().hex[:8]}",
@@ -922,6 +1036,7 @@ class AgentLoopManager:
                     ),
                 ).remote(self.config, self.server_handles, self.reward_router_address)
             )
+    print("[agent-loop][resize] _init_agent_loop_workers done")
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Split input batch and dispatch to agent loop workers.
@@ -985,13 +1100,25 @@ class AgentLoopManager:
         """Wake up all rollout replica instances."""
         self._run_all([replica.wake_up() for replica in self.rollout_replicas])
 
+    async def wake_up_async(self):
+        """Wake up all rollout replica instances."""
+        await asyncio.gather(*[replica.wake_up() for replica in self.rollout_replicas])
+
     def sleep(self):
         """Sleep all rollout replica instances."""
         self._run_all([replica.sleep() for replica in self.rollout_replicas])
 
+    async def sleep_async(self):
+        """Sleep all rollout replica instances."""
+        await asyncio.gather(*[replica.sleep() for replica in self.rollout_replicas])
+
     def clear_kv_cache(self):
         """Clear all rollout kv cache, but don`t sleep."""
         self._run_all([replica.clear_kv_cache() for replica in self.rollout_replicas])
+
+    async def clear_kv_cache_async(self):
+        """Clear all rollout kv cache, but don`t sleep."""
+        await asyncio.gather(*[replica.clear_kv_cache() for replica in self.rollout_replicas])
 
     def _run_all(self, tasks: list[asyncio.Task]):
         async def run_all():

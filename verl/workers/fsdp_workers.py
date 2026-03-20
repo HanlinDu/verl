@@ -147,13 +147,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def __init__(self, config: DictConfig, role: str, **kwargs):
         Worker.__init__(self)
 
-        if int(os.environ.get("VERL_DEBUG_ACTOR", "0")) == 1:
-            print(
-                " ---DHL: ActorRolloutRefWorker init entry, "
-                f"pid={os.getpid()}, role_arg={role}, "
-                f"rank_env={os.environ.get('RANK')}, world_size_env={os.environ.get('WORLD_SIZE')}"
-            )
-
         self.config = config
         import torch.distributed
 
@@ -201,12 +194,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
-        if int(os.environ.get("VERL_DEBUG_ACTOR", "0")) == 1:
-            print(
-                " ---DHL: ActorRolloutRefWorker init, "
-                f"pid={os.getpid()}, role={self.role}, is_actor={self._is_actor}, "
-                f"is_rollout={self._is_rollout}, is_ref={self._is_ref}"
-            )
         self.use_orig_params = self.config.actor.fsdp_config.get("use_orig_params", False)
 
         # TODO(haibin.lin):
@@ -793,13 +780,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def init_model(self):
         from verl.workers.actor import DataParallelPPOActor
 
-        debug_enabled = int(os.environ.get("VERL_DEBUG_ACTOR", "0")) == 1
-        if debug_enabled and (self._is_actor or self._is_rollout):
-            print(
-                " ---DHL: init_model start, "
-                f"role={self.role}, is_actor={self._is_actor}, is_rollout={self._is_rollout}"
-            )
-
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
 
@@ -853,11 +833,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 offload_fsdp_model_to_cpu(self.actor_module_fsdp)
                 log_gpu_memory_usage("After offload actor model during init", logger=logger)
 
-            if debug_enabled:
-                print(
-                    " ---DHL: init_model done, "
-                    f"role={self.role}, is_actor={self._is_actor}, is_rollout={self._is_rollout}"
-                )
 
             if self._is_offload_optimizer:
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)

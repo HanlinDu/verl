@@ -204,7 +204,8 @@ class DataParallelPPOCritic(BasePPOCritic):
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        mini_batches = data.split(self.config.ppo_mini_batch_size)
+        runtime_mini_batch_size = data.meta_info.get("critic_mini_batch_size", self.config.ppo_mini_batch_size)
+        mini_batches = data.split(runtime_mini_batch_size)
 
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
@@ -212,9 +213,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
-                    self.gradient_accumulation = (
-                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                    )
+                    self.gradient_accumulation = runtime_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.critic_optimizer.zero_grad()
@@ -238,7 +237,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                     )
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
-                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                        loss_scale_factor = response_mask.shape[0] / runtime_mini_batch_size
                         loss = vf_loss * loss_scale_factor
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
