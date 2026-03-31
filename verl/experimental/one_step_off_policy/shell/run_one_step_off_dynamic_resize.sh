@@ -18,8 +18,20 @@ VAL_FILE=${VAL_FILE:-/file_system/common-data/new_gsm8k/test.parquet}
 n_gpus_rollout=${N_GPUS_ROLLOUT:-4}
 n_gpus_training=$((NUM_GPUS - n_gpus_rollout))
 resize_step=${RESIZE_STEP:-2}
+second_resize_step=$((resize_step + 2))
 shared_pool_gpus=${SHARED_POOL_GPUS:-${NUM_GPUS}}
-split_plan=${SPLIT_PLAN:-"[6,2]"}
+first_split_plan=${FIRST_SPLIT_PLAN:-${SPLIT_PLAN:-"[6,2]"}}
+second_split_plan=${SECOND_SPLIT_PLAN:-"[2,6]"}
+total_training_steps=${TOTAL_TRAINING_STEPS:-$((second_resize_step + 2))}
+CKPT_DIR=${CKPT_DIR:-/file_system/dhl/save_ckpt/dynamic-resize}
+RAY_TMPDIR=${RAY_TMPDIR:-}
+
+if [[ -n "${RAY_TMPDIR}" ]]; then
+  mkdir -p "${RAY_TMPDIR}"
+  export RAY_TMPDIR
+fi
+
+mkdir -p "${CKPT_DIR}"
 
 python3 -m verl.experimental.one_step_off_policy.main_ppo \
   --config-path=config \
@@ -31,22 +43,32 @@ python3 -m verl.experimental.one_step_off_policy.main_ppo \
   trainer.n_gpus_per_node=${n_gpus_training} \
   rollout.nnodes=1 \
   rollout.n_gpus_per_node=${n_gpus_rollout} \
-  trainer.total_training_steps=5 \
+  trainer.default_local_dir="${CKPT_DIR}" \
+  trainer.total_training_steps=${total_training_steps} \
   trainer.save_freq=-1 \
   trainer.dynamic_resize.shared_pool.n_gpus_per_node=${shared_pool_gpus} \
   +trainer.dynamic_resize.schedule.stage1.step=${resize_step} \
   +trainer.dynamic_resize.schedule.stage1.actor_pool.mode=split \
   +trainer.dynamic_resize.schedule.stage1.actor_pool.from_pool=shared_pool \
   +trainer.dynamic_resize.schedule.stage1.actor_pool.index=0 \
-  +trainer.dynamic_resize.schedule.stage1.actor_pool.size=${split_plan} \
+  +trainer.dynamic_resize.schedule.stage1.actor_pool.size=${first_split_plan} \
   +trainer.dynamic_resize.schedule.stage1.rollout_pool.mode=split \
   +trainer.dynamic_resize.schedule.stage1.rollout_pool.from_pool=shared_pool \
   +trainer.dynamic_resize.schedule.stage1.rollout_pool.index=1 \
-  +trainer.dynamic_resize.schedule.stage1.rollout_pool.size=${split_plan} \
+  +trainer.dynamic_resize.schedule.stage1.rollout_pool.size=${first_split_plan} \
   +trainer.dynamic_resize.schedule.stage1.release_old=false \
+  +trainer.dynamic_resize.schedule.stage2.step=${second_resize_step} \
+  +trainer.dynamic_resize.schedule.stage2.actor_pool.mode=split \
+  +trainer.dynamic_resize.schedule.stage2.actor_pool.from_pool=shared_pool \
+  +trainer.dynamic_resize.schedule.stage2.actor_pool.index=0 \
+  +trainer.dynamic_resize.schedule.stage2.actor_pool.size=${second_split_plan} \
+  +trainer.dynamic_resize.schedule.stage2.rollout_pool.mode=split \
+  +trainer.dynamic_resize.schedule.stage2.rollout_pool.from_pool=shared_pool \
+  +trainer.dynamic_resize.schedule.stage2.rollout_pool.index=1 \
+  +trainer.dynamic_resize.schedule.stage2.rollout_pool.size=${second_split_plan} \
+  +trainer.dynamic_resize.schedule.stage2.release_old=false \
   trainer.test_freq=-1 \
   trainer.resume_mode=disable \
-  trainer.total_training_steps=4 \
   trainer.logger='["console"]' \
   actor_rollout_ref.hybrid_engine=false \
   actor_rollout_ref.actor.use_torch_compile=false \
@@ -62,3 +84,7 @@ python3 -m verl.experimental.one_step_off_policy.main_ppo \
   actor_rollout_ref.rollout.gpu_memory_utilization=0.3 \
   critic.model.path="${RESOLVED_MODEL_PATH}" \
   critic.model.tokenizer_path="${RESOLVED_MODEL_PATH}"
+
+  +global_profiler.enabled=true \
+  +global_profiler.tool=torch_profiler \
+  +global_profiler.save_dir="${CKPT_DIR}/profiler"

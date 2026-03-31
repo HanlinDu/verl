@@ -21,7 +21,8 @@ from dataclasses import fields
 
 import torch
 import torch.distributed
-from omegaconf import DictConfig, OmegaConf, open_dict
+from packaging import version
+from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from ray.util.collective import collective
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
@@ -35,7 +36,10 @@ from verl.utils.device import (
     get_torch_device,
 )
 from verl.utils.fsdp_utils import (
+    fsdp2_load_full_state_dict,
+    get_fsdp_full_state_dict,
     fsdp_version,
+    load_fsdp_optimizer,
     load_fsdp_model_to_gpu,
     offload_fsdp_optimizer,
     offload_fsdp_model_to_cpu,
@@ -64,6 +68,48 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 __all__ = ["DetachActorWorker", "DetachAsyncRolloutWorker", "CriticWorker", "RewardModelWorker"]
+
+
+def _get_reshardable_optimizer_state_dict_api():
+    if version.parse(torch.__version__) >= version.parse("2.7.0"):
+        from torch.distributed.checkpoint.state_dict import (
+            StateDictOptions,
+            get_optimizer_state_dict,
+            set_optimizer_state_dict,
+        )
+    else:
+        from verl.third_party.torch.distributed.checkpoint.state_dict import (
+            StateDictOptions,
+            get_optimizer_state_dict,
+            set_optimizer_state_dict,
+        )
+
+    return StateDictOptions, get_optimizer_state_dict, set_optimizer_state_dict
+
+
+def _to_builtin_python_container(obj):
+    if isinstance(obj, DictConfig | ListConfig):
+        return OmegaConf.to_container(obj, resolve=True)
+    if isinstance(obj, list | tuple):
+        converted = [_to_builtin_python_container(item) for item in obj]
+        return tuple(converted) if isinstance(obj, tuple) else converted
+    if isinstance(obj, dict):
+        return {key: _to_builtin_python_container(value) for key, value in obj.items()}
+    return obj
+
+
+def _sanitize_optimizer_container_values(optimizer) -> None:
+    if optimizer is None:
+        return
+
+    optimizer.defaults = _to_builtin_python_container(dict(optimizer.defaults))
+    for group in optimizer.param_groups:
+        for key, value in list(group.items()):
+            if key == "params":
+                continue
+            group[key] = _to_builtin_python_container(value)
+    for state_key, state_value in list(optimizer.state.items()):
+        optimizer.state[state_key] = _to_builtin_python_container(state_value)
 
 
 def _sanitize_actor_config_for_dataclass(actor_cfg):
@@ -848,6 +894,99 @@ class DetachActorWorker(DetachSync):
             ret.append((key, tensor.size(), tensor.dtype))
         self._weights_info = ret
         return ret
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def save_actor_handoff_state(self, local_path: str):
+        assert self._is_actor
+
+        logger.info("[one-step-off][resize][handoff] rank=%s saving actor handoff state to %s", self.rank, local_path)
+
+        os.makedirs(local_path, exist_ok=True) if self.rank == 0 else None
+        torch.distributed.barrier()
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(self.actor_optimizer, device_id=get_torch_device().current_device())
+
+        _sanitize_optimizer_container_values(self.actor_optimizer)
+
+        logger.info("[one-step-off][resize][handoff] rank=%s collecting full model state", self.rank)
+        model_state_dict = get_fsdp_full_state_dict(self.actor_module_fsdp, offload_to_cpu=True, rank0_only=True)
+
+        logger.info("[one-step-off][resize][handoff] rank=%s collecting optimizer state", self.rank)
+        StateDictOptions, get_optimizer_state_dict, _ = _get_reshardable_optimizer_state_dict_api()
+        options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+        optim_state_dict = get_optimizer_state_dict(self.actor_module_fsdp, self.actor_optimizer, options=options)
+
+        if self.rank == 0:
+            torch.save(model_state_dict, os.path.join(local_path, "model_state.pt"))
+            torch.save(optim_state_dict, os.path.join(local_path, "optim_state.pt"))
+            torch.save(
+                {
+                    "lr_scheduler": self.actor_lr_scheduler.state_dict() if self.actor_lr_scheduler is not None else None,
+                    "rng": self.checkpoint_manager.get_rng_state() if self.checkpoint_manager is not None else None,
+                },
+                os.path.join(local_path, "extra_state.pt"),
+            )
+
+        torch.distributed.barrier()
+
+        logger.info("[one-step-off][resize][handoff] rank=%s finished saving actor handoff state", self.rank)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(self.actor_optimizer)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_actor_handoff_state(self, local_path: str):
+        assert self._is_actor
+
+        logger.info("[one-step-off][resize][handoff] rank=%s loading actor handoff state from %s", self.rank, local_path)
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(self.actor_optimizer, device_id=get_torch_device().current_device())
+
+        _sanitize_optimizer_container_values(self.actor_optimizer)
+
+        if self.rank == 0:
+            model_state_dict = torch.load(os.path.join(local_path, "model_state.pt"), weights_only=False)
+            optim_state_dict = torch.load(os.path.join(local_path, "optim_state.pt"), weights_only=False)
+            extra_state = torch.load(os.path.join(local_path, "extra_state.pt"), weights_only=False)
+        else:
+            model_state_dict = {}
+            optim_state_dict = {}
+            extra_state = None
+
+        logger.info("[one-step-off][resize][handoff] rank=%s restoring full model state", self.rank)
+        if fsdp_version(self.actor_module_fsdp) == 2:
+            cpu_offload = True if self.config.actor.fsdp_config.get("offload_policy", False) else None
+            fsdp2_load_full_state_dict(self.actor_module_fsdp, model_state_dict, self.device_mesh, cpu_offload)
+        else:
+            raise NotImplementedError("actor handoff currently supports fsdp2 only")
+
+        logger.info("[one-step-off][resize][handoff] rank=%s restoring optimizer state", self.rank)
+        StateDictOptions, _, set_optimizer_state_dict = _get_reshardable_optimizer_state_dict_api()
+        options = StateDictOptions(full_state_dict=True, cpu_offload=True, broadcast_from_rank0=True)
+        set_optimizer_state_dict(self.actor_module_fsdp, self.actor_optimizer, optim_state_dict, options=options)
+
+        extra_state_list = [extra_state]
+        torch.distributed.broadcast_object_list(extra_state_list, src=0)
+        extra_state = extra_state_list[0]
+        if extra_state is not None and self.actor_lr_scheduler is not None and extra_state.get("lr_scheduler") is not None:
+            self.actor_lr_scheduler.load_state_dict(extra_state["lr_scheduler"])
+        if extra_state is not None and self.checkpoint_manager is not None and extra_state.get("rng") is not None:
+            self.checkpoint_manager.load_rng_state(extra_state["rng"])
+
+        logger.info("[one-step-off][resize][handoff] rank=%s finished loading actor handoff state", self.rank)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(self.actor_optimizer)
 
 
 class DetachAsyncRolloutWorker(DetachSync):

@@ -62,3 +62,20 @@ class OneStepOffAgentLoopManager(AgentLoopManager):
 
     async def clear_kv_cache(self):
         await asyncio.gather(*[replica.clear_kv_cache() for replica in self.rollout_replicas])
+
+    async def shutdown_async(self):
+        handles = []
+        handles.extend(getattr(self, "agent_loop_workers", []) or [])
+        for replica in getattr(self, "rollout_replicas", []) or []:
+            handles.extend(getattr(replica, "servers", []) or [])
+
+        seen_actor_ids = set()
+        for handle in handles:
+            actor_id = getattr(handle, "_actor_id", None)
+            if actor_id in seen_actor_ids:
+                continue
+            seen_actor_ids.add(actor_id)
+            try:
+                ray.kill(handle)
+            except Exception as exc:  # pragma: no cover - best effort cleanup
+                logger.warning("[one-step-off][resize] failed to kill async rollout actor %s: %s", handle, exc)

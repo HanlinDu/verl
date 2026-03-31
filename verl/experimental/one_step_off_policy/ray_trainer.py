@@ -24,6 +24,7 @@ import inspect
 import logging
 import math
 import os
+import shutil
 import socket
 import uuid
 from pprint import pprint
@@ -76,16 +77,17 @@ class OneStepOffRayTrainer(RayPPOTrainer):
     #
     # Layer 2: resource transition
     #   - release the shrinking side first (e.g. old rollout 4 -> 2 releases 2 slots)
-    #   - create the expanding side with the freed slots (e.g. actor 4 -> 6 consumes the 2 slots)
+    #   - create/rebuild the new actor on the freed slots
+    #   - release the other old side if needed, then create the new rollout
     #
     # Layer 3: final commit/publish
     #   - commit new worker/model init
     #   - restore/copy weights
     #   - publish new actor/rollout pair and rebuild dependent managers/groups
     #
-    # For the current shared-pool 4+4 -> 6+2 case on 8 GPUs, trying to build the
-    # full new 6-actor group before shrinking old rollout over-allocates the pool
-    # and leaves the new actors stuck in PENDING_CREATION.
+    # For shared-pool in-place rebalance such as 4+4 -> 6+2 or 6+2 -> 2+6 on 8 GPUs,
+    # trying to build the full new topology before shrinking the old one can
+    # over-allocate the pool and leave new workers stuck in PENDING_CREATION.
     # TODO: support each role have individual ray_worker_group_cls,
     # i.e., support different backend of different role
     def __init__(
@@ -1122,6 +1124,104 @@ class OneStepOffRayTrainer(RayPPOTrainer):
     def _is_split_resize_spec(self, pool_spec: dict | None) -> bool:
         return bool(pool_spec) and pool_spec.get("mode", "pool") == "split"
 
+    def _get_staged_shared_pool_resize_plan(self, item: dict) -> dict:
+        actor_spec = item["actor_pool"]
+        rollout_spec = item["rollout_pool"]
+
+        old_actor_count = self._active_role_world_sizes.get(Role.Actor)
+        old_rollout_count = self._active_role_world_sizes.get(Role.Rollout)
+        if old_actor_count is None or old_rollout_count is None:
+            raise ValueError(
+                "staged shared-pool resize requires active topology state before resize, got "
+                f"active_sizes={self._active_role_world_sizes}"
+            )
+
+        actor_target = actor_spec["size"][actor_spec.get("index", 0)]
+        rollout_target = rollout_spec["size"][rollout_spec.get("index", 0)]
+        actor_delta = actor_target - old_actor_count
+        rollout_delta = rollout_target - old_rollout_count
+
+        if actor_delta == 0 and rollout_delta == 0:
+            raise ValueError("staged shared-pool resize got a no-op target topology")
+        if actor_delta * rollout_delta >= 0:
+            raise ValueError(
+                "staged shared-pool resize requires one role to expand and the other to shrink, got "
+                f"actor_delta={actor_delta}, rollout_delta={rollout_delta}"
+            )
+        if abs(actor_delta) != abs(rollout_delta):
+            raise ValueError(
+                "staged shared-pool resize requires balanced split reallocation, got "
+                f"actor_delta={actor_delta}, rollout_delta={rollout_delta}"
+            )
+
+        shrinking_role = Role.Actor if actor_delta < 0 else Role.Rollout
+        expanding_role = Role.Rollout if shrinking_role == Role.Actor else Role.Actor
+        delta = abs(actor_delta)
+
+        return {
+            "actor_spec": actor_spec,
+            "rollout_spec": rollout_spec,
+            "old_actor_count": old_actor_count,
+            "old_rollout_count": old_rollout_count,
+            "actor_target": actor_target,
+            "rollout_target": rollout_target,
+            "actor_delta": actor_delta,
+            "rollout_delta": rollout_delta,
+            "shrinking_role": shrinking_role,
+            "expanding_role": expanding_role,
+            "delta": delta,
+        }
+
+    def _resolve_staged_actor_resume(self, actor_resume_path: str | None) -> tuple[str | None, bool, str | None]:
+        if actor_resume_path is not None:
+            logger.info("[one-step-off][resize][resume] using explicit actor checkpoint path: %s", actor_resume_path)
+            return actor_resume_path, False, "checkpoint"
+
+        checkpoint_folder = self.config.trainer.default_local_dir
+        if not os.path.isabs(checkpoint_folder):
+            checkpoint_folder = os.path.join(os.getcwd(), checkpoint_folder)
+        handoff_dir = os.path.join(checkpoint_folder, f"dynamic_resize_actor_handoff_step_{self.global_steps}")
+        logger.info("[one-step-off][resize][handoff] using temporary actor handoff dir: %s", handoff_dir)
+        return handoff_dir, True, "handoff"
+
+    def _normalize_actor_resume_load_path(self, actor_resume_path: str | None) -> str | None:
+        if actor_resume_path is None:
+            return None
+
+        actor_subdir = os.path.join(actor_resume_path, "actor")
+        if os.path.isdir(actor_subdir):
+            return actor_subdir
+        return actor_resume_path
+
+    async def _shutdown_async_rollout_manager_async(self) -> None:
+        manager = getattr(self, "async_rollout_manager", None)
+        if manager is None:
+            return
+
+        shutdown_async = getattr(manager, "shutdown_async", None)
+        if shutdown_async is None:
+            self.async_rollout_manager = None
+            return
+
+        result = shutdown_async()
+        if inspect.isawaitable(result):
+            await result
+        self.async_rollout_manager = None
+
+    def _has_dynamic_resize_scheduled_at_step(self, step: int) -> bool:
+        cfg = OmegaConf.select(self.config.trainer, "dynamic_resize")
+        if cfg is None:
+            return False
+        cfg = OmegaConf.to_container(cfg, resolve=True)
+        if not cfg.get("enable", True):
+            return False
+        schedule = cfg.get("schedule", []) or []
+        if isinstance(schedule, dict):
+            schedule = list(schedule.values())
+        if not isinstance(schedule, list):
+            return False
+        return any(isinstance(item, dict) and item.get("step") == step for item in schedule)
+
     def _should_use_staged_shared_pool_resize(self, item: dict) -> bool:
         actor_spec = item.get("actor_pool")
         rollout_spec = item.get("rollout_pool")
@@ -1141,11 +1241,6 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             )
             return False
 
-        actor_target = actor_size[actor_spec.get("index", 0)]
-        rollout_target = rollout_size[rollout_spec.get("index", 0)]
-
-        # Only enable the staged path for the currently supported in-place rebalance:
-        # actor expands while rollout shrinks on the same shared split plan.
         same_base_pool = actor_spec.get("from_pool") == rollout_spec.get("from_pool")
         if not same_base_pool:
             logger.debug(
@@ -1162,53 +1257,58 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 f"active_sizes={self._active_role_world_sizes}"
             )
             return False
-        enabled = same_base_pool and actor_target > old_actor and rollout_target < old_rollout
+
+        actor_target = actor_size[actor_spec.get("index", 0)]
+        rollout_target = rollout_size[rollout_spec.get("index", 0)]
+        actor_delta = actor_target - old_actor
+        rollout_delta = rollout_target - old_rollout
+        enabled = same_base_pool and actor_delta * rollout_delta < 0
+        if not enabled:
+            logger.debug(
+                "[one-step-off][resize][staged-check] disabled: staged resize needs opposite deltas, "
+                f"actor_delta={actor_delta}, rollout_delta={rollout_delta}"
+            )
         return enabled
 
     async def _staged_resize_shared_pool(self, item: dict, *, actor_resume_path: str | None = None) -> None:
-        actor_spec = item["actor_pool"]
-        rollout_spec = item["rollout_pool"]
+        plan = self._get_staged_shared_pool_resize_plan(item)
+        actor_spec = plan["actor_spec"]
+        rollout_spec = plan["rollout_spec"]
         detached = item.get("detached", False)
         name_prefix = item.get("name_prefix")
 
         old_actor_wg = self.actor_wg
         old_rollout_wg = self.rollout_wg
-        old_actor_count = self._active_role_world_sizes.get(Role.Actor)
-        old_rollout_count = self._active_role_world_sizes.get(Role.Rollout)
-        if old_actor_count is None or old_rollout_count is None:
-            raise ValueError(
-                "staged shared-pool resize requires active topology state before resize, got "
-                f"active_sizes={self._active_role_world_sizes}"
-            )
+        old_actor_count = plan["old_actor_count"]
+        old_rollout_count = plan["old_rollout_count"]
+        actor_target = plan["actor_target"]
+        rollout_target = plan["rollout_target"]
+        actor_delta = plan["actor_delta"]
+        rollout_delta = plan["rollout_delta"]
+        shrinking_role = plan["shrinking_role"]
 
-        actor_target = actor_spec["size"][actor_spec.get("index", 0)]
-        rollout_target = rollout_spec["size"][rollout_spec.get("index", 0)]
-        actor_delta = actor_target - old_actor_count
-        rollout_delta = old_rollout_count - rollout_target
+        actor_resume_path, should_cleanup_actor_resume, actor_resume_kind = self._resolve_staged_actor_resume(
+            actor_resume_path,
+        )
+        if actor_resume_kind == "handoff":
+            logger.info("[one-step-off][resize][handoff] exporting actor state before staged switch")
+            old_actor_wg.save_actor_handoff_state(actor_resume_path)
 
         logger.info(
             "[one-step-off][resize][staged] start: "
             f"old_actor={old_actor_count}, old_rollout={old_rollout_count}, "
             f"target_actor={actor_target}, target_rollout={rollout_target}, "
-            f"actor_delta={actor_delta}, rollout_delta={rollout_delta}"
+            f"actor_delta={actor_delta}, rollout_delta={rollout_delta}, "
+            f"shrinking_role={shrinking_role}"
         )
 
-        if actor_delta <= 0 or rollout_delta <= 0:
-            raise ValueError(
-                "staged shared-pool resize currently only supports actor expansion + rollout shrink, got "
-                f"actor_delta={actor_delta}, rollout_delta={rollout_delta}"
-            )
+        # Phase A: release whichever side is shrinking to free shared-pool slots.
+        if shrinking_role == Role.Actor:
+            self.remove_role_group(Role.Actor, old_actor_wg)
+        else:
+            self.remove_role_group(Role.Rollout, old_rollout_wg)
 
-        if actor_delta > rollout_delta:
-            raise ValueError(
-                "staged shared-pool resize needs freed rollout slots to cover actor expansion, got "
-                f"actor_delta={actor_delta}, rollout_delta={rollout_delta}"
-            )
-
-        # Phase A: release the shrinking side first to free shared-pool slots.
-        self.remove_role_group(Role.Rollout, old_rollout_wg)
-
-        # Phase B: build the expanding side once resources are actually free.
+        # Phase B: rebuild actor first so rollout can attach to the final actor weights.
         actor_pool = self._resolve_role_pool(Role.Actor, actor_spec)
         new_actor_wg = await self.add_role_group_async(
             Role.Actor,
@@ -1220,17 +1320,52 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         )
         await self._commit_role_group_init_async(new_actor_wg, role=Role.Actor)
 
-        if actor_resume_path is not None:
-            logger.info("[one-step-off][resize][staged] loading checkpoint into new actor")
+        actor_resume_load_path = self._normalize_actor_resume_load_path(actor_resume_path)
+
+        if actor_resume_kind == "handoff" and actor_resume_path is not None:
+            logger.info("[one-step-off][resize][handoff] importing actor state into new actor")
+            new_actor_wg.load_actor_handoff_state(actor_resume_path)
+            if should_cleanup_actor_resume:
+                try:
+                    shutil.rmtree(actor_resume_path)
+                    logger.info("[one-step-off][resize][handoff] cleaned temporary actor handoff dir: %s", actor_resume_path)
+                except FileNotFoundError:
+                    pass
+                except Exception as exc:  # pragma: no cover - best effort cleanup
+                    logger.warning(
+                        "[one-step-off][resize][handoff] failed to remove temporary handoff %s: %s",
+                        actor_resume_path,
+                        exc,
+                    )
+        elif actor_resume_load_path is not None:
+            logger.info("[one-step-off][resize][resume] loading actor checkpoint into new actor: %s", actor_resume_load_path)
             new_actor_wg.load_checkpoint(
-                actor_resume_path,
+                actor_resume_load_path,
                 del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
             )
+            if should_cleanup_actor_resume:
+                try:
+                    shutil.rmtree(actor_resume_path)
+                    logger.info("[one-step-off][resize][resume] cleaned temporary checkpoint dir: %s", actor_resume_path)
+                except FileNotFoundError:
+                    pass
+                except Exception as exc:  # pragma: no cover - best effort cleanup
+                    logger.warning(
+                        "[one-step-off][resize][resume] failed to remove temporary checkpoint %s: %s",
+                        actor_resume_path,
+                        exc,
+                    )
         else:
             logger.info(
                 "[one-step-off][resize][staged] new actor keeps its freshly initialized weights; "
                 "rollout weight metadata will be attached after rollout group commit"
             )
+
+        # Phase C: if rollout is the expanding side, release the old rollout after
+        # the new actor is already available. This keeps both resize directions on
+        # the same actor-first handoff flow while avoiding shared-pool over-allocation.
+        if shrinking_role == Role.Actor:
+            self.remove_role_group(Role.Rollout, old_rollout_wg)
 
         # Phase D: create the final rollout group after actor is ready.
         rollout_pool = self._resolve_role_pool(Role.Rollout, rollout_spec)
@@ -1251,9 +1386,11 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self._switch_weight_sync_group(new_actor_wg, new_rollout_wg)
         self._publish_active_topology_state(actor_spec=actor_spec, rollout_spec=rollout_spec)
 
+        await self._shutdown_async_rollout_manager_async()
         await self._init_async_rollout_manager_async()
 
-        self.remove_role_group(Role.Actor, old_actor_wg)
+        if shrinking_role == Role.Rollout:
+            self.remove_role_group(Role.Actor, old_actor_wg)
         self._cleanup_pending_weight_sync_groups()
         logger.info("[one-step-off][resize][staged] done")
 
@@ -1393,6 +1530,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         # Phase 5: 重建依赖最终拓扑的管理器和同步链路。
         # Rollout manager 和 sync group 都依赖最终 actor/rollout 对，因此必须在
         # publish 之后统一重建。
+        await self._shutdown_async_rollout_manager_async()
         await self._init_async_rollout_manager_async()
 
         # Phase 6: 兼容旧策略的延后清理。
@@ -1580,7 +1718,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
         from verl.utils.tracking import Tracking
 
-        logger = Tracking(
+        tracking_logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,
@@ -1603,7 +1741,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
+            tracking_logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
 
@@ -1649,6 +1787,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             metrics = {}
             timing_raw = {}
             is_last_step = self.global_steps >= self.total_training_steps
+            resize_scheduled_this_step = self._has_dynamic_resize_scheduled_at_step(self.global_steps)
 
             with marked_timer("start_profile", timing_raw):
                 self._start_profiling(
@@ -1672,9 +1811,15 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                     await self.async_rollout_manager.clear_kv_cache()
 
                 # async next generation
-                if not is_last_step:
+                if not is_last_step and not resize_scheduled_this_step:
                     batch_data_future = asyncio.create_task(self._async_gen_next_batch(continuous_iterator))
                     await asyncio.sleep(0)
+                elif not is_last_step:
+                    logger.info(
+                        "[one-step-off][resize][prefetch] defer next async batch until resize completes: step=%s",
+                        self.global_steps,
+                    )
+                    batch_data_future = None
 
                 with marked_timer("reward", timing_raw, color="yellow"):
                     # compute reward model score
@@ -1871,6 +2016,14 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             # NOTE(HanlinDu): this may be executed asynchronously with _save_checkpoint()
             await self._maybe_dynamic_resize()
 
+            if not is_last_step and batch_data_future is None:
+                logger.info(
+                    "[one-step-off][resize][prefetch] start deferred async batch after resize: step=%s",
+                    self.global_steps,
+                )
+                batch_data_future = asyncio.create_task(self._async_gen_next_batch(continuous_iterator))
+                await asyncio.sleep(0)
+
             with marked_timer("stop_profile", timing_raw):
                 next_step_profile = (
                     self.global_steps + 1 in self.config.global_profiler.steps
@@ -1908,7 +2061,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 self.train_dataloader.sampler.update(batch=batch)
 
             # TODO: make a canonical logger that supports various backend
-            logger.log(data=metrics, step=self.global_steps)
+            tracking_logger.log(data=metrics, step=self.global_steps)
 
             progress_bar.update(1)
             self.global_steps += 1
