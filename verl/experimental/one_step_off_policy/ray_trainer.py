@@ -223,23 +223,25 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
     def _build_runtime_batch_plan(self, batch: DataProto) -> dict[str, int]:
         total_samples = len(batch)
+        existing_plan = batch.meta_info.get("runtime_batch_plan") or {}
+        base_total_samples = int(existing_plan.get("base_total_samples", total_samples))
         actor_world_size = max(self._active_role_world_sizes.get(Role.Actor, 1), 1)
         critic_world_size = max(self._active_role_world_sizes.get(Role.Critic, actor_world_size), 1)
 
         actor_micro = self.config.actor_rollout_ref.actor.get("ppo_micro_batch_size_per_gpu", None)
         critic_micro = self.config.critic.get("ppo_micro_batch_size_per_gpu", None) if self.use_critic else None
-        actor_micro = actor_micro if actor_micro is not None else max(total_samples // actor_world_size, 1)
-        critic_micro = critic_micro if critic_micro is not None else max(total_samples // critic_world_size, 1)
+        actor_micro = actor_micro if actor_micro is not None else max(base_total_samples // actor_world_size, 1)
+        critic_micro = critic_micro if critic_micro is not None else max(base_total_samples // critic_world_size, 1)
 
         actor_alignment = actor_world_size * actor_micro
         critic_alignment = critic_world_size * critic_micro if self.use_critic else actor_alignment
         target_alignment = math.lcm(actor_alignment, critic_alignment)
 
-        padded_total_samples = total_samples
+        padded_total_samples = base_total_samples
         pad_samples = 0
-        if total_samples % target_alignment != 0:
-            padded_total_samples = math.ceil(total_samples / target_alignment) * target_alignment
-            pad_samples = padded_total_samples - total_samples
+        if base_total_samples % target_alignment != 0:
+            padded_total_samples = math.ceil(base_total_samples / target_alignment) * target_alignment
+            pad_samples = padded_total_samples - base_total_samples
 
         actor_runtime_mini = max(actor_alignment, padded_total_samples // actor_world_size)
         if actor_runtime_mini % actor_micro != 0:
@@ -252,9 +254,11 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 critic_runtime_mini = math.ceil(critic_runtime_mini / critic_micro) * critic_micro
 
         return {
+            "base_total_samples": base_total_samples,
             "original_total_samples": total_samples,
             "padded_total_samples": padded_total_samples,
             "pad_samples": pad_samples,
+            "net_pad_delta": padded_total_samples - total_samples,
             "target_alignment": target_alignment,
             "actor_world_size": actor_world_size,
             "actor_micro_batch_size_per_gpu": actor_micro,
@@ -329,7 +333,27 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         )
         metrics.update(global_balance_stats)
 
+    def _strip_resize_history_training_state(self, batch: DataProto) -> DataProto:
+        tensor_exclude_keys = {
+            "old_log_probs",
+            "ref_log_prob",
+            "values",
+            "advantages",
+            "returns",
+            "token_level_rewards",
+            "token_level_scores",
+            "acc",
+            "verifier_scores",
+            "reward_baselines",
+            "kl",
+            "is_weights",
+            "rollout_keep_mask",
+        }
+        tensor_keys = [key for key in batch.batch.keys() if key not in tensor_exclude_keys]
+        return batch.select(batch_keys=tensor_keys, non_tensor_batch_keys=list(batch.non_tensor_batch.keys()), meta_info_keys=[])
+
     def _maybe_record_resize_history_batch(self, batch: DataProto) -> None:
+        batch = self._strip_resize_history_training_state(batch)
         batch_size = len(batch)
         if batch_size <= 0:
             return
@@ -339,8 +363,6 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         else:
             sample_indices = np.random.choice(batch_size, size=snapshot_size, replace=False)
             snapshot = batch[sample_indices]
-        
-        # Clear meta_info to save memory, since we only care about the tensor data for padding.
         snapshot = snapshot.select(meta_info_keys=[])
 
         self._resize_padding_history.append(snapshot)
@@ -372,20 +394,43 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         plan = self._build_runtime_batch_plan(batch)
         self._last_runtime_batch_plan = plan
 
-        if plan["pad_samples"] > 0:
-            repeat_indices = np.arange(plan["pad_samples"]) % plan["original_total_samples"]
-            padding_batch = batch[repeat_indices.tolist()]
-            plan["padding_source"] = "current"
+        if plan["net_pad_delta"] < 0:
+            batch = batch[: plan["padded_total_samples"]]
+
+            if "uid" in batch.non_tensor_batch:
+                batch.non_tensor_batch["uid"] = batch.non_tensor_batch["uid"][: plan["padded_total_samples"]]
+
+        if plan["net_pad_delta"] > 0:
+            padding_batch = self._sample_padding_from_history(plan["net_pad_delta"])
+            repeat_indices = None
+            if padding_batch is None:
+                repeat_indices = np.arange(plan["net_pad_delta"]) % plan["original_total_samples"]
+                padding_batch = batch[repeat_indices.tolist()]
+                plan["padding_source"] = "current"
+            else:
+                plan["padding_source"] = "history"
+            print(
+                "[one-step-off][padding] step=%s base=%s current=%s target=%s net_delta=%s source=%s history_snapshots=%s",
+                self.global_steps,
+                plan["base_total_samples"],
+                plan["original_total_samples"],
+                plan["padded_total_samples"],
+                plan["net_pad_delta"],
+                plan["padding_source"],
+                len(self._resize_padding_history),
+            )
             batch = DataProto.concat([batch, padding_batch])
 
             repeated_from = batch.non_tensor_batch.get("uid", None)
-            if repeated_from is not None:
+            if repeated_from is not None and repeat_indices is not None:
                 original_uids = repeated_from[: plan["original_total_samples"]]
                 padded_uids = original_uids[repeat_indices]
                 padded_uids = np.array(
                     [f"{uid}::currpad::step{self.global_steps}::{i}" for i, uid in enumerate(padded_uids)], dtype=object
                 )
                 batch.non_tensor_batch["uid"] = np.concatenate([original_uids, padded_uids])
+
+        plan["pad_samples"] = max(plan["net_pad_delta"], 0)
 
         batch.meta_info["runtime_batch_plan"] = plan
         batch.meta_info["mini_batch_size"] = plan["actor_runtime_mini_batch_size"]
@@ -1749,6 +1794,8 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                         "norm_adv_by_std_in_grpo", True
                     )  # GRPO adv normalization factor
 
+                    self._maybe_record_resize_history_batch(batch)
+
                     batch = compute_advantage(
                         batch,
                         adv_estimator=self.config.algorithm.adv_estimator,
@@ -1758,7 +1805,6 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                         norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                         config=self.config.algorithm,
                     )
-                    self._maybe_record_resize_history_batch(batch)
                 await asyncio.sleep(0)
 
                 # update critic
