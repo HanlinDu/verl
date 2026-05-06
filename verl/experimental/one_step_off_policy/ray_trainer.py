@@ -78,6 +78,36 @@ class OneStepOffRayTrainer(RayPPOTrainer):
     # Layer 2: resource transition
     #   - release the shrinking side first (e.g. old rollout 4 -> 2 releases 2 slots)
     #   - create/rebuild the new actor on the freed slots
+
+    def _start_profiling(self, do_profile: bool) -> None:
+        """Start profiling for one-step-off worker groups.
+
+        Keep rollout profiling separate from actor profiling and avoid passing the
+        PPO trainer's `role` kwarg into torch profiler implementations.
+        """
+        if do_profile:
+            self.actor_wg.start_profile(profile_step=self.global_steps)
+            if not self.hybrid_engine:
+                self.rollout_wg.start_profile(profile_step=self.global_steps)
+            if self.use_reference_policy:
+                self.ref_policy_wg.start_profile(profile_step=self.global_steps)
+            if self.use_critic:
+                self.critic_wg.start_profile(profile_step=self.global_steps)
+            if self.use_rm:
+                self.rm_wg.start_profile(profile_step=self.global_steps)
+
+    def _stop_profiling(self, do_profile: bool) -> None:
+        """Stop profiling for one-step-off worker groups."""
+        if do_profile:
+            self.actor_wg.stop_profile()
+            if not self.hybrid_engine:
+                self.rollout_wg.stop_profile()
+            if self.use_reference_policy:
+                self.ref_policy_wg.stop_profile()
+            if self.use_critic:
+                self.critic_wg.stop_profile()
+            if self.use_rm:
+                self.rm_wg.stop_profile()
     #   - release the other old side if needed, then create the new rollout
     #
     # Layer 3: final commit/publish
@@ -1773,17 +1803,6 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 if self.config.global_profiler.steps is not None
                 else False
             )
-            if do_profile:
-                self.actor_wg.start_profile()
-                if not self.hybrid_engine:
-                    self.rollout_wg.start_profile()
-                if self.use_reference_policy:
-                    self.ref_policy_wg.start_profile()
-                if self.use_critic:
-                    self.critic_wg.start_profile()
-                if self.use_rm:
-                    self.rm_wg.start_profile()
-
             metrics = {}
             timing_raw = {}
             is_last_step = self.global_steps >= self.total_training_steps
