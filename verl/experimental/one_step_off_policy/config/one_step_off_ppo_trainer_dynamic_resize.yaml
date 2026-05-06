@@ -42,6 +42,9 @@ trainer:
       progressive_swap: true
       cleanup_after_load: true
       preclear_rollout_kv_cache: true
+    communicator_cache:
+      enable: false
+      reserve_schedule_topologies: true
     hysteresis:
       enable: false
       window_size: 2

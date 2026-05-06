@@ -40,6 +40,11 @@ from torch.utils.data import Dataset, Sampler
 from tqdm import tqdm
 
 from verl import DataProto
+from verl.experimental.one_step_off_policy.communicator_cache import (
+    CommunicatorCacheConfig,
+    WeightSyncCommunicatorCache,
+    build_topology_key,
+)
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.experimental.one_step_off_policy.resize_controller import (
     ACTION_EXPAND_ROLLOUT,
@@ -198,6 +203,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self._last_runtime_batch_plan: dict[str, int] | None = None
         self._resize_padding_history: list[DataProto] = []
         self._resize_padding_history_size = 8
+        self._active_topology_specs: dict[Role, dict | None] = {Role.Actor: None, Role.Rollout: None}
         # Round one: schedule is still the source of candidate topologies.
         # The controller only decides whether a scheduled switch should fire.
         self._dynamic_resize_mode = self._resolve_dynamic_resize_mode()
@@ -208,6 +214,9 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         # richer host-memory implementations without changing the trainer flow.
         self._handoff_staging_config = self._build_handoff_staging_config()
         self._latest_resize_execution_metrics: dict[str, float | str | int] = self._default_resize_execution_metrics()
+        self._communicator_cache_config = self._build_communicator_cache_config()
+        self._weight_sync_communicator_cache = WeightSyncCommunicatorCache(self._communicator_cache_config)
+        self._latest_communicator_cache_metrics: dict[str, float | str | int] = self._default_communicator_cache_metrics()
 
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
         if lora_rank <= 0:
@@ -249,6 +258,13 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         cfg = OmegaConf.to_container(cfg, resolve=True)
         return HostStagingConfig.from_dict(cfg.get("handoff", {}))
 
+    def _build_communicator_cache_config(self) -> CommunicatorCacheConfig:
+        cfg = OmegaConf.select(self.config.trainer, "dynamic_resize")
+        if cfg is None:
+            return CommunicatorCacheConfig()
+        cfg = OmegaConf.to_container(cfg, resolve=True)
+        return CommunicatorCacheConfig.from_dict(cfg.get("communicator_cache", {}))
+
     def _default_resize_control_metrics(self) -> dict[str, float | str | int]:
         enabled = 1.0 if self._resize_controller is not None else 0.0
         return {
@@ -279,13 +295,59 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             "resize/host_stage_cleanup": 0.0,
         }
 
+    def _default_communicator_cache_metrics(self) -> dict[str, float | str | int]:
+        return {
+            "resize/comm_cache_enabled": 1.0 if self._communicator_cache_config.enable else 0.0,
+            "resize/comm_cache_hit": 0.0,
+            "resize/comm_cache_miss": 0.0,
+            "resize/comm_cache_reused_group": "",
+        }
+
     def _reset_resize_execution_metrics(self) -> dict[str, float | str | int]:
         self._latest_resize_execution_metrics = self._default_resize_execution_metrics()
         return dict(self._latest_resize_execution_metrics)
 
+    def _reset_communicator_cache_metrics(self) -> dict[str, float | str | int]:
+        self._latest_communicator_cache_metrics = self._default_communicator_cache_metrics()
+        return dict(self._latest_communicator_cache_metrics)
+
     def _update_resize_execution_metrics(self, **kwargs) -> dict[str, float | str | int]:
         self._latest_resize_execution_metrics.update(kwargs)
         return dict(self._latest_resize_execution_metrics)
+
+    def _update_communicator_cache_metrics(self, **kwargs) -> dict[str, float | str | int]:
+        self._latest_communicator_cache_metrics.update(kwargs)
+        return dict(self._latest_communicator_cache_metrics)
+
+    def _current_topology_key(self) -> str:
+        return build_topology_key(
+            actor_spec=self._active_topology_specs.get(Role.Actor),
+            rollout_spec=self._active_topology_specs.get(Role.Rollout),
+        )
+
+    def _candidate_topology_key(self, *, actor_spec: dict | None, rollout_spec: dict | None) -> str:
+        return build_topology_key(actor_spec=actor_spec, rollout_spec=rollout_spec)
+
+    def _warmup_communicator_cache_keys(self) -> None:
+        if not self._communicator_cache_config.enable or not self._communicator_cache_config.reserve_schedule_topologies:
+            return
+
+        cfg = OmegaConf.select(self.config.trainer, "dynamic_resize")
+        schedule = []
+        if cfg is not None:
+            cfg = OmegaConf.to_container(cfg, resolve=True)
+            schedule = cfg.get("schedule", []) or []
+            if isinstance(schedule, dict):
+                schedule = list(schedule.values())
+
+        for item in schedule:
+            if not isinstance(item, dict):
+                continue
+            topology_key = self._candidate_topology_key(
+                actor_spec=item.get("actor_pool"),
+                rollout_spec=item.get("rollout_pool"),
+            )
+            self._weight_sync_communicator_cache.reserve(topology_key)
 
     def _build_resize_control_metrics(self, snapshot: dict[str, float | str | int] | None = None) -> dict[str, float | str | int]:
         snapshot = snapshot or {}
@@ -822,6 +884,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self.role_groups[Role.Actor] = {"primary": self.actor_wg}
         self.role_groups[Role.Rollout] = {"primary": self.rollout_wg}
         self._initialize_active_topology_state()
+        self._warmup_communicator_cache_keys()
         weights_info = self._get_actor_weights_info(self.actor_wg)[0]
         self._set_actor_weights_info(self.rollout_wg, weights_info)
         self._create_weight_sync_group()
@@ -862,6 +925,8 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self._active_role_world_sizes[Role.Rollout] = self._pool_world_size_from_spec(Role.Rollout, None)
 
     def _publish_active_topology_state(self, *, actor_spec: dict | None, rollout_spec: dict | None) -> None:
+        self._active_topology_specs[Role.Actor] = actor_spec
+        self._active_topology_specs[Role.Rollout] = rollout_spec
         self._active_role_world_sizes[Role.Actor] = self._pool_world_size_from_spec(Role.Actor, actor_spec)
         self._active_role_world_sizes[Role.Rollout] = self._pool_world_size_from_spec(Role.Rollout, rollout_spec)
 
@@ -1116,6 +1181,13 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self._weight_sync_group_version += 1
         return f"actor_rollout_v{self._weight_sync_group_version}"
 
+    def _is_weight_sync_group_name_busy(self, group_name: str | None) -> bool:
+        if group_name is None:
+            return False
+        if group_name == getattr(self, "_active_weight_sync_group_name", None):
+            return True
+        return any(pending_group_name == group_name for pending_group_name, _, _ in self._pending_weight_sync_group_cleanup)
+
     def _register_weight_sync_group_for_cleanup(
         self, group_name: str, actor_wg: RayWorkerGroup | None, rollout_wg: RayWorkerGroup | None
     ) -> None:
@@ -1127,6 +1199,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         pending = self._pending_weight_sync_group_cleanup
         self._pending_weight_sync_group_cleanup = []
         for group_name, actor_wg, rollout_wg in pending:
+            self._weight_sync_communicator_cache.discard_by_group_name(group_name)
             try:
                 self._destroy_actor_weight_sync_group(actor_wg, group_name)
             except Exception as exc:  # pragma: no cover - best effort cleanup
@@ -1149,12 +1222,41 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                     f"group_name={group_name}: {exc}"
                 )
 
-    def _create_weight_sync_group(self, *, group_name: str | None = None):
+    def _create_weight_sync_group(self, *, group_name: str | None = None, topology_key: str | None = None):
         from verl.utils.device import get_nccl_backend
 
         actor_rollout_workers = self.actor_wg.workers + self.rollout_wg.workers
         n_workers = len(actor_rollout_workers)
-        group_name = group_name or self._active_weight_sync_group_name
+        topology_key = topology_key or self._current_topology_key()
+
+        cached_entry = self._weight_sync_communicator_cache.get(
+            topology_key=topology_key,
+            actor_wg=self.actor_wg,
+            rollout_wg=self.rollout_wg,
+        )
+        if cached_entry is not None:
+            # Fast path: the communicator for this exact live actor/rollout pair
+            # is already available, so only switch the active group binding.
+            reused_group_name = cached_entry.group_name
+            self.actor_wg.execute_all_sync(f"{str(Role.Actor)}_activate_weight_sync_group", reused_group_name)
+            self.rollout_wg.execute_all_sync(f"{str(Role.Rollout)}_activate_weight_sync_group", reused_group_name)
+            self._active_weight_sync_group_name = reused_group_name
+            self._update_communicator_cache_metrics(
+                **{
+                    "resize/comm_cache_hit": 1.0,
+                    "resize/comm_cache_miss": 0.0,
+                    "resize/comm_cache_reused_group": reused_group_name,
+                }
+            )
+            return
+
+        # Slow path: either this topology has never been seen, or it is being
+        # revisited with newly spawned workers. In both cases we rebuild the
+        # communicator and then refresh the cache entry.
+        candidate_group_name = group_name or self._weight_sync_communicator_cache.reserve(topology_key)
+        if self._is_weight_sync_group_name_busy(candidate_group_name):
+            candidate_group_name = None
+        group_name = candidate_group_name or self._next_weight_sync_group_name()
 
         if self.device_name == "npu":
             master_address = ray.get(self.actor_wg.workers[0]._get_node_ip.remote()).strip("[]")
@@ -1205,17 +1307,43 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 group_name,
             )
         self._active_weight_sync_group_name = group_name
+        self._weight_sync_communicator_cache.put(
+            topology_key=topology_key,
+            group_name=group_name,
+            actor_wg=self.actor_wg,
+            rollout_wg=self.rollout_wg,
+        )
+        self._update_communicator_cache_metrics(
+            **{
+                "resize/comm_cache_hit": 0.0,
+                "resize/comm_cache_miss": 1.0,
+                "resize/comm_cache_reused_group": group_name,
+            }
+        )
 
-    def _switch_weight_sync_group(self, new_actor_wg: RayWorkerGroup, new_rollout_wg: RayWorkerGroup) -> None:
+    def _switch_weight_sync_group(
+        self,
+        new_actor_wg: RayWorkerGroup,
+        new_rollout_wg: RayWorkerGroup,
+        *,
+        actor_spec: dict | None = None,
+        rollout_spec: dict | None = None,
+    ) -> None:
+        # Cache lookup is topology-aware, but reuse is still constrained by the
+        # concrete worker-group identities for safety.
         old_group_name = getattr(self, "_active_weight_sync_group_name", None)
         old_actor_wg = getattr(self, "actor_wg", None)
         old_rollout_wg = getattr(self, "rollout_wg", None)
-        new_group_name = self._next_weight_sync_group_name()
+        topology_key = self._candidate_topology_key(actor_spec=actor_spec, rollout_spec=rollout_spec)
+        reserved_group_name = self._weight_sync_communicator_cache.reserve(topology_key)
+        if self._is_weight_sync_group_name_busy(reserved_group_name):
+            reserved_group_name = None
+        new_group_name = reserved_group_name or self._next_weight_sync_group_name()
 
         self.actor_wg = new_actor_wg
         self.rollout_wg = new_rollout_wg
         self.actor_rollout_wg = new_actor_wg
-        self._create_weight_sync_group(group_name=new_group_name)
+        self._create_weight_sync_group(group_name=new_group_name, topology_key=topology_key)
 
         if old_group_name is not None and old_actor_wg is not None and old_rollout_wg is not None:
             self._register_weight_sync_group_for_cleanup(old_group_name, old_actor_wg, old_rollout_wg)
@@ -1648,7 +1776,12 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self._set_actor_weights_info(new_rollout_wg, weights_info)
 
         # Publish the new pair together.
-        self._switch_weight_sync_group(new_actor_wg, new_rollout_wg)
+        self._switch_weight_sync_group(
+            new_actor_wg,
+            new_rollout_wg,
+            actor_spec=actor_spec,
+            rollout_spec=rollout_spec,
+        )
         self._publish_active_topology_state(actor_spec=actor_spec, rollout_spec=rollout_spec)
 
         await self._shutdown_async_rollout_manager_async()
@@ -1811,7 +1944,12 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
         # Phase 4: 发布新拓扑。
         # actor/rollout 必须作为一对同时对外可见，避免混合拓扑。
-        self._switch_weight_sync_group(new_actor_wg, new_rollout_wg)
+        self._switch_weight_sync_group(
+            new_actor_wg,
+            new_rollout_wg,
+            actor_spec=actor_spec,
+            rollout_spec=rollout_spec,
+        )
         self._publish_active_topology_state(actor_spec=actor_spec, rollout_spec=rollout_spec)
 
         # Phase 5: 重建依赖最终拓扑的管理器和同步链路。
@@ -2056,6 +2194,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         while batch_data_future is not None:
             self._ensure_actor_training_group_binding()
             self._reset_resize_execution_metrics()
+            self._reset_communicator_cache_metrics()
             do_profile = (
                 self.global_steps in self.config.global_profiler.steps
                 if self.config.global_profiler.steps is not None
@@ -2295,6 +2434,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             await self._maybe_dynamic_resize()
             metrics.update(self._latest_resize_control_metrics)
             metrics.update(self._latest_resize_execution_metrics)
+            metrics.update(self._latest_communicator_cache_metrics)
 
             if not is_last_step and batch_data_future is None:
                 logger.info(

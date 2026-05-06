@@ -689,6 +689,22 @@ class DetachSync(LocalInitActorRolloutRefWorker, AsyncActorRolloutRefWorker):
 
     def _set_active_weight_sync_group_name(self, group_name: str) -> None:
         self._active_weight_sync_group_name = group_name
+        if device_name == "npu":
+            self._weight_sync_group = getattr(self, "_weight_sync_group_cache", {}).get(group_name)
+
+    def _get_weight_sync_group_cache(self) -> dict[str, object]:
+        cache = getattr(self, "_weight_sync_group_cache", None)
+        if cache is None:
+            cache = {}
+            self._weight_sync_group_cache = cache
+        return cache
+
+    def _get_weight_sync_group_metadata(self) -> dict[str, tuple[int, int]]:
+        metadata = getattr(self, "_weight_sync_group_metadata", None)
+        if metadata is None:
+            metadata = {}
+            self._weight_sync_group_metadata = metadata
+        return metadata
 
     def _maybe_init_collective_group(self, group_name: str = "actor_rollout") -> None:
         if device_name == "npu":
@@ -747,7 +763,23 @@ class DetachSync(LocalInitActorRolloutRefWorker, AsyncActorRolloutRefWorker):
         rank = torch.distributed.get_rank() + rank_offset
         self._actor_rollout_collective_rank = rank
         self._actor_rollout_collective_world_size = world_size
+        metadata = self._get_weight_sync_group_metadata()
+        cached_key = metadata.get(group_name)
+        current_key = (rank, world_size)
         self._set_active_weight_sync_group_name(group_name)
+
+        # Reuse only when the group name already maps to the same rank/world-size
+        # contract on this worker. Any topology shape change forces a rebuild.
+        if cached_key == current_key:
+            if device_name == "npu":
+                cache = self._get_weight_sync_group_cache()
+                cached_group = cache.get(group_name)
+                if cached_group is not None:
+                    self._weight_sync_group = cached_group
+                    return
+            else:
+                self._maybe_init_collective_group(group_name=group_name)
+                return
 
         if device_name == "npu":
             self._weight_sync_group = vllm_stateless_init_process_group(
@@ -757,18 +789,28 @@ class DetachSync(LocalInitActorRolloutRefWorker, AsyncActorRolloutRefWorker):
                 world_size,
                 get_torch_device().current_device(),
             )
+            self._get_weight_sync_group_cache()[group_name] = self._weight_sync_group
+        else:
+            self._maybe_init_collective_group(group_name=group_name)
+        metadata[group_name] = current_key
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def activate_weight_sync_group(self, group_name: str):
+        # Activation is the fast path used by the trainer on communicator-cache
+        # hits: switch the active handle without rebuilding the group.
+        self._set_active_weight_sync_group_name(group_name)
+        if device_name == "npu":
+            self._weight_sync_group = self._get_weight_sync_group_cache().get(group_name)
         else:
             self._maybe_init_collective_group(group_name=group_name)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    def activate_weight_sync_group(self, group_name: str):
-        self._set_active_weight_sync_group_name(group_name)
-        if device_name != "npu":
-            self._maybe_init_collective_group(group_name=group_name)
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def destroy_weight_sync_group(self, group_name: str):
+        self._get_weight_sync_group_metadata().pop(group_name, None)
+        self._get_weight_sync_group_cache().pop(group_name, None)
         if device_name == "npu":
+            if self._get_active_weight_sync_group_name() == group_name:
+                self._weight_sync_group = None
             return
         try:
             if hasattr(collective, "is_group_initialized") and not collective.is_group_initialized(group_name=group_name):

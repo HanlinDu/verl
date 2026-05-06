@@ -39,6 +39,8 @@ HOST_STAGING_STAGE_OPTIMIZER=${HOST_STAGING_STAGE_OPTIMIZER:-true}
 HOST_STAGING_PROGRESSIVE_SWAP=${HOST_STAGING_PROGRESSIVE_SWAP:-true}
 HOST_STAGING_CLEANUP=${HOST_STAGING_CLEANUP:-true}
 HOST_STAGING_PRECLEAR_KV=${HOST_STAGING_PRECLEAR_KV:-true}
+COMM_CACHE_ENABLE=${COMM_CACHE_ENABLE:-false}
+COMM_CACHE_RESERVE_SCHEDULE=${COMM_CACHE_RESERVE_SCHEDULE:-true}
 CKPT_DIR=${CKPT_DIR:-/file_system/dhl/save_ckpt/dynamic-resize}
 RAY_TMPDIR=${RAY_TMPDIR:-}
 
@@ -78,6 +80,8 @@ python3 -m verl.experimental.one_step_off_policy.main_ppo \
   trainer.dynamic_resize.handoff.progressive_swap=${HOST_STAGING_PROGRESSIVE_SWAP} \
   trainer.dynamic_resize.handoff.cleanup_after_load=${HOST_STAGING_CLEANUP} \
   trainer.dynamic_resize.handoff.preclear_rollout_kv_cache=${HOST_STAGING_PRECLEAR_KV} \
+  trainer.dynamic_resize.communicator_cache.enable=${COMM_CACHE_ENABLE} \
+  trainer.dynamic_resize.communicator_cache.reserve_schedule_topologies=${COMM_CACHE_RESERVE_SCHEDULE} \
   trainer.dynamic_resize.shared_pool.n_gpus_per_node=${shared_pool_gpus} \
   +trainer.dynamic_resize.schedule.stage1.step=${resize_step} \
   +trainer.dynamic_resize.schedule.stage1.actor_pool.mode=split \
