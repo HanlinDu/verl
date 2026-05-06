@@ -27,6 +27,11 @@ from ray.util.collective import collective
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from verl.experimental.one_step_off_policy.distributed_utils import vllm_stateless_init_process_group
+from verl.experimental.one_step_off_policy.staging_backend import (
+    HostStagingConfig,
+    read_host_staging_manifest,
+    write_host_staging_manifest,
+)
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.config import omega_conf_to_dataclass
@@ -897,6 +902,12 @@ class DetachActorWorker(DetachSync):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_actor_handoff_state(self, local_path: str):
+        self._export_actor_handoff_state(local_path, stage_optimizer=True)
+
+    def _export_actor_handoff_state(self, local_path: str, *, stage_optimizer: bool) -> None:
+        # Export always materializes a CPU-resident full state first. Round two
+        # reuses this path for both legacy checkpoint-like handoff and the new
+        # host-staging abstraction.
         assert self._is_actor
 
         logger.info("[one-step-off][resize][handoff] rank=%s saving actor handoff state to %s", self.rank, local_path)
@@ -914,18 +925,22 @@ class DetachActorWorker(DetachSync):
         logger.info("[one-step-off][resize][handoff] rank=%s collecting full model state", self.rank)
         model_state_dict = get_fsdp_full_state_dict(self.actor_module_fsdp, offload_to_cpu=True, rank0_only=True)
 
-        logger.info("[one-step-off][resize][handoff] rank=%s collecting optimizer state", self.rank)
-        StateDictOptions, get_optimizer_state_dict, _ = _get_reshardable_optimizer_state_dict_api()
-        options = StateDictOptions(full_state_dict=True, cpu_offload=True)
-        optim_state_dict = get_optimizer_state_dict(self.actor_module_fsdp, self.actor_optimizer, options=options)
+        optim_state_dict = None
+        if stage_optimizer:
+            logger.info("[one-step-off][resize][handoff] rank=%s collecting optimizer state", self.rank)
+            StateDictOptions, get_optimizer_state_dict, _ = _get_reshardable_optimizer_state_dict_api()
+            options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+            optim_state_dict = get_optimizer_state_dict(self.actor_module_fsdp, self.actor_optimizer, options=options)
 
         if self.rank == 0:
             torch.save(model_state_dict, os.path.join(local_path, "model_state.pt"))
-            torch.save(optim_state_dict, os.path.join(local_path, "optim_state.pt"))
+            if stage_optimizer:
+                torch.save(optim_state_dict, os.path.join(local_path, "optim_state.pt"))
             torch.save(
                 {
                     "lr_scheduler": self.actor_lr_scheduler.state_dict() if self.actor_lr_scheduler is not None else None,
                     "rng": self.checkpoint_manager.get_rng_state() if self.checkpoint_manager is not None else None,
+                    "stage_optimizer": stage_optimizer,
                 },
                 os.path.join(local_path, "extra_state.pt"),
             )
@@ -941,6 +956,20 @@ class DetachActorWorker(DetachSync):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_actor_handoff_state(self, local_path: str):
+        self._restore_actor_handoff_state(local_path, load_optimizer=True, progressive_swap=False, chunk_mb=None)
+
+    def _restore_actor_handoff_state(
+        self,
+        local_path: str,
+        *,
+        load_optimizer: bool,
+        progressive_swap: bool,
+        chunk_mb: int | None,
+    ) -> None:
+        # The conservative "progressive swap" implementation restores model
+        # state first, then optimizer state, and explicitly drops allocator
+        # caches between phases. This keeps the semantics simple while reducing
+        # peak memory pressure at the switch boundary.
         assert self._is_actor
 
         logger.info("[one-step-off][resize][handoff] rank=%s loading actor handoff state from %s", self.rank, local_path)
@@ -954,12 +983,23 @@ class DetachActorWorker(DetachSync):
 
         if self.rank == 0:
             model_state_dict = torch.load(os.path.join(local_path, "model_state.pt"), weights_only=False)
-            optim_state_dict = torch.load(os.path.join(local_path, "optim_state.pt"), weights_only=False)
             extra_state = torch.load(os.path.join(local_path, "extra_state.pt"), weights_only=False)
+            optim_state_path = os.path.join(local_path, "optim_state.pt")
+            if load_optimizer and os.path.exists(optim_state_path):
+                optim_state_dict = torch.load(optim_state_path, weights_only=False)
+            else:
+                optim_state_dict = {}
         else:
             model_state_dict = {}
             optim_state_dict = {}
             extra_state = None
+
+        if progressive_swap:
+            logger.info(
+                "[one-step-off][resize][handoff] rank=%s progressive restore enabled: backend=disk_fallback chunk_mb=%s",
+                self.rank,
+                chunk_mb,
+            )
 
         logger.info("[one-step-off][resize][handoff] rank=%s restoring full model state", self.rank)
         if fsdp_version(self.actor_module_fsdp) == 2:
@@ -968,10 +1008,16 @@ class DetachActorWorker(DetachSync):
         else:
             raise NotImplementedError("actor handoff currently supports fsdp2 only")
 
-        logger.info("[one-step-off][resize][handoff] rank=%s restoring optimizer state", self.rank)
-        StateDictOptions, _, set_optimizer_state_dict = _get_reshardable_optimizer_state_dict_api()
-        options = StateDictOptions(full_state_dict=True, cpu_offload=True, broadcast_from_rank0=True)
-        set_optimizer_state_dict(self.actor_module_fsdp, self.actor_optimizer, optim_state_dict, options=options)
+        if progressive_swap:
+            get_torch_device().empty_cache()
+
+        if load_optimizer:
+            logger.info("[one-step-off][resize][handoff] rank=%s restoring optimizer state", self.rank)
+            StateDictOptions, _, set_optimizer_state_dict = _get_reshardable_optimizer_state_dict_api()
+            options = StateDictOptions(full_state_dict=True, cpu_offload=True, broadcast_from_rank0=True)
+            set_optimizer_state_dict(self.actor_module_fsdp, self.actor_optimizer, optim_state_dict, options=options)
+            if progressive_swap:
+                get_torch_device().empty_cache()
 
         extra_state_list = [extra_state]
         torch.distributed.broadcast_object_list(extra_state_list, src=0)
@@ -987,6 +1033,53 @@ class DetachActorWorker(DetachSync):
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(self.actor_optimizer)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def stage_actor_handoff_state_to_host(self, local_path: str, staging_config: dict | None = None):
+        # Host staging is represented as a backend + manifest pair so the
+        # trainer can switch storage strategies without changing RPC semantics.
+        cfg = HostStagingConfig.from_dict(staging_config)
+        logger.info(
+            "[one-step-off][resize][host-stage] rank=%s export actor state to host staging: requested_backend=%s effective_backend=%s path=%s",
+            self.rank,
+            cfg.backend,
+            cfg.effective_backend(),
+            local_path,
+        )
+        if self.rank == 0:
+            write_host_staging_manifest(local_path, cfg)
+        torch.distributed.barrier()
+        self._export_actor_handoff_state(local_path, stage_optimizer=cfg.stage_optimizer)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_actor_handoff_state_from_host(self, local_path: str, staging_config: dict | None = None):
+        # The manifest is broadcast from rank 0 so every worker uses the same
+        # effective staging backend and restore policy.
+        cfg = HostStagingConfig.from_dict(staging_config)
+        manifest = None
+        if self.rank == 0:
+            manifest = read_host_staging_manifest(local_path)
+        manifest_list = [manifest]
+        torch.distributed.broadcast_object_list(manifest_list, src=0)
+        manifest = manifest_list[0] or {}
+        cfg = HostStagingConfig.from_dict({**manifest, **(staging_config or {})})
+        self._restore_actor_handoff_state(
+            local_path,
+            load_optimizer=cfg.stage_optimizer,
+            progressive_swap=cfg.progressive_swap,
+            chunk_mb=cfg.chunk_mb,
+        )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def release_host_staging_buffer(self, local_path: str, staging_config: dict | None = None):
+        cfg = HostStagingConfig.from_dict(staging_config)
+        logger.info(
+            "[one-step-off][resize][host-stage] rank=%s release staging metadata: backend=%s path=%s cleanup_after_load=%s",
+            self.rank,
+            cfg.effective_backend(),
+            local_path,
+            cfg.cleanup_after_load,
+        )
 
 
 class DetachAsyncRolloutWorker(DetachSync):

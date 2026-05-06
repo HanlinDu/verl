@@ -26,6 +26,7 @@ import math
 import os
 import shutil
 import socket
+import time
 import uuid
 from pprint import pprint
 
@@ -49,6 +50,7 @@ from verl.experimental.one_step_off_policy.resize_controller import (
     ResizeControllerConfig,
 )
 from verl.experimental.one_step_off_policy.resize_metrics import build_resize_observation
+from verl.experimental.one_step_off_policy.staging_backend import HostStagingConfig
 from verl.experimental.one_step_off_policy.utils import need_critic
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls, split_resource_pool
@@ -196,9 +198,16 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self._last_runtime_batch_plan: dict[str, int] | None = None
         self._resize_padding_history: list[DataProto] = []
         self._resize_padding_history_size = 8
+        # Round one: schedule is still the source of candidate topologies.
+        # The controller only decides whether a scheduled switch should fire.
         self._dynamic_resize_mode = self._resolve_dynamic_resize_mode()
         self._resize_controller = self._build_resize_controller()
         self._latest_resize_control_metrics: dict[str, float | str | int] = self._default_resize_control_metrics()
+        # Round two: handoff is configured through a staging backend abstraction
+        # so the staged resize path can evolve from disk-backed transfer toward
+        # richer host-memory implementations without changing the trainer flow.
+        self._handoff_staging_config = self._build_handoff_staging_config()
+        self._latest_resize_execution_metrics: dict[str, float | str | int] = self._default_resize_execution_metrics()
 
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
         if lora_rank <= 0:
@@ -233,6 +242,13 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             return None
         return ResizeController(controller_cfg)
 
+    def _build_handoff_staging_config(self) -> HostStagingConfig:
+        cfg = OmegaConf.select(self.config.trainer, "dynamic_resize")
+        if cfg is None:
+            return HostStagingConfig()
+        cfg = OmegaConf.to_container(cfg, resolve=True)
+        return HostStagingConfig.from_dict(cfg.get("handoff", {}))
+
     def _default_resize_control_metrics(self) -> dict[str, float | str | int]:
         enabled = 1.0 if self._resize_controller is not None else 0.0
         return {
@@ -250,6 +266,26 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             "resize/cooldown_remaining": 0,
             "resize/gate_pass": -1.0,
         }
+
+    def _default_resize_execution_metrics(self) -> dict[str, float | str | int]:
+        return {
+            "resize/host_stage_enabled": 1.0 if self._handoff_staging_config.enable else 0.0,
+            "resize/host_stage_backend": self._handoff_staging_config.effective_backend(),
+            "resize/host_stage_requested_backend": self._handoff_staging_config.backend,
+            "resize/host_stage_export_s": 0.0,
+            "resize/host_stage_import_s": 0.0,
+            "resize/progressive_swap_s": 0.0,
+            "resize/kv_cache_preclear_s": 0.0,
+            "resize/host_stage_cleanup": 0.0,
+        }
+
+    def _reset_resize_execution_metrics(self) -> dict[str, float | str | int]:
+        self._latest_resize_execution_metrics = self._default_resize_execution_metrics()
+        return dict(self._latest_resize_execution_metrics)
+
+    def _update_resize_execution_metrics(self, **kwargs) -> dict[str, float | str | int]:
+        self._latest_resize_execution_metrics.update(kwargs)
+        return dict(self._latest_resize_execution_metrics)
 
     def _build_resize_control_metrics(self, snapshot: dict[str, float | str | int] | None = None) -> dict[str, float | str | int]:
         snapshot = snapshot or {}
@@ -1324,6 +1360,15 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         if not os.path.isabs(checkpoint_folder):
             checkpoint_folder = os.path.join(os.getcwd(), checkpoint_folder)
         handoff_dir = os.path.join(checkpoint_folder, f"dynamic_resize_actor_handoff_step_{self.global_steps}")
+        # When host staging is enabled, the same directory becomes a staging root
+        # rather than a plain checkpoint handoff directory.
+        if self._handoff_staging_config.enable:
+            logger.info(
+                "[one-step-off][resize][host-stage] using temporary actor host staging dir: %s backend=%s",
+                handoff_dir,
+                self._handoff_staging_config.effective_backend(),
+            )
+            return handoff_dir, self._handoff_staging_config.cleanup_after_load, "host_staging"
         logger.info("[one-step-off][resize][handoff] using temporary actor handoff dir: %s", handoff_dir)
         return handoff_dir, True, "handoff"
 
@@ -1350,6 +1395,26 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         if inspect.isawaitable(result):
             await result
         self.async_rollout_manager = None
+
+    async def _clear_rollout_kv_cache_before_resize_async(self) -> float:
+        manager = getattr(self, "async_rollout_manager", None)
+        if manager is None:
+            return 0.0
+
+        started_at = time.monotonic()
+        clear_async = getattr(manager, "clear_kv_cache_async", None)
+        if clear_async is not None:
+            await clear_async()
+            return time.monotonic() - started_at
+
+        clear_sync = getattr(manager, "clear_kv_cache", None)
+        if clear_sync is not None:
+            result = clear_sync()
+            if inspect.isawaitable(result):
+                await result
+            return time.monotonic() - started_at
+
+        return 0.0
 
     def _has_dynamic_resize_scheduled_at_step(self, step: int) -> bool:
         cfg = OmegaConf.select(self.config.trainer, "dynamic_resize")
@@ -1433,9 +1498,28 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         actor_resume_path, should_cleanup_actor_resume, actor_resume_kind = self._resolve_staged_actor_resume(
             actor_resume_path,
         )
-        if actor_resume_kind == "handoff":
+        # Phase 0: export the train-side state into the host staging backend
+        # before shared-pool slots are reclaimed. This avoids claiming that the
+        # new role has already been preloaded into free VRAM.
+        if actor_resume_kind == "host_staging":
+            logger.info("[one-step-off][resize][host-stage] exporting actor state before staged switch")
+            export_started_at = time.monotonic()
+            old_actor_wg.stage_actor_handoff_state_to_host(
+                actor_resume_path,
+                staging_config=self._handoff_staging_config.to_manifest_dict(),
+            )
+            export_duration = time.monotonic() - export_started_at
+            self._update_resize_execution_metrics(**{"resize/host_stage_export_s": export_duration})
+            if self._handoff_staging_config.preclear_rollout_kv_cache:
+                # Reclaim rollout-side transient memory before the switch window.
+                kv_cache_preclear_s = await self._clear_rollout_kv_cache_before_resize_async()
+                self._update_resize_execution_metrics(**{"resize/kv_cache_preclear_s": kv_cache_preclear_s})
+        elif actor_resume_kind == "handoff":
             logger.info("[one-step-off][resize][handoff] exporting actor state before staged switch")
+            export_started_at = time.monotonic()
             old_actor_wg.save_actor_handoff_state(actor_resume_path)
+            export_duration = time.monotonic() - export_started_at
+            self._update_resize_execution_metrics(**{"resize/host_stage_export_s": export_duration})
 
         logger.info(
             "[one-step-off][resize][staged] start: "
@@ -1465,12 +1549,50 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
         actor_resume_load_path = self._normalize_actor_resume_load_path(actor_resume_path)
 
-        if actor_resume_kind == "handoff" and actor_resume_path is not None:
-            logger.info("[one-step-off][resize][handoff] importing actor state into new actor")
-            new_actor_wg.load_actor_handoff_state(actor_resume_path)
+        # Phase B: restore actor state only after the new actor has finished its
+        # minimal worker/model initialization. This keeps the resize window short
+        # and makes the host-staging timing visible in metrics.
+        if actor_resume_kind == "host_staging" and actor_resume_path is not None:
+            logger.info("[one-step-off][resize][host-stage] importing actor state into new actor")
+            import_started_at = time.monotonic()
+            new_actor_wg.load_actor_handoff_state_from_host(
+                actor_resume_path,
+                staging_config=self._handoff_staging_config.to_manifest_dict(),
+            )
+            import_duration = time.monotonic() - import_started_at
+            self._update_resize_execution_metrics(
+                **{
+                    "resize/host_stage_import_s": import_duration,
+                    "resize/progressive_swap_s": import_duration if self._handoff_staging_config.progressive_swap else 0.0,
+                }
+            )
+            new_actor_wg.release_host_staging_buffer(
+                actor_resume_path,
+                staging_config=self._handoff_staging_config.to_manifest_dict(),
+            )
             if should_cleanup_actor_resume:
                 try:
                     shutil.rmtree(actor_resume_path)
+                    self._update_resize_execution_metrics(**{"resize/host_stage_cleanup": 1.0})
+                    logger.info("[one-step-off][resize][host-stage] cleaned temporary actor handoff dir: %s", actor_resume_path)
+                except FileNotFoundError:
+                    pass
+                except Exception as exc:  # pragma: no cover - best effort cleanup
+                    logger.warning(
+                        "[one-step-off][resize][host-stage] failed to remove temporary handoff %s: %s",
+                        actor_resume_path,
+                        exc,
+                    )
+        elif actor_resume_kind == "handoff" and actor_resume_path is not None:
+            logger.info("[one-step-off][resize][handoff] importing actor state into new actor")
+            import_started_at = time.monotonic()
+            new_actor_wg.load_actor_handoff_state(actor_resume_path)
+            import_duration = time.monotonic() - import_started_at
+            self._update_resize_execution_metrics(**{"resize/host_stage_import_s": import_duration})
+            if should_cleanup_actor_resume:
+                try:
+                    shutil.rmtree(actor_resume_path)
+                    self._update_resize_execution_metrics(**{"resize/host_stage_cleanup": 1.0})
                     logger.info("[one-step-off][resize][handoff] cleaned temporary actor handoff dir: %s", actor_resume_path)
                 except FileNotFoundError:
                     pass
@@ -1933,6 +2055,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
         while batch_data_future is not None:
             self._ensure_actor_training_group_binding()
+            self._reset_resize_execution_metrics()
             do_profile = (
                 self.global_steps in self.config.global_profiler.steps
                 if self.config.global_profiler.steps is not None
@@ -2171,6 +2294,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             # NOTE(HanlinDu): this may be executed asynchronously with _save_checkpoint()
             await self._maybe_dynamic_resize()
             metrics.update(self._latest_resize_control_metrics)
+            metrics.update(self._latest_resize_execution_metrics)
 
             if not is_last_step and batch_data_future is None:
                 logger.info(

@@ -34,6 +34,14 @@ trainer:
   dynamic_resize:
     enable: true
     mode: schedule
+    handoff:
+      enable: true
+      backend: disk_fallback
+      chunk_mb: 256
+      stage_optimizer: true
+      progressive_swap: true
+      cleanup_after_load: true
+      preclear_rollout_kv_cache: true
     hysteresis:
       enable: false
       window_size: 2

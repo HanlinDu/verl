@@ -60,6 +60,9 @@ class ResizeController:
         return self.config.enable
 
     def observe(self, *, step: int, observation: dict[str, float]) -> dict[str, float | str | int]:
+        # Record per-step timing signals before any schedule item is evaluated.
+        # The controller only gates scheduled candidate topologies; it does not
+        # invent a new topology on its own in this first round.
         self._observations.append(observation)
         avg_rollout_time, avg_train_time = self._average_times()
         ratio = avg_rollout_time / max(avg_train_time, 1e-6)
@@ -90,6 +93,8 @@ class ResizeController:
         step: int,
         required_action: str,
     ) -> tuple[bool, dict[str, float | str | int]]:
+        # `required_action` comes from the scheduled topology delta. The gate
+        # opens only when the recent hysteresis decision agrees with that action.
         snapshot = self._build_snapshot(current_step=step, required_action=required_action)
 
         if not self.enabled:
@@ -120,6 +125,7 @@ class ResizeController:
         return allow, snapshot
 
     def mark_resize_applied(self, *, step: int, action: str) -> dict[str, float | str | int]:
+        # Update dwell/cooldown state only after a resize is actually committed.
         self._last_resize_step = step
         self._last_applied_action = action
         self._latest_snapshot = self._build_snapshot(current_step=step, required_action=action)
@@ -172,6 +178,8 @@ class ResizeController:
         return ACTION_HOLD
 
     def _stable_decision(self) -> str:
+        # Require repeated identical non-hold signals before allowing the gate
+        # to pass. This is the core anti-thrashing rule in round one.
         if len(self._signals) < self.config.consecutive_signal_steps:
             return ACTION_HOLD
         first_signal = self._signals[0]
