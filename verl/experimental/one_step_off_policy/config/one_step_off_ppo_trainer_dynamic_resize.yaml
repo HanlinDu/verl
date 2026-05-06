@@ -33,6 +33,16 @@ trainer:
   # Dynamic resize schedule for actor/rollout group switching.
   dynamic_resize:
     enable: true
+    mode: schedule
+    hysteresis:
+      enable: false
+      window_size: 2
+      up_threshold: 1.15
+      down_threshold: 0.9
+      min_dwell_steps: 1
+      cooldown_steps: 0
+      consecutive_signal_steps: 1
+      min_observation_count: 1
     shared_pool:
       enable: true
       nnodes: 1

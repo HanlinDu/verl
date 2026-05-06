@@ -40,6 +40,15 @@ from tqdm import tqdm
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
+from verl.experimental.one_step_off_policy.resize_controller import (
+    ACTION_EXPAND_ROLLOUT,
+    ACTION_EXPAND_TRAIN,
+    ACTION_HOLD,
+    ACTION_TO_CODE,
+    ResizeController,
+    ResizeControllerConfig,
+)
+from verl.experimental.one_step_off_policy.resize_metrics import build_resize_observation
 from verl.experimental.one_step_off_policy.utils import need_critic
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls, split_resource_pool
@@ -187,6 +196,9 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self._last_runtime_batch_plan: dict[str, int] | None = None
         self._resize_padding_history: list[DataProto] = []
         self._resize_padding_history_size = 8
+        self._dynamic_resize_mode = self._resolve_dynamic_resize_mode()
+        self._resize_controller = self._build_resize_controller()
+        self._latest_resize_control_metrics: dict[str, float | str | int] = self._default_resize_control_metrics()
 
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
         if lora_rank <= 0:
@@ -200,6 +212,107 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(config.algorithm.kl_ctrl)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _resolve_dynamic_resize_mode(self) -> str:
+        cfg = OmegaConf.select(self.config.trainer, "dynamic_resize")
+        if cfg is None:
+            return "schedule"
+        cfg = OmegaConf.to_container(cfg, resolve=True)
+        return str(cfg.get("mode", "schedule"))
+
+    def _build_resize_controller(self) -> ResizeController | None:
+        cfg = OmegaConf.select(self.config.trainer, "dynamic_resize")
+        if cfg is None:
+            return None
+        cfg = OmegaConf.to_container(cfg, resolve=True)
+        mode = str(cfg.get("mode", "schedule"))
+        if mode != "schedule_with_hysteresis":
+            return None
+        controller_cfg = ResizeControllerConfig.from_dict(cfg.get("hysteresis", {}))
+        if not controller_cfg.enable:
+            return None
+        return ResizeController(controller_cfg)
+
+    def _default_resize_control_metrics(self) -> dict[str, float | str | int]:
+        enabled = 1.0 if self._resize_controller is not None else 0.0
+        return {
+            "resize/mode": self._dynamic_resize_mode,
+            "resize/controller_enabled": enabled,
+            "resize/rollout_train_ratio": 0.0,
+            "resize/hysteresis_signal": ACTION_HOLD,
+            "resize/hysteresis_signal_code": 0.0,
+            "resize/hysteresis_decision": ACTION_HOLD,
+            "resize/hysteresis_decision_code": 0.0,
+            "resize/required_action": ACTION_HOLD,
+            "resize/required_action_code": 0.0,
+            "resize/window_fill": 0,
+            "resize/dwell_remaining": 0,
+            "resize/cooldown_remaining": 0,
+            "resize/gate_pass": -1.0,
+        }
+
+    def _build_resize_control_metrics(self, snapshot: dict[str, float | str | int] | None = None) -> dict[str, float | str | int]:
+        snapshot = snapshot or {}
+        base = self._default_resize_control_metrics()
+        for key, value in snapshot.items():
+            base[f"resize/{key}"] = value
+        return base
+
+    def _record_resize_control_observation(self, *, timing_raw: dict, batch: DataProto | None) -> dict[str, float | str | int]:
+        if self._resize_controller is None:
+            self._latest_resize_control_metrics = self._default_resize_control_metrics()
+            return dict(self._latest_resize_control_metrics)
+
+        observation = build_resize_observation(timing_raw=timing_raw, batch=batch)
+        snapshot = self._resize_controller.observe(step=self.global_steps, observation=observation)
+        self._latest_resize_control_metrics = self._build_resize_control_metrics(snapshot)
+        return dict(self._latest_resize_control_metrics)
+
+    def _resolve_scheduled_resize_action(self, item: dict) -> str:
+        actor_spec = item.get("actor_pool")
+        rollout_spec = item.get("rollout_pool")
+        if actor_spec is None or rollout_spec is None:
+            return ACTION_HOLD
+
+        active_actor = self._active_role_world_sizes.get(Role.Actor)
+        active_rollout = self._active_role_world_sizes.get(Role.Rollout)
+        if active_actor is None or active_rollout is None:
+            return ACTION_HOLD
+
+        actor_target = self._pool_world_size_from_spec(Role.Actor, actor_spec)
+        rollout_target = self._pool_world_size_from_spec(Role.Rollout, rollout_spec)
+        if self._resize_controller is None:
+            actor_delta = actor_target - active_actor
+            rollout_delta = rollout_target - active_rollout
+            if rollout_delta > 0 and actor_delta < 0:
+                return ACTION_EXPAND_ROLLOUT
+            if actor_delta > 0 and rollout_delta < 0:
+                return ACTION_EXPAND_TRAIN
+            return ACTION_HOLD
+
+        return self._resize_controller.infer_required_action(
+            active_actor=active_actor,
+            active_rollout=active_rollout,
+            actor_target=actor_target,
+            rollout_target=rollout_target,
+        )
+
+    def _gate_dynamic_resize_schedule_item(self, item: dict) -> tuple[bool, str, dict[str, float | str | int]]:
+        required_action = self._resolve_scheduled_resize_action(item)
+        if self._dynamic_resize_mode != "schedule_with_hysteresis" or self._resize_controller is None:
+            snapshot = {
+                "required_action": required_action,
+                "required_action_code": ACTION_TO_CODE[required_action],
+                "gate_pass": 1.0,
+            }
+            metrics = self._build_resize_control_metrics(snapshot)
+            self._latest_resize_control_metrics = metrics
+            return True, required_action, metrics
+
+        allow, snapshot = self._resize_controller.gate(step=self.global_steps, required_action=required_action)
+        metrics = self._build_resize_control_metrics(snapshot)
+        self._latest_resize_control_metrics = metrics
+        return allow, required_action, metrics
 
     def _maybe_patch_reward_metadata(self, non_tensor_batch) -> None:
         # Keep this fallback intentionally narrow. We only synthesize reward
@@ -1458,6 +1571,22 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 f"global_step={self.global_steps}, item={item}"
             )
 
+            gate_pass, required_action, gate_metrics = self._gate_dynamic_resize_schedule_item(item)
+            self._latest_resize_control_metrics = gate_metrics
+            if not gate_pass:
+                logger.info(
+                    "[one-step-off][resize][gate] skip scheduled resize: step=%s required_action=%s signal=%s "
+                    "decision=%s ratio=%.4f cooldown_remaining=%s dwell_remaining=%s",
+                    self.global_steps,
+                    required_action,
+                    gate_metrics.get("resize/hysteresis_signal"),
+                    gate_metrics.get("resize/hysteresis_decision"),
+                    float(gate_metrics.get("resize/rollout_train_ratio", 0.0)),
+                    gate_metrics.get("resize/cooldown_remaining"),
+                    gate_metrics.get("resize/dwell_remaining"),
+                )
+                continue
+
             actor_spec = item.get("actor_pool")
             rollout_spec = item.get("rollout_pool")
             release_old = item.get("release_old", True)
@@ -1468,6 +1597,9 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             if not release_old and staged_enabled:
                 logger.info("[one-step-off][resize] using staged shared-pool resize path")
                 await self._staged_resize_shared_pool(item, actor_resume_path=actor_resume_path)
+                if self._resize_controller is not None:
+                    snapshot = self._resize_controller.mark_resize_applied(step=self.global_steps, action=required_action)
+                    self._latest_resize_control_metrics = self._build_resize_control_metrics(snapshot)
                 logger.info("[one-step-off][resize] staged switch complete")
                 continue
 
@@ -1499,6 +1631,9 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 actor_spec=actor_spec,
                 rollout_spec=rollout_spec,
             )
+            if self._resize_controller is not None:
+                snapshot = self._resize_controller.mark_resize_applied(step=self.global_steps, action=required_action)
+                self._latest_resize_control_metrics = self._build_resize_control_metrics(snapshot)
             logger.info(
                 "[one-step-off][resize] switch complete: actor=%s, rollout=%s",
                 len(getattr(new_actor, "workers", [])),
@@ -2016,6 +2151,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 max_steps_duration=self.max_steps_duration,
                 redundant_time=self.config.trainer.esi_redundant_time,
             )
+            metrics.update(self._record_resize_control_observation(timing_raw=timing_raw, batch=batch))
             # Check if the conditions for saving a checkpoint are met.
             # The conditions include a mandatory condition (1) and
             # one of the following optional conditions (2/3/4):
@@ -2034,6 +2170,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             # dynamic resize of actor/rollout pool
             # NOTE(HanlinDu): this may be executed asynchronously with _save_checkpoint()
             await self._maybe_dynamic_resize()
+            metrics.update(self._latest_resize_control_metrics)
 
             if not is_last_step and batch_data_future is None:
                 logger.info(
