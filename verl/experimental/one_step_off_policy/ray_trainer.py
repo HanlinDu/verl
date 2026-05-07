@@ -45,6 +45,11 @@ from verl.experimental.one_step_off_policy.communicator_cache import (
     WeightSyncCommunicatorCache,
     build_topology_key,
 )
+from verl.experimental.one_step_off_policy.resize_budget import (
+    ResizeBudgetConfig,
+    ResizeBudgetController,
+    ResizeBudgetSnapshot,
+)
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.experimental.one_step_off_policy.resize_controller import (
     ACTION_EXPAND_ROLLOUT,
@@ -217,6 +222,9 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self._communicator_cache_config = self._build_communicator_cache_config()
         self._weight_sync_communicator_cache = WeightSyncCommunicatorCache(self._communicator_cache_config)
         self._latest_communicator_cache_metrics: dict[str, float | str | int] = self._default_communicator_cache_metrics()
+        self._resize_budget_config = self._build_resize_budget_config()
+        self._resize_budget_controller = ResizeBudgetController(self._resize_budget_config)
+        self._latest_resize_budget_metrics: dict[str, float | str | int] = self._default_resize_budget_metrics()
 
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
         if lora_rank <= 0:
@@ -265,6 +273,13 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         cfg = OmegaConf.to_container(cfg, resolve=True)
         return CommunicatorCacheConfig.from_dict(cfg.get("communicator_cache", {}))
 
+    def _build_resize_budget_config(self) -> ResizeBudgetConfig:
+        cfg = OmegaConf.select(self.config.trainer, "dynamic_resize")
+        if cfg is None:
+            return ResizeBudgetConfig()
+        cfg = OmegaConf.to_container(cfg, resolve=True)
+        return ResizeBudgetConfig.from_dict(cfg.get("budget_protection", {}))
+
     def _default_resize_control_metrics(self) -> dict[str, float | str | int]:
         enabled = 1.0 if self._resize_controller is not None else 0.0
         return {
@@ -303,6 +318,15 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             "resize/comm_cache_reused_group": "",
         }
 
+    def _default_resize_budget_metrics(self) -> dict[str, float | str | int]:
+        return {
+            "resize/budget_enabled": 1.0 if self._resize_budget_config.enable else 0.0,
+            "resize/budget_ratio": self._resize_budget_config.memory_budget_ratio,
+            "resize/budget_blocked": 0.0,
+            "resize/budget_reason": "",
+            "resize/budget_effective_backend": self._handoff_staging_config.effective_backend(),
+        }
+
     def _reset_resize_execution_metrics(self) -> dict[str, float | str | int]:
         self._latest_resize_execution_metrics = self._default_resize_execution_metrics()
         return dict(self._latest_resize_execution_metrics)
@@ -311,6 +335,10 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self._latest_communicator_cache_metrics = self._default_communicator_cache_metrics()
         return dict(self._latest_communicator_cache_metrics)
 
+    def _reset_resize_budget_metrics(self) -> dict[str, float | str | int]:
+        self._latest_resize_budget_metrics = self._default_resize_budget_metrics()
+        return dict(self._latest_resize_budget_metrics)
+
     def _update_resize_execution_metrics(self, **kwargs) -> dict[str, float | str | int]:
         self._latest_resize_execution_metrics.update(kwargs)
         return dict(self._latest_resize_execution_metrics)
@@ -318,6 +346,49 @@ class OneStepOffRayTrainer(RayPPOTrainer):
     def _update_communicator_cache_metrics(self, **kwargs) -> dict[str, float | str | int]:
         self._latest_communicator_cache_metrics.update(kwargs)
         return dict(self._latest_communicator_cache_metrics)
+
+    def _update_resize_budget_metrics(self, **kwargs) -> dict[str, float | str | int]:
+        self._latest_resize_budget_metrics.update(kwargs)
+        return dict(self._latest_resize_budget_metrics)
+
+    @staticmethod
+    def _estimate_weights_info_bytes(weights_info) -> int:
+        total_bytes = 0
+        for _, shape, dtype in weights_info:
+            element_size = torch.empty((), dtype=dtype).element_size()
+            total_bytes += math.prod(shape) * element_size
+        return int(total_bytes)
+
+    @staticmethod
+    def _estimate_host_export_peak_bytes(model_bytes: int, *, stage_optimizer: bool) -> int:
+        # Conservative heuristic: full model state plus CPU-side optimizer state.
+        multiplier = 3.0 if stage_optimizer else 1.25
+        return int(model_bytes * multiplier)
+
+    @staticmethod
+    def _estimate_gpu_restore_peak_bytes(
+        model_bytes: int,
+        *,
+        progressive_swap: bool = False,
+        chunk_mb: int | None = None,
+    ) -> int:
+        # When paged restore is enabled, the extra transient GPU pressure is
+        # dominated by the current page rather than a second full model copy.
+        working_bytes = model_bytes
+        if progressive_swap and chunk_mb is not None and chunk_mb > 0:
+            working_bytes = min(model_bytes, int(chunk_mb) * 1024 * 1024)
+        return int(working_bytes * 1.2)
+
+    def _make_runtime_handoff_staging_dict(self, *, effective_backend: str) -> dict[str, float | str | bool | int]:
+        runtime_cfg = self._handoff_staging_config.to_manifest_dict()
+        runtime_cfg["backend"] = effective_backend
+        return runtime_cfg
+
+    def _get_role_group_resource_snapshot(self, role: Role, role_wg: RayWorkerGroup, staging_path: str | None = None) -> ResizeBudgetSnapshot:
+        # Query one representative worker before resize so the trainer can make
+        # a budget decision without pushing large tensors through the switch path.
+        snapshot = role_wg.execute_rank_zero_sync(f"{str(role)}_get_resize_resource_snapshot", staging_path)
+        return ResizeBudgetSnapshot.from_dict(snapshot)
 
     def _current_topology_key(self) -> str:
         return build_topology_key(
@@ -1606,7 +1677,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             )
         return enabled
 
-    async def _staged_resize_shared_pool(self, item: dict, *, actor_resume_path: str | None = None) -> None:
+    async def _staged_resize_shared_pool(self, item: dict, *, actor_resume_path: str | None = None) -> bool:
         plan = self._get_staged_shared_pool_resize_plan(item)
         actor_spec = plan["actor_spec"]
         rollout_spec = plan["rollout_spec"]
@@ -1622,10 +1693,44 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         actor_delta = plan["actor_delta"]
         rollout_delta = plan["rollout_delta"]
         shrinking_role = plan["shrinking_role"]
+        model_bytes = self._estimate_weights_info_bytes(self._get_actor_weights_info(old_actor_wg)[0])
 
         actor_resume_path, should_cleanup_actor_resume, actor_resume_kind = self._resolve_staged_actor_resume(
             actor_resume_path,
         )
+        runtime_staging_cfg = self._handoff_staging_config.to_manifest_dict()
+
+        if actor_resume_kind in {"host_staging", "handoff"}:
+            # The same budget gate covers both host-staging export and legacy
+            # handoff export. The only difference is whether we are allowed to
+            # downgrade the requested backend to disk fallback.
+            export_snapshot = self._get_role_group_resource_snapshot(Role.Actor, old_actor_wg, staging_path=actor_resume_path)
+            export_decision = self._resize_budget_controller.evaluate_export(
+                requested_backend=self._handoff_staging_config.backend if actor_resume_kind == "host_staging" else "disk_fallback",
+                snapshot=export_snapshot,
+                estimated_host_peak_bytes=self._estimate_host_export_peak_bytes(
+                    model_bytes,
+                    stage_optimizer=self._handoff_staging_config.stage_optimizer if actor_resume_kind == "host_staging" else True,
+                ),
+                estimated_stage_bytes=model_bytes,
+            )
+            self._update_resize_budget_metrics(
+                **{
+                    "resize/budget_blocked": 1.0 if export_decision.blocked else 0.0,
+                    "resize/budget_reason": export_decision.reason,
+                    "resize/budget_effective_backend": export_decision.effective_backend,
+                }
+            )
+            if export_decision.blocked:
+                logger.warning(
+                    "[one-step-off][resize][budget] skip staged resize before export: step=%s reason=%s",
+                    self.global_steps,
+                    export_decision.reason,
+                )
+                return False
+            if actor_resume_kind == "host_staging":
+                runtime_staging_cfg = self._make_runtime_handoff_staging_dict(effective_backend=export_decision.effective_backend)
+
         # Phase 0: export the train-side state into the host staging backend
         # before shared-pool slots are reclaimed. This avoids claiming that the
         # new role has already been preloaded into free VRAM.
@@ -1634,7 +1739,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             export_started_at = time.monotonic()
             old_actor_wg.stage_actor_handoff_state_to_host(
                 actor_resume_path,
-                staging_config=self._handoff_staging_config.to_manifest_dict(),
+                staging_config=runtime_staging_cfg,
             )
             export_duration = time.monotonic() - export_started_at
             self._update_resize_execution_metrics(**{"resize/host_stage_export_s": export_duration})
@@ -1648,6 +1753,37 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             old_actor_wg.save_actor_handoff_state(actor_resume_path)
             export_duration = time.monotonic() - export_started_at
             self._update_resize_execution_metrics(**{"resize/host_stage_export_s": export_duration})
+
+        # GPU restore is checked after KV-cache preclear/export, because the
+        # effective free memory at that moment is what matters for the switch.
+        gpu_role = Role.Rollout if shrinking_role == Role.Rollout else Role.Actor
+        gpu_wg = old_rollout_wg if shrinking_role == Role.Rollout else old_actor_wg
+        restore_snapshot = self._get_role_group_resource_snapshot(gpu_role, gpu_wg, staging_path=actor_resume_path)
+        restore_decision = self._resize_budget_controller.evaluate_restore(
+            snapshot=restore_snapshot,
+            estimated_gpu_peak_bytes=self._estimate_gpu_restore_peak_bytes(
+                model_bytes,
+                progressive_swap=bool(runtime_staging_cfg.get("progressive_swap", False)),
+                chunk_mb=int(runtime_staging_cfg.get("chunk_mb", 0) or 0),
+            ),
+        )
+        self._update_resize_budget_metrics(
+            **{
+                "resize/budget_blocked": 1.0 if restore_decision.blocked else 0.0,
+                "resize/budget_reason": restore_decision.reason,
+                "resize/budget_effective_backend": runtime_staging_cfg.get("backend", "disk_fallback"),
+            }
+        )
+        if restore_decision.blocked:
+            logger.warning(
+                "[one-step-off][resize][budget] skip staged resize before restore: step=%s reason=%s",
+                self.global_steps,
+                restore_decision.reason,
+            )
+            if should_cleanup_actor_resume and actor_resume_path is not None:
+                shutil.rmtree(actor_resume_path, ignore_errors=True)
+                self._update_resize_execution_metrics(**{"resize/host_stage_cleanup": 1.0})
+            return False
 
         logger.info(
             "[one-step-off][resize][staged] start: "
@@ -1685,18 +1821,18 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             import_started_at = time.monotonic()
             new_actor_wg.load_actor_handoff_state_from_host(
                 actor_resume_path,
-                staging_config=self._handoff_staging_config.to_manifest_dict(),
+                staging_config=runtime_staging_cfg,
             )
             import_duration = time.monotonic() - import_started_at
             self._update_resize_execution_metrics(
                 **{
                     "resize/host_stage_import_s": import_duration,
-                    "resize/progressive_swap_s": import_duration if self._handoff_staging_config.progressive_swap else 0.0,
+                    "resize/progressive_swap_s": import_duration if runtime_staging_cfg.get("progressive_swap", False) else 0.0,
                 }
             )
             new_actor_wg.release_host_staging_buffer(
                 actor_resume_path,
-                staging_config=self._handoff_staging_config.to_manifest_dict(),
+                staging_config=runtime_staging_cfg,
             )
             if should_cleanup_actor_resume:
                 try:
@@ -1791,6 +1927,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             self.remove_role_group(Role.Actor, old_actor_wg)
         self._cleanup_pending_weight_sync_groups()
         logger.info("[one-step-off][resize][staged] done")
+        return True
 
     async def _maybe_dynamic_resize(self):
         # Execute scheduled resize steps driven by config.trainer.dynamic_resize.
@@ -1851,11 +1988,12 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             staged_enabled = self._should_use_staged_shared_pool_resize(item)
             if not release_old and staged_enabled:
                 logger.info("[one-step-off][resize] using staged shared-pool resize path")
-                await self._staged_resize_shared_pool(item, actor_resume_path=actor_resume_path)
-                if self._resize_controller is not None:
-                    snapshot = self._resize_controller.mark_resize_applied(step=self.global_steps, action=required_action)
-                    self._latest_resize_control_metrics = self._build_resize_control_metrics(snapshot)
-                logger.info("[one-step-off][resize] staged switch complete")
+                resize_applied = await self._staged_resize_shared_pool(item, actor_resume_path=actor_resume_path)
+                if resize_applied:
+                    if self._resize_controller is not None:
+                        snapshot = self._resize_controller.mark_resize_applied(step=self.global_steps, action=required_action)
+                        self._latest_resize_control_metrics = self._build_resize_control_metrics(snapshot)
+                    logger.info("[one-step-off][resize] staged switch complete")
                 continue
 
             actor_pool = self._resolve_role_pool(Role.Actor, actor_spec)
@@ -2195,6 +2333,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             self._ensure_actor_training_group_binding()
             self._reset_resize_execution_metrics()
             self._reset_communicator_cache_metrics()
+            self._reset_resize_budget_metrics()
             do_profile = (
                 self.global_steps in self.config.global_profiler.steps
                 if self.config.global_profiler.steps is not None
@@ -2435,6 +2574,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             metrics.update(self._latest_resize_control_metrics)
             metrics.update(self._latest_resize_execution_metrics)
             metrics.update(self._latest_communicator_cache_metrics)
+            metrics.update(self._latest_resize_budget_metrics)
 
             if not is_last_step and batch_data_future is None:
                 logger.info(

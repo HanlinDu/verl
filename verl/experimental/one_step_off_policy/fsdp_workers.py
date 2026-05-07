@@ -17,6 +17,8 @@ import logging
 import os
 import datetime
 import math
+import shutil
+import gc
 from dataclasses import fields
 
 import torch
@@ -29,7 +31,13 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from verl.experimental.one_step_off_policy.distributed_utils import vllm_stateless_init_process_group
 from verl.experimental.one_step_off_policy.staging_backend import (
     HostStagingConfig,
+    has_paged_state_dict,
+    iter_paged_state_dict,
+    load_paged_optimizer_state_dict,
     read_host_staging_manifest,
+    save_paged_state_dict,
+    save_paged_optimizer_state_dict,
+    read_paged_state_manifest,
     write_host_staging_manifest,
 )
 from verl.single_controller.base import Worker
@@ -92,6 +100,15 @@ def _get_reshardable_optimizer_state_dict_api():
     return StateDictOptions, get_optimizer_state_dict, set_optimizer_state_dict
 
 
+def _get_reshardable_model_state_dict_api():
+    if version.parse(torch.__version__) >= version.parse("2.7.0"):
+        from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+    else:
+        from verl.third_party.torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+
+    return StateDictOptions, set_model_state_dict
+
+
 def _to_builtin_python_container(obj):
     if isinstance(obj, DictConfig | ListConfig):
         return OmegaConf.to_container(obj, resolve=True)
@@ -141,6 +158,25 @@ def _sanitize_actor_config_for_dataclass(actor_cfg):
         }
 
     return OmegaConf.create(sanitized_actor_cfg), rollout_correction_cfg
+
+
+def _get_available_host_memory_bytes() -> int | None:
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        avail_pages = os.sysconf("SC_AVPHYS_PAGES")
+        return int(page_size * avail_pages)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _get_available_device_memory_bytes() -> tuple[int | None, int | None]:
+    try:
+        if torch.cuda.is_available():
+            free_bytes, total_bytes = torch.cuda.mem_get_info(get_torch_device().current_device())
+            return int(free_bytes), int(total_bytes)
+    except Exception:
+        pass
+    return None, None
 
 
 class LocalInitActorRolloutRefWorker(Worker, DistProfilerExtension):
@@ -706,6 +742,23 @@ class DetachSync(LocalInitActorRolloutRefWorker, AsyncActorRolloutRefWorker):
             self._weight_sync_group_metadata = metadata
         return metadata
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_resize_resource_snapshot(self, staging_path: str | None = None):
+        host_free_bytes = _get_available_host_memory_bytes()
+        gpu_free_bytes, gpu_total_bytes = _get_available_device_memory_bytes()
+        disk_free_bytes = None
+        if staging_path:
+            try:
+                disk_free_bytes = int(shutil.disk_usage(staging_path).free)
+            except Exception:
+                disk_free_bytes = None
+        return {
+            "host_free_bytes": host_free_bytes,
+            "gpu_free_bytes": gpu_free_bytes,
+            "gpu_total_bytes": gpu_total_bytes,
+            "disk_free_bytes": disk_free_bytes,
+        }
+
     def _maybe_init_collective_group(self, group_name: str = "actor_rollout") -> None:
         if device_name == "npu":
             return
@@ -944,9 +997,9 @@ class DetachActorWorker(DetachSync):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_actor_handoff_state(self, local_path: str):
-        self._export_actor_handoff_state(local_path, stage_optimizer=True)
+        self._export_actor_handoff_state(local_path, stage_optimizer=True, chunk_mb=None)
 
-    def _export_actor_handoff_state(self, local_path: str, *, stage_optimizer: bool) -> None:
+    def _export_actor_handoff_state(self, local_path: str, *, stage_optimizer: bool, chunk_mb: int | None) -> None:
         # Export always materializes a CPU-resident full state first. Round two
         # reuses this path for both legacy checkpoint-like handoff and the new
         # host-staging abstraction.
@@ -975,14 +1028,23 @@ class DetachActorWorker(DetachSync):
             optim_state_dict = get_optimizer_state_dict(self.actor_module_fsdp, self.actor_optimizer, options=options)
 
         if self.rank == 0:
-            torch.save(model_state_dict, os.path.join(local_path, "model_state.pt"))
+            page_bytes = max(int(chunk_mb or 0), 0) * 1024 * 1024
+            if page_bytes > 0:
+                save_paged_state_dict(local_path, "model_state", model_state_dict, page_bytes)
+            else:
+                torch.save(model_state_dict, os.path.join(local_path, "model_state.pt"))
             if stage_optimizer:
-                torch.save(optim_state_dict, os.path.join(local_path, "optim_state.pt"))
+                if page_bytes > 0:
+                    save_paged_optimizer_state_dict(local_path, "optim_state", optim_state_dict, page_bytes)
+                else:
+                    torch.save(optim_state_dict, os.path.join(local_path, "optim_state.pt"))
             torch.save(
                 {
                     "lr_scheduler": self.actor_lr_scheduler.state_dict() if self.actor_lr_scheduler is not None else None,
                     "rng": self.checkpoint_manager.get_rng_state() if self.checkpoint_manager is not None else None,
                     "stage_optimizer": stage_optimizer,
+                    "paged_model_state": page_bytes > 0,
+                    "paged_optim_state": page_bytes > 0 and stage_optimizer,
                 },
                 os.path.join(local_path, "extra_state.pt"),
             )
@@ -999,6 +1061,70 @@ class DetachActorWorker(DetachSync):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_actor_handoff_state(self, local_path: str):
         self._restore_actor_handoff_state(local_path, load_optimizer=True, progressive_swap=False, chunk_mb=None)
+
+    def _restore_paged_actor_model_state(self, local_path: str, *, cpu_offload, progressive_swap: bool) -> None:
+        StateDictOptions, set_model_state_dict = _get_reshardable_model_state_dict_api()
+
+        manifest = read_paged_state_manifest(local_path, "model_state") if self.rank == 0 else None
+        manifest_list = [manifest]
+        torch.distributed.broadcast_object_list(manifest_list, src=0)
+        manifest = manifest_list[0] or {}
+
+        if self.rank == 0:
+            model = self.actor_module_fsdp.to(device=get_torch_device().current_device(), non_blocking=True)
+        else:
+            model = self.actor_module_fsdp.to_empty(device=get_torch_device().current_device())
+
+        options = StateDictOptions(
+            full_state_dict=True,
+            cpu_offload=cpu_offload is not None,
+            broadcast_from_rank0=True,
+            strict=False,
+        )
+
+        for page_idx in range(int(manifest.get("page_count", 0))):
+            if self.rank == 0:
+                file_name = manifest["files"][page_idx]
+                page_state = torch.load(os.path.join(local_path, file_name), weights_only=False)
+            else:
+                page_state = {}
+
+            set_model_state_dict(model, page_state, options=options)
+
+            if self.rank == 0:
+                del page_state
+                gc.collect()
+            if progressive_swap:
+                get_torch_device().empty_cache()
+
+        for _, buf in model.named_buffers():
+            torch.distributed.broadcast(buf, src=0)
+
+        if cpu_offload:
+            model.to("cpu", non_blocking=True)
+            for buf in model.buffers():
+                buf.data = buf.data.to(get_torch_device().current_device())
+
+    def _load_paged_actor_optimizer_state(self, local_path: str, *, progressive_swap: bool) -> dict:
+        manifest = read_paged_state_manifest(local_path, "optim_state") if self.rank == 0 else None
+        manifest_list = [manifest]
+        torch.distributed.broadcast_object_list(manifest_list, src=0)
+        manifest = manifest_list[0] or {}
+
+        if self.rank == 0:
+            logger.info(
+                "[one-step-off][resize][handoff] rank=%s paged optimizer restore enabled: page_count=%s",
+                self.rank,
+                manifest.get("page_count", 0),
+            )
+            optim_state_dict = load_paged_optimizer_state_dict(local_path, "optim_state")
+            gc.collect()
+        else:
+            optim_state_dict = {}
+
+        if progressive_swap:
+            get_torch_device().empty_cache()
+        return optim_state_dict
 
     def _restore_actor_handoff_state(
         self,
@@ -1023,11 +1149,23 @@ class DetachActorWorker(DetachSync):
 
         _sanitize_optimizer_container_values(self.actor_optimizer)
 
+        paged_model_state = has_paged_state_dict(local_path, "model_state") if self.rank == 0 else False
+        paged_model_state_list = [paged_model_state]
+        torch.distributed.broadcast_object_list(paged_model_state_list, src=0)
+        paged_model_state = bool(paged_model_state_list[0])
+
+        paged_optim_state = has_paged_state_dict(local_path, "optim_state") if self.rank == 0 else False
+        paged_optim_state_list = [paged_optim_state]
+        torch.distributed.broadcast_object_list(paged_optim_state_list, src=0)
+        paged_optim_state = bool(paged_optim_state_list[0])
+
         if self.rank == 0:
-            model_state_dict = torch.load(os.path.join(local_path, "model_state.pt"), weights_only=False)
+            model_state_dict = None if paged_model_state else torch.load(
+                os.path.join(local_path, "model_state.pt"), weights_only=False
+            )
             extra_state = torch.load(os.path.join(local_path, "extra_state.pt"), weights_only=False)
             optim_state_path = os.path.join(local_path, "optim_state.pt")
-            if load_optimizer and os.path.exists(optim_state_path):
+            if load_optimizer and (not paged_optim_state) and os.path.exists(optim_state_path):
                 optim_state_dict = torch.load(optim_state_path, weights_only=False)
             else:
                 optim_state_dict = {}
@@ -1035,6 +1173,12 @@ class DetachActorWorker(DetachSync):
             model_state_dict = {}
             optim_state_dict = {}
             extra_state = None
+
+        if load_optimizer and paged_optim_state:
+            optim_state_dict = self._load_paged_actor_optimizer_state(
+                local_path,
+                progressive_swap=progressive_swap,
+            )
 
         if progressive_swap:
             logger.info(
@@ -1046,9 +1190,25 @@ class DetachActorWorker(DetachSync):
         logger.info("[one-step-off][resize][handoff] rank=%s restoring full model state", self.rank)
         if fsdp_version(self.actor_module_fsdp) == 2:
             cpu_offload = True if self.config.actor.fsdp_config.get("offload_policy", False) else None
-            fsdp2_load_full_state_dict(self.actor_module_fsdp, model_state_dict, self.device_mesh, cpu_offload)
+            if paged_model_state:
+                logger.info(
+                    "[one-step-off][resize][handoff] rank=%s paged model restore enabled: page_count=%s",
+                    self.rank,
+                    read_paged_state_manifest(local_path, "model_state").get("page_count", 0) if self.rank == 0 else -1,
+                )
+                self._restore_paged_actor_model_state(
+                    local_path,
+                    cpu_offload=cpu_offload,
+                    progressive_swap=progressive_swap,
+                )
+            else:
+                fsdp2_load_full_state_dict(self.actor_module_fsdp, model_state_dict, self.device_mesh, cpu_offload)
         else:
             raise NotImplementedError("actor handoff currently supports fsdp2 only")
+
+        if self.rank == 0 and model_state_dict is not None:
+            del model_state_dict
+            gc.collect()
 
         if progressive_swap:
             get_torch_device().empty_cache()
@@ -1091,7 +1251,7 @@ class DetachActorWorker(DetachSync):
         if self.rank == 0:
             write_host_staging_manifest(local_path, cfg)
         torch.distributed.barrier()
-        self._export_actor_handoff_state(local_path, stage_optimizer=cfg.stage_optimizer)
+        self._export_actor_handoff_state(local_path, stage_optimizer=cfg.stage_optimizer, chunk_mb=cfg.chunk_mb)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_actor_handoff_state_from_host(self, local_path: str, staging_config: dict | None = None):

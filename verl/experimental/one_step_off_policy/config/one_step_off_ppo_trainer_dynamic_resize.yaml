@@ -42,6 +42,9 @@ trainer:
       progressive_swap: true
       cleanup_after_load: true
       preclear_rollout_kv_cache: true
+    budget_protection:
+      enable: false
+      memory_budget_ratio: 0.85
     communicator_cache:
       enable: false
       reserve_schedule_topologies: true
