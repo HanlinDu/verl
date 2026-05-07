@@ -19,15 +19,19 @@ import datetime
 import math
 import shutil
 import gc
+import time
 from dataclasses import fields
 
+import psutil
 import torch
 import torch.distributed
+from codetiming import Timer
 from packaging import version
 from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from ray.util.collective import collective
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+from verl import DataProto
 from verl.experimental.one_step_off_policy.distributed_utils import vllm_stateless_init_process_group
 from verl.experimental.one_step_off_policy.staging_backend import (
     HostStagingConfig,
@@ -40,7 +44,6 @@ from verl.experimental.one_step_off_policy.staging_backend import (
     load_paged_optimizer_state_dict,
     record_restore_progress,
     read_host_staging_manifest,
-    read_restore_session_manifest,
     save_paged_state_dict,
     save_paged_optimizer_state_dict,
     read_paged_state_manifest,
@@ -48,9 +51,10 @@ from verl.experimental.one_step_off_policy.staging_backend import (
     write_host_staging_manifest,
 )
 from verl.single_controller.base import Worker
-from verl.single_controller.base.decorator import Dispatch, register
+from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import (
+    get_device_id,
     get_device_name,
     get_nccl_backend,
     get_torch_device,
@@ -234,6 +238,12 @@ class LocalInitActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.rollout_device_mesh = None
         self.checkpoint_manager = None
         self.flops_counter = None
+        self._pending_optimizer_restore_path: str | None = None
+        self._pending_optimizer_restore_page_count = 0
+        self._pending_optimizer_restore_progressive_swap = False
+        self._pending_optimizer_restore_cleanup_after_load = False
+        self._pending_optimizer_restore_policy = "immediate"
+        self._pending_optimizer_restore_materialize_count = 0
 
         self._worker_init_plan = None
         self._worker_init_prepared = False
@@ -1002,6 +1012,52 @@ class DetachActorWorker(DetachSync):
         self._weights_info = ret
         return ret
 
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="red", role="actor_update")
+    def update_actor(self, data: DataProto):
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+
+        materialize_metrics = self._ensure_optimizer_materialized_before_update()
+
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")
+            data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+            with Timer(name="update_policy", logger=None) as timer:
+                metrics = self.actor.update_policy(data=data)
+            delta_time = timer.last
+            global_num_tokens = data.meta_info["global_token_num"]
+            images_seqlens = data.meta_info.get("images_seqlens", None)
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(
+                global_num_tokens, delta_time, images_seqlens=images_seqlens
+            )
+            metrics["perf/mfu/actor"] = (
+                estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+            )
+            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+            metrics.update(materialize_metrics)
+
+            lr = self.actor_lr_scheduler.get_last_lr()[0]
+            metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
+            self.actor_lr_scheduler.step()
+
+            output = DataProto(meta_info={"metrics": metrics})
+            output = output.to("cpu")
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+            log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+
+        return output
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_actor_handoff_state(self, local_path: str):
         self._export_actor_handoff_state(local_path, stage_optimizer=True, chunk_mb=None)
@@ -1068,6 +1124,7 @@ class DetachActorWorker(DetachSync):
             create_restore_session_manifest(
                 local_path,
                 backend="disk_fallback",
+                optimizer_restore_policy="immediate" if stage_optimizer else "deferred",
                 model_manifest=model_manifest,
                 optimizer_manifest=optim_manifest,
             )
@@ -1083,7 +1140,14 @@ class DetachActorWorker(DetachSync):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_actor_handoff_state(self, local_path: str):
-        self._restore_actor_handoff_state(local_path, load_optimizer=True, progressive_swap=False, chunk_mb=None)
+        self._restore_actor_handoff_state(
+            local_path,
+            load_optimizer=True,
+            optimizer_restore_policy="immediate",
+            progressive_swap=False,
+            chunk_mb=None,
+            cleanup_after_load=False,
+        )
 
     def _restore_paged_actor_model_state(self, local_path: str, *, cpu_offload, progressive_swap: bool) -> None:
         StateDictOptions, set_model_state_dict = _get_reshardable_model_state_dict_api()
@@ -1156,13 +1220,146 @@ class DetachActorWorker(DetachSync):
             get_torch_device().empty_cache()
         return optim_state_dict, manifest_page_count
 
+    def _clear_pending_optimizer_restore(self) -> None:
+        self._pending_optimizer_restore_path = None
+        self._pending_optimizer_restore_page_count = 0
+        self._pending_optimizer_restore_progressive_swap = False
+        self._pending_optimizer_restore_cleanup_after_load = False
+        self._pending_optimizer_restore_policy = "immediate"
+
+    def _mark_pending_optimizer_restore(
+        self,
+        *,
+        local_path: str,
+        page_count: int,
+        progressive_swap: bool,
+        cleanup_after_load: bool,
+        optimizer_restore_policy: str,
+    ) -> None:
+        self._pending_optimizer_restore_path = local_path
+        self._pending_optimizer_restore_page_count = max(int(page_count), 0)
+        self._pending_optimizer_restore_progressive_swap = progressive_swap
+        self._pending_optimizer_restore_cleanup_after_load = cleanup_after_load
+        self._pending_optimizer_restore_policy = optimizer_restore_policy
+
+    def _has_pending_optimizer_restore(self) -> bool:
+        return bool(self._pending_optimizer_restore_path)
+
+    def _get_optimizer_restore_page_count(self, local_path: str) -> int:
+        paged_optim_state = has_paged_state_dict(local_path, "optim_state") if self.rank == 0 else False
+        paged_optim_state_list = [paged_optim_state]
+        torch.distributed.broadcast_object_list(paged_optim_state_list, src=0)
+        paged_optim_state = bool(paged_optim_state_list[0])
+
+        if paged_optim_state:
+            if self.rank == 0:
+                manifest = read_paged_state_manifest(local_path, "optim_state")
+                page_count = int(manifest.get("page_count", 0))
+            else:
+                page_count = 0
+            page_count_list = [page_count]
+            torch.distributed.broadcast_object_list(page_count_list, src=0)
+            return int(page_count_list[0])
+
+        if self.rank == 0:
+            page_count = 1 if os.path.exists(os.path.join(local_path, "optim_state.pt")) else 0
+        else:
+            page_count = 0
+        page_count_list = [page_count]
+        torch.distributed.broadcast_object_list(page_count_list, src=0)
+        return int(page_count_list[0])
+
+    def _load_optimizer_state_from_handoff_path(self, local_path: str, *, progressive_swap: bool) -> tuple[dict, int]:
+        paged_optim_state = has_paged_state_dict(local_path, "optim_state") if self.rank == 0 else False
+        paged_optim_state_list = [paged_optim_state]
+        torch.distributed.broadcast_object_list(paged_optim_state_list, src=0)
+        paged_optim_state = bool(paged_optim_state_list[0])
+
+        if paged_optim_state:
+            return self._load_paged_actor_optimizer_state(local_path, progressive_swap=progressive_swap)
+
+        if self.rank == 0:
+            optim_state_path = os.path.join(local_path, "optim_state.pt")
+            if os.path.exists(optim_state_path):
+                optim_state_dict = torch.load(optim_state_path, weights_only=False)
+                page_count = 1 if optim_state_dict else 0
+            else:
+                optim_state_dict = {}
+                page_count = 0
+        else:
+            optim_state_dict = {}
+            page_count = 0
+
+        if progressive_swap:
+            get_torch_device().empty_cache()
+        return optim_state_dict, page_count
+
+    def _ensure_optimizer_materialized_before_update(self) -> dict[str, float | int]:
+        if not self._has_pending_optimizer_restore():
+            return {}
+
+        local_path = self._pending_optimizer_restore_path
+        assert local_path is not None
+        page_count_hint = self._pending_optimizer_restore_page_count
+        started_at = time.monotonic()
+
+        try:
+            optim_state_dict, page_count = self._load_optimizer_state_from_handoff_path(
+                local_path,
+                progressive_swap=self._pending_optimizer_restore_progressive_swap,
+            )
+            StateDictOptions, _, set_optimizer_state_dict = _get_reshardable_optimizer_state_dict_api()
+            options = StateDictOptions(full_state_dict=True, cpu_offload=True, broadcast_from_rank0=True)
+            set_optimizer_state_dict(self.actor_module_fsdp, self.actor_optimizer, optim_state_dict, options=options)
+
+            applied_page_count = max(int(page_count), int(page_count_hint), 0)
+            if self.rank == 0 and has_restore_session_manifest(local_path):
+                update_restore_session_manifest(
+                    local_path,
+                    status="completed",
+                    applied_optimizer_pages=applied_page_count,
+                    last_error="",
+                )
+
+            if self._pending_optimizer_restore_progressive_swap:
+                get_torch_device().empty_cache()
+
+            cleanup_applied = 0.0
+            if self._pending_optimizer_restore_cleanup_after_load and self.rank == 0:
+                try:
+                    shutil.rmtree(local_path)
+                    cleanup_applied = 1.0
+                except FileNotFoundError:
+                    cleanup_applied = 0.0
+            torch.distributed.barrier()
+
+            self._pending_optimizer_restore_materialize_count += 1
+            duration = time.monotonic() - started_at
+            self._clear_pending_optimizer_restore()
+            return {
+                "resize/optimizer_materialize_s": duration,
+                "resize/optimizer_materialize_count": float(self._pending_optimizer_restore_materialize_count),
+                "resize/optimizer_pending_pages": float(applied_page_count),
+                "resize/host_stage_cleanup": cleanup_applied,
+            }
+        except Exception as exc:
+            if self.rank == 0 and has_restore_session_manifest(local_path):
+                update_restore_session_manifest(
+                    local_path,
+                    status="optimizer_materialize_failed",
+                    last_error=repr(exc),
+                )
+            raise
+
     def _restore_actor_handoff_state(
         self,
         local_path: str,
         *,
         load_optimizer: bool,
+        optimizer_restore_policy: str,
         progressive_swap: bool,
         chunk_mb: int | None,
+        cleanup_after_load: bool,
     ) -> None:
         # The conservative "progressive swap" implementation restores model
         # state first, then optimizer state, and explicitly drops allocator
@@ -1171,12 +1368,15 @@ class DetachActorWorker(DetachSync):
         assert self._is_actor
 
         logger.info("[one-step-off][resize][handoff] rank=%s loading actor handoff state from %s", self.rank, local_path)
+        optimizer_restore_policy = str(optimizer_restore_policy or "immediate").strip().lower()
+        defer_optimizer_restore = load_optimizer and optimizer_restore_policy == "deferred"
 
         if self.rank == 0 and has_restore_session_manifest(local_path):
             update_restore_session_manifest(
                 local_path,
                 status="restoring",
                 last_error="",
+                optimizer_restore_policy=optimizer_restore_policy,
                 applied_model_pages=0,
                 applied_optimizer_pages=0,
             )
@@ -1213,8 +1413,10 @@ class DetachActorWorker(DetachSync):
                 optim_state_dict = {}
                 extra_state = None
 
+            optimizer_page_count = self._get_optimizer_restore_page_count(local_path) if load_optimizer else 0
+
             paged_optimizer_page_count = 0
-            if load_optimizer and paged_optim_state:
+            if load_optimizer and (not defer_optimizer_restore) and paged_optim_state:
                 optim_state_dict, paged_optimizer_page_count = self._load_paged_actor_optimizer_state(
                     local_path,
                     progressive_swap=progressive_swap,
@@ -1255,7 +1457,7 @@ class DetachActorWorker(DetachSync):
             if progressive_swap:
                 get_torch_device().empty_cache()
 
-            if load_optimizer:
+            if load_optimizer and not defer_optimizer_restore:
                 logger.info("[one-step-off][resize][handoff] rank=%s restoring optimizer state", self.rank)
                 StateDictOptions, _, set_optimizer_state_dict = _get_reshardable_optimizer_state_dict_api()
                 options = StateDictOptions(full_state_dict=True, cpu_offload=True, broadcast_from_rank0=True)
@@ -1283,7 +1485,22 @@ class DetachActorWorker(DetachSync):
             if extra_state is not None and self.checkpoint_manager is not None and extra_state.get("rng") is not None:
                 self.checkpoint_manager.load_rng_state(extra_state["rng"])
 
-            if self.rank == 0 and has_restore_session_manifest(local_path):
+            if defer_optimizer_restore:
+                self._mark_pending_optimizer_restore(
+                    local_path=local_path,
+                    page_count=optimizer_page_count,
+                    progressive_swap=progressive_swap,
+                    cleanup_after_load=cleanup_after_load,
+                    optimizer_restore_policy=optimizer_restore_policy,
+                )
+                if self.rank == 0 and has_restore_session_manifest(local_path):
+                    update_restore_session_manifest(
+                        local_path,
+                        status="optimizer_deferred",
+                        applied_optimizer_pages=0,
+                        last_error="",
+                    )
+            elif self.rank == 0 and has_restore_session_manifest(local_path):
                 finalize_restore_session_manifest(local_path, status="completed")
 
             logger.info("[one-step-off][resize][handoff] rank=%s finished loading actor handoff state", self.rank)
@@ -1333,8 +1550,10 @@ class DetachActorWorker(DetachSync):
         self._restore_actor_handoff_state(
             local_path,
             load_optimizer=cfg.stage_optimizer,
+            optimizer_restore_policy=cfg.optimizer_restore_policy,
             progressive_swap=cfg.progressive_swap,
             chunk_mb=cfg.chunk_mb,
+            cleanup_after_load=cfg.cleanup_after_load,
         )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

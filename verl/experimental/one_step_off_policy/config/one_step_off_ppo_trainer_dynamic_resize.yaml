@@ -39,6 +39,7 @@ trainer:
       backend: disk_fallback
       chunk_mb: 256
       stage_optimizer: true
+      optimizer_restore_policy: deferred
       progressive_swap: true
       cleanup_after_load: true
       preclear_rollout_kv_cache: true

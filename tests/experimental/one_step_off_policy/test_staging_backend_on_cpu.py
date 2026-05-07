@@ -28,6 +28,7 @@ def test_host_staging_manifest_roundtrip(tmp_path: Path):
             "backend": "disk_fallback",
             "chunk_mb": 512,
             "stage_optimizer": False,
+            "optimizer_restore_policy": "immediate",
             "progressive_swap": True,
             "cleanup_after_load": False,
             "preclear_rollout_kv_cache": True,
@@ -41,6 +42,7 @@ def test_host_staging_manifest_roundtrip(tmp_path: Path):
     assert manifest["requested_backend"] == "disk_fallback"
     assert manifest["chunk_mb"] == 512
     assert manifest["stage_optimizer"] is False
+    assert manifest["optimizer_restore_policy"] == "immediate"
     assert manifest["cleanup_after_load"] is False
 
 
@@ -49,6 +51,22 @@ def test_pinned_cpu_request_falls_back_to_disk_backend():
 
     assert cfg.backend == "pinned_cpu"
     assert cfg.effective_backend() == "disk_fallback"
+
+
+def test_optimizer_restore_policy_defaults_to_deferred():
+    cfg = HostStagingConfig.from_dict({"stage_optimizer": True})
+
+    assert cfg.optimizer_restore_policy == "deferred"
+    assert cfg.should_defer_optimizer_restore() is True
+    assert cfg.should_restore_optimizer_on_load() is False
+
+
+def test_optimizer_restore_policy_can_be_immediate():
+    cfg = HostStagingConfig.from_dict({"stage_optimizer": True, "optimizer_restore_policy": "immediate"})
+
+    assert cfg.optimizer_restore_policy == "immediate"
+    assert cfg.should_restore_optimizer_on_load() is True
+    assert cfg.should_defer_optimizer_restore() is False
 
 
 def test_paged_state_dict_roundtrip(tmp_path: Path):
@@ -126,6 +144,7 @@ def test_restore_session_manifest_tracks_progress(tmp_path: Path):
         str(tmp_path),
         backend="disk_fallback",
         session_id="session-test",
+        optimizer_restore_policy="deferred",
         model_manifest=model_manifest,
         optimizer_manifest=optim_manifest,
     )
@@ -134,6 +153,7 @@ def test_restore_session_manifest_tracks_progress(tmp_path: Path):
     assert created["session_id"] == "session-test"
     assert created["model_page_count"] == model_manifest["page_count"]
     assert created["optimizer_page_count"] == optim_manifest["page_count"]
+    assert created["optimizer_restore_policy"] == "deferred"
 
     record_restore_progress(str(tmp_path), applied_model_pages=1, status="restoring_model")
     update_restore_session_manifest(str(tmp_path), applied_optimizer_pages=1)

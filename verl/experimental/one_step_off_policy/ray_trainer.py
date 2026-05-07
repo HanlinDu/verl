@@ -60,7 +60,7 @@ from verl.experimental.one_step_off_policy.resize_controller import (
     ResizeControllerConfig,
 )
 from verl.experimental.one_step_off_policy.resize_metrics import build_resize_observation
-from verl.experimental.one_step_off_policy.staging_backend import HostStagingConfig
+from verl.experimental.one_step_off_policy.staging_backend import HostStagingConfig, has_restore_session_manifest, read_restore_session_manifest
 from verl.experimental.one_step_off_policy.utils import need_critic
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls, split_resource_pool
@@ -308,6 +308,10 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             "resize/progressive_swap_s": 0.0,
             "resize/kv_cache_preclear_s": 0.0,
             "resize/host_stage_cleanup": 0.0,
+            "resize/optimizer_deferred_restore": 0.0,
+            "resize/optimizer_pending_pages": 0.0,
+            "resize/optimizer_materialize_s": 0.0,
+            "resize/optimizer_materialize_count": 0.0,
             "resize/restore_failed": 0.0,
             "resize/partial_restore_cleanup_count": 0.0,
         }
@@ -1837,6 +1841,10 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         await self._commit_role_group_init_async(new_actor_wg, role=Role.Actor)
 
         actor_resume_load_path = self._normalize_actor_resume_load_path(actor_resume_path)
+        defer_optimizer_restore = bool(
+            runtime_staging_cfg.get("stage_optimizer", False)
+            and str(runtime_staging_cfg.get("optimizer_restore_policy", "deferred")) == "deferred"
+        )
 
         # Phase B: restore actor state only after the new actor has finished its
         # minimal worker/model initialization. This keeps the resize window short
@@ -1873,11 +1881,19 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                     "resize/progressive_swap_s": import_duration if runtime_staging_cfg.get("progressive_swap", False) else 0.0,
                 }
             )
+            if defer_optimizer_restore and has_restore_session_manifest(actor_resume_path):
+                session_manifest = read_restore_session_manifest(actor_resume_path)
+                self._update_resize_execution_metrics(
+                    **{
+                        "resize/optimizer_deferred_restore": 1.0,
+                        "resize/optimizer_pending_pages": float(session_manifest.get("optimizer_page_count", 0)),
+                    }
+                )
             new_actor_wg.release_host_staging_buffer(
                 actor_resume_path,
                 staging_config=runtime_staging_cfg,
             )
-            if should_cleanup_actor_resume:
+            if should_cleanup_actor_resume and not defer_optimizer_restore:
                 try:
                     shutil.rmtree(actor_resume_path)
                     self._update_resize_execution_metrics(**{"resize/host_stage_cleanup": 1.0})
@@ -2586,6 +2602,13 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                         batch.meta_info["temperature"] = rollout_config.temperature
                         actor_output = self.actor_rollout_wg.update_actor(batch)
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                    resize_execution_actor_metrics = {
+                        key: value
+                        for key, value in actor_output_metrics.items()
+                        if key in self._latest_resize_execution_metrics
+                    }
+                    if resize_execution_actor_metrics:
+                        self._update_resize_execution_metrics(**resize_execution_actor_metrics)
                     metrics.update(actor_output_metrics)
                 await asyncio.sleep(0)
 

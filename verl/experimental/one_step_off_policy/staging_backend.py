@@ -22,6 +22,7 @@ class HostStagingConfig:
     backend: str = "disk_fallback"
     chunk_mb: int = 256
     stage_optimizer: bool = True
+    optimizer_restore_policy: str = "deferred"
     progressive_swap: bool = True
     cleanup_after_load: bool = True
     preclear_rollout_kv_cache: bool = True
@@ -34,10 +35,17 @@ class HostStagingConfig:
             backend=str(cfg.get("backend", "disk_fallback")),
             chunk_mb=max(int(cfg.get("chunk_mb", 256)), 1),
             stage_optimizer=bool(cfg.get("stage_optimizer", True)),
+            optimizer_restore_policy=_normalize_optimizer_restore_policy(cfg.get("optimizer_restore_policy", "deferred")),
             progressive_swap=bool(cfg.get("progressive_swap", True)),
             cleanup_after_load=bool(cfg.get("cleanup_after_load", True)),
             preclear_rollout_kv_cache=bool(cfg.get("preclear_rollout_kv_cache", True)),
         )
+
+    def should_restore_optimizer_on_load(self) -> bool:
+        return self.stage_optimizer and self.optimizer_restore_policy == "immediate"
+
+    def should_defer_optimizer_restore(self) -> bool:
+        return self.stage_optimizer and self.optimizer_restore_policy == "deferred"
 
     def effective_backend(self) -> str:
         # Round two keeps the abstraction flexible, but the implementation is
@@ -60,6 +68,7 @@ class RestoreSessionManifest:
     session_id: str
     backend: str
     status: str = "staged"
+    optimizer_restore_policy: str = "deferred"
     model_page_count: int = 0
     optimizer_page_count: int = 0
     staged_model_bytes: int = 0
@@ -80,6 +89,7 @@ class RestoreSessionManifest:
             session_id=str(data.get("session_id") or uuid.uuid4().hex),
             backend=str(data.get("backend", "disk_fallback")),
             status=str(data.get("status", "staged")),
+            optimizer_restore_policy=_normalize_optimizer_restore_policy(data.get("optimizer_restore_policy", "deferred")),
             model_page_count=max(int(data.get("model_page_count", 0)), 0),
             optimizer_page_count=max(int(data.get("optimizer_page_count", 0)), 0),
             staged_model_bytes=max(int(data.get("staged_model_bytes", 0)), 0),
@@ -134,12 +144,14 @@ def create_restore_session_manifest(
     *,
     backend: str,
     session_id: str | None = None,
+    optimizer_restore_policy: str = "deferred",
     model_manifest: dict[str, Any] | None = None,
     optimizer_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     manifest = RestoreSessionManifest(
         session_id=session_id or uuid.uuid4().hex,
         backend=backend,
+        optimizer_restore_policy=_normalize_optimizer_restore_policy(optimizer_restore_policy),
         model_page_count=_manifest_page_count(model_manifest),
         optimizer_page_count=_manifest_page_count(optimizer_manifest),
         staged_model_bytes=_manifest_total_bytes(model_manifest),
@@ -370,3 +382,10 @@ def _manifest_total_bytes(manifest: dict[str, Any] | None) -> int:
     if "total_bytes" in manifest:
         return max(int(manifest.get("total_bytes", 0)), 0)
     return sum(int(page.get("estimated_bytes", 0)) for page in manifest.get("pages", []))
+
+
+def _normalize_optimizer_restore_policy(value: Any) -> str:
+    policy = str(value or "deferred").strip().lower()
+    if policy not in {"immediate", "deferred"}:
+        return "deferred"
+    return policy
