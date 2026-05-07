@@ -308,6 +308,8 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             "resize/progressive_swap_s": 0.0,
             "resize/kv_cache_preclear_s": 0.0,
             "resize/host_stage_cleanup": 0.0,
+            "resize/restore_failed": 0.0,
+            "resize/partial_restore_cleanup_count": 0.0,
         }
 
     def _default_communicator_cache_metrics(self) -> dict[str, float | str | int]:
@@ -1842,10 +1844,28 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         if actor_resume_kind == "host_staging" and actor_resume_path is not None:
             logger.info("[one-step-off][resize][host-stage] importing actor state into new actor")
             import_started_at = time.monotonic()
-            new_actor_wg.load_actor_handoff_state_from_host(
-                actor_resume_path,
-                staging_config=runtime_staging_cfg,
-            )
+            try:
+                new_actor_wg.load_actor_handoff_state_from_host(
+                    actor_resume_path,
+                    staging_config=runtime_staging_cfg,
+                )
+            except Exception as exc:
+                self._update_resize_execution_metrics(
+                    **{
+                        "resize/restore_failed": 1.0,
+                        "resize/partial_restore_cleanup_count": 1.0,
+                    }
+                )
+                logger.exception(
+                    "[one-step-off][resize][host-stage] restore failed: path=%s "
+                    "resize/restore_failed=1.0 resize/partial_restore_cleanup_count=1.0 error=%r",
+                    actor_resume_path,
+                    exc,
+                )
+                try:
+                    new_actor_wg.cleanup_actor_handoff_restore_session(actor_resume_path)
+                finally:
+                    raise
             import_duration = time.monotonic() - import_started_at
             self._update_resize_execution_metrics(
                 **{
@@ -1873,7 +1893,25 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         elif actor_resume_kind == "handoff" and actor_resume_path is not None:
             logger.info("[one-step-off][resize][handoff] importing actor state into new actor")
             import_started_at = time.monotonic()
-            new_actor_wg.load_actor_handoff_state(actor_resume_path)
+            try:
+                new_actor_wg.load_actor_handoff_state(actor_resume_path)
+            except Exception as exc:
+                self._update_resize_execution_metrics(
+                    **{
+                        "resize/restore_failed": 1.0,
+                        "resize/partial_restore_cleanup_count": 1.0,
+                    }
+                )
+                logger.exception(
+                    "[one-step-off][resize][handoff] restore failed: path=%s "
+                    "resize/restore_failed=1.0 resize/partial_restore_cleanup_count=1.0 error=%r",
+                    actor_resume_path,
+                    exc,
+                )
+                try:
+                    new_actor_wg.cleanup_actor_handoff_restore_session(actor_resume_path)
+                finally:
+                    raise
             import_duration = time.monotonic() - import_started_at
             self._update_resize_execution_metrics(**{"resize/host_stage_import_s": import_duration})
             if should_cleanup_actor_resume:

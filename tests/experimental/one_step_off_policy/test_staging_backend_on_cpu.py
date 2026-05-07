@@ -4,12 +4,19 @@ import torch
 
 from verl.experimental.one_step_off_policy.staging_backend import (
     HostStagingConfig,
+    create_restore_session_manifest,
+    finalize_restore_session_manifest,
     has_paged_state_dict,
+    has_restore_session_manifest,
     iter_paged_state_dict,
     load_paged_optimizer_state_dict,
     read_host_staging_manifest,
+    read_paged_state_manifest,
+    read_restore_session_manifest,
+    record_restore_progress,
     save_paged_optimizer_state_dict,
     save_paged_state_dict,
+    update_restore_session_manifest,
     write_host_staging_manifest,
 )
 
@@ -54,6 +61,8 @@ def test_paged_state_dict_roundtrip(tmp_path: Path):
     manifest = save_paged_state_dict(str(tmp_path), "model_state", state_dict, page_bytes=1024)
 
     assert manifest["page_count"] >= 2
+    assert manifest["total_bytes"] > 0
+    assert len(manifest["pages"]) == manifest["page_count"]
     assert has_paged_state_dict(str(tmp_path), "model_state") is True
 
     restored = {}
@@ -83,6 +92,8 @@ def test_paged_optimizer_state_dict_roundtrip(tmp_path: Path):
     manifest = save_paged_optimizer_state_dict(str(tmp_path), "optim_state", optim_state_dict, page_bytes=1024)
 
     assert manifest["page_count"] >= 2
+    assert manifest["total_bytes"] > 0
+    assert len(manifest["pages"]) == manifest["page_count"]
     assert has_paged_state_dict(str(tmp_path), "optim_state") is True
 
     restored = load_paged_optimizer_state_dict(str(tmp_path), "optim_state")
@@ -92,3 +103,61 @@ def test_paged_optimizer_state_dict_roundtrip(tmp_path: Path):
     for param_name, state in restored["state"].items():
         for key, value in state.items():
             assert torch.equal(value, optim_state_dict["state"][param_name][key])
+
+
+def test_restore_session_manifest_tracks_progress(tmp_path: Path):
+    model_manifest = save_paged_state_dict(
+        str(tmp_path),
+        "model_state",
+        {"layer.weight": torch.ones(512, dtype=torch.float32)},
+        page_bytes=512,
+    )
+    optim_manifest = save_paged_optimizer_state_dict(
+        str(tmp_path),
+        "optim_state",
+        {
+            "state": {"layer.weight": {"exp_avg": torch.ones(128, dtype=torch.float32)}},
+            "param_groups": [{"params": ["layer.weight"], "lr": 1e-4}],
+        },
+        page_bytes=256,
+    )
+
+    created = create_restore_session_manifest(
+        str(tmp_path),
+        backend="disk_fallback",
+        session_id="session-test",
+        model_manifest=model_manifest,
+        optimizer_manifest=optim_manifest,
+    )
+
+    assert has_restore_session_manifest(str(tmp_path)) is True
+    assert created["session_id"] == "session-test"
+    assert created["model_page_count"] == model_manifest["page_count"]
+    assert created["optimizer_page_count"] == optim_manifest["page_count"]
+
+    record_restore_progress(str(tmp_path), applied_model_pages=1, status="restoring_model")
+    update_restore_session_manifest(str(tmp_path), applied_optimizer_pages=1)
+    finalize_restore_session_manifest(str(tmp_path))
+
+    manifest = read_restore_session_manifest(str(tmp_path))
+    assert manifest["status"] == "completed"
+    assert manifest["applied_model_pages"] == manifest["model_page_count"]
+    assert manifest["applied_optimizer_pages"] == manifest["optimizer_page_count"]
+
+
+def test_read_paged_manifest_exposes_page_metadata(tmp_path: Path):
+    save_paged_state_dict(
+        str(tmp_path),
+        "model_state",
+        {
+            "layer0.weight": torch.ones(256, dtype=torch.float32),
+            "layer1.weight": torch.ones(256, dtype=torch.float32),
+        },
+        page_bytes=1024,
+    )
+
+    manifest = read_paged_state_manifest(str(tmp_path), "model_state")
+
+    assert manifest["page_count"] == len(manifest["pages"])
+    assert manifest["pages"][0]["file_name"].startswith("model_state.page_")
+    assert manifest["pages"][0]["estimated_bytes"] > 0
