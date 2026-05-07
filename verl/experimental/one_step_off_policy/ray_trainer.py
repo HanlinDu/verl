@@ -1266,6 +1266,11 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             return
         self._pending_weight_sync_group_cleanup.append((group_name, actor_wg, rollout_wg))
 
+    @staticmethod
+    def _is_expected_weight_sync_cleanup_error(exc: Exception) -> bool:
+        message = str(exc)
+        return "`ray.kill`" in message or "does not exist" in message
+
     def _cleanup_pending_weight_sync_groups(self) -> None:
         pending = self._pending_weight_sync_group_cleanup
         self._pending_weight_sync_group_cleanup = []
@@ -1274,24 +1279,42 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             try:
                 self._destroy_actor_weight_sync_group(actor_wg, group_name)
             except Exception as exc:  # pragma: no cover - best effort cleanup
-                logger.warning(
-                    "[one-step-off][resize] warning: failed to destroy actor-side weight sync group "
-                    f"group_name={group_name}: {exc}"
-                )
+                if self._is_expected_weight_sync_cleanup_error(exc):
+                    logger.debug(
+                        "[one-step-off][resize] skip actor-side weight sync cleanup for terminated worker "
+                        f"group_name={group_name}: {exc}"
+                    )
+                else:
+                    logger.warning(
+                        "[one-step-off][resize] warning: failed to destroy actor-side weight sync group "
+                        f"group_name={group_name}: {exc}"
+                    )
             try:
                 self._destroy_rollout_weight_sync_group(rollout_wg, group_name)
             except Exception as exc:  # pragma: no cover - best effort cleanup
-                logger.warning(
-                    "[one-step-off][resize] warning: failed to destroy rollout-side weight sync group "
-                    f"group_name={group_name}: {exc}"
-                )
+                if self._is_expected_weight_sync_cleanup_error(exc):
+                    logger.debug(
+                        "[one-step-off][resize] skip rollout-side weight sync cleanup for terminated worker "
+                        f"group_name={group_name}: {exc}"
+                    )
+                else:
+                    logger.warning(
+                        "[one-step-off][resize] warning: failed to destroy rollout-side weight sync group "
+                        f"group_name={group_name}: {exc}"
+                    )
             try:
                 collective.destroy_collective_group(group_name)
             except Exception as exc:  # pragma: no cover - best effort cleanup
-                logger.warning(
-                    "[one-step-off][resize] warning: failed to destroy driver-side weight sync group "
-                    f"group_name={group_name}: {exc}"
-                )
+                if self._is_expected_weight_sync_cleanup_error(exc):
+                    logger.debug(
+                        "[one-step-off][resize] skip driver-side weight sync cleanup for missing group "
+                        f"group_name={group_name}: {exc}"
+                    )
+                else:
+                    logger.warning(
+                        "[one-step-off][resize] warning: failed to destroy driver-side weight sync group "
+                        f"group_name={group_name}: {exc}"
+                    )
 
     def _create_weight_sync_group(self, *, group_name: str | None = None, topology_key: str | None = None):
         from verl.utils.device import get_nccl_backend
@@ -2296,7 +2319,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
         # after load checkpoint sync rollout weights
         self.sync_rollout_weights()
-        await self.async_rollout_manager.clear_kv_cache()
+        await self.async_rollout_manager.clear_kv_cache_async()
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -2363,7 +2386,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 # sync weights from actor to rollout
                 with marked_timer("sync_rollout_weights", timing_raw, color="purple"):
                     self.sync_rollout_weights()
-                    await self.async_rollout_manager.clear_kv_cache()
+                    await self.async_rollout_manager.clear_kv_cache_async()
 
                 # async next generation
                 if not is_last_step and not resize_scheduled_this_step:

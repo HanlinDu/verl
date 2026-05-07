@@ -14,6 +14,7 @@
 import asyncio
 import logging
 import os
+import threading
 
 import ray
 
@@ -25,6 +26,30 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class OneStepOffAgentLoopManager(AgentLoopManager):
+    def _run_replica_tasks_blocking(self, method_name: str) -> None:
+        async def run_all():
+            await asyncio.gather(*[getattr(replica, method_name)() for replica in self.rollout_replicas])
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(run_all())
+            return
+
+        errors: list[BaseException] = []
+
+        def _runner() -> None:
+            try:
+                asyncio.run(run_all())
+            except BaseException as exc:  # pragma: no cover - best effort propagation
+                errors.append(exc)
+
+        thread = threading.Thread(target=_runner, daemon=True)
+        thread.start()
+        thread.join()
+        if errors:
+            raise errors[0]
+
     async def generate_sequences_async(self, prompts: DataProto) -> DataProto:
         """Split input batch and dispatch to agent loop workers (async version).
 
@@ -54,13 +79,22 @@ class OneStepOffAgentLoopManager(AgentLoopManager):
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
         return output
 
-    async def wake_up(self):
+    def wake_up(self):
+        self._run_replica_tasks_blocking("wake_up")
+
+    async def wake_up_async(self):
         await asyncio.gather(*[replica.wake_up() for replica in self.rollout_replicas])
 
-    async def sleep(self):
+    def sleep(self):
+        self._run_replica_tasks_blocking("sleep")
+
+    async def sleep_async(self):
         await asyncio.gather(*[replica.sleep() for replica in self.rollout_replicas])
 
-    async def clear_kv_cache(self):
+    def clear_kv_cache(self):
+        self._run_replica_tasks_blocking("clear_kv_cache")
+
+    async def clear_kv_cache_async(self):
         await asyncio.gather(*[replica.clear_kv_cache() for replica in self.rollout_replicas])
 
     async def shutdown_async(self):
