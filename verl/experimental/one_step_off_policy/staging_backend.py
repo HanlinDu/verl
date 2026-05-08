@@ -20,6 +20,7 @@ RESTORE_SESSION_MANIFEST = "restore_session_manifest.json"
 class HostStagingConfig:
     enable: bool = True
     backend: str = "disk_fallback"
+    service_name: str | None = None
     chunk_mb: int = 256
     stage_optimizer: bool = True
     optimizer_restore_policy: str = "deferred"
@@ -33,6 +34,7 @@ class HostStagingConfig:
         return cls(
             enable=bool(cfg.get("enable", True)),
             backend=str(cfg.get("backend", "disk_fallback")),
+            service_name=_normalize_optional_string(cfg.get("service_name")),
             chunk_mb=max(int(cfg.get("chunk_mb", 256)), 1),
             stage_optimizer=bool(cfg.get("stage_optimizer", True)),
             optimizer_restore_policy=_normalize_optimizer_restore_policy(cfg.get("optimizer_restore_policy", "deferred")),
@@ -48,11 +50,9 @@ class HostStagingConfig:
         return self.stage_optimizer and self.optimizer_restore_policy == "deferred"
 
     def effective_backend(self) -> str:
-        # Round two keeps the abstraction flexible, but the implementation is
-        # intentionally conservative: unsupported host-memory backends fall back
-        # to the disk-backed staging path instead of failing mid-resize.
-        if self.backend == "pinned_cpu":
-            return "disk_fallback"
+        # The backend is now a real runtime choice. Budget protection may still
+        # downgrade `pinned_cpu` to `disk_fallback`, but the config layer no
+        # longer hides that decision by auto-falling back here.
         return self.backend
 
     def to_manifest_dict(self) -> dict[str, Any]:
@@ -67,6 +67,7 @@ class HostStagingConfig:
 class RestoreSessionManifest:
     session_id: str
     backend: str
+    service_name: str | None = None
     status: str = "staged"
     optimizer_restore_policy: str = "deferred"
     model_page_count: int = 0
@@ -88,6 +89,7 @@ class RestoreSessionManifest:
         return cls(
             session_id=str(data.get("session_id") or uuid.uuid4().hex),
             backend=str(data.get("backend", "disk_fallback")),
+            service_name=_normalize_optional_string(data.get("service_name")),
             status=str(data.get("status", "staged")),
             optimizer_restore_policy=_normalize_optimizer_restore_policy(data.get("optimizer_restore_policy", "deferred")),
             model_page_count=max(int(data.get("model_page_count", 0)), 0),
@@ -215,14 +217,46 @@ def read_paged_state_manifest(stage_dir: str, prefix: str) -> dict[str, Any]:
 def save_paged_state_dict(stage_dir: str, prefix: str, state_dict: dict[str, Any], page_bytes: int) -> dict[str, Any]:
     os.makedirs(stage_dir, exist_ok=True)
     target_bytes = max(int(page_bytes), 1)
-    pages = _split_state_dict_into_pages(state_dict, target_bytes)
-    files: list[str] = []
+    manifest, pages = build_paged_state_pages(prefix=prefix, state_dict=state_dict, page_bytes=target_bytes)
+    for page_meta, page in zip(manifest["pages"], pages, strict=True):
+        torch.save(page, os.path.join(stage_dir, page_meta["file_name"]))
+    with open(paged_state_manifest_path(stage_dir, prefix), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    return manifest
 
+
+def save_paged_optimizer_state_dict(
+    stage_dir: str,
+    prefix: str,
+    optim_state_dict: dict[str, Any],
+    page_bytes: int,
+) -> dict[str, Any]:
+    os.makedirs(stage_dir, exist_ok=True)
+    target_bytes = max(int(page_bytes), 1)
+    manifest, pages = build_paged_optimizer_state_pages(
+        prefix=prefix,
+        optim_state_dict=optim_state_dict,
+        page_bytes=target_bytes,
+    )
+    for page_meta, page in zip(manifest["pages"], pages, strict=True):
+        torch.save(page, os.path.join(stage_dir, page_meta["file_name"]))
+    with open(paged_state_manifest_path(stage_dir, prefix), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    return manifest
+
+
+def build_paged_state_pages(
+    *,
+    prefix: str,
+    state_dict: dict[str, Any],
+    page_bytes: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    target_bytes = max(int(page_bytes), 1)
+    pages = _split_state_dict_into_pages(state_dict, target_bytes)
     page_metas: list[dict[str, Any]] = []
+
     for idx, page in enumerate(pages):
         file_name = f"{prefix}.page_{idx:04d}.pt"
-        torch.save(page, os.path.join(stage_dir, file_name))
-        files.append(file_name)
         page_metas.append(
             {
                 "page_id": idx,
@@ -237,34 +271,28 @@ def save_paged_state_dict(stage_dir: str, prefix: str, state_dict: dict[str, Any
         "manifest_version": 1,
         "prefix": prefix,
         "page_bytes": target_bytes,
-        "page_count": len(files),
-        "files": files,
+        "page_count": len(page_metas),
+        "files": [page_meta["file_name"] for page_meta in page_metas],
         "pages": page_metas,
         "total_bytes": sum(int(page_meta["estimated_bytes"]) for page_meta in page_metas),
     }
-    with open(paged_state_manifest_path(stage_dir, prefix), "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, sort_keys=True)
-    return manifest
+    return manifest, pages
 
 
-def save_paged_optimizer_state_dict(
-    stage_dir: str,
+def build_paged_optimizer_state_pages(
+    *,
     prefix: str,
     optim_state_dict: dict[str, Any],
     page_bytes: int,
-) -> dict[str, Any]:
-    os.makedirs(stage_dir, exist_ok=True)
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     target_bytes = max(int(page_bytes), 1)
     state = dict(optim_state_dict.get("state", {}))
     param_groups = list(optim_state_dict.get("param_groups", []))
     pages = _split_optimizer_state_into_pages(state, param_groups, target_bytes)
-    files: list[str] = []
-
     page_metas: list[dict[str, Any]] = []
+
     for idx, page in enumerate(pages):
         file_name = f"{prefix}.page_{idx:04d}.pt"
-        torch.save(page, os.path.join(stage_dir, file_name))
-        files.append(file_name)
         page_metas.append(
             {
                 "page_id": idx,
@@ -279,15 +307,13 @@ def save_paged_optimizer_state_dict(
         "manifest_version": 1,
         "prefix": prefix,
         "page_bytes": target_bytes,
-        "page_count": len(files),
-        "files": files,
+        "page_count": len(page_metas),
+        "files": [page_meta["file_name"] for page_meta in page_metas],
         "pages": page_metas,
         "state_entries": len(state),
         "total_bytes": sum(int(page_meta["estimated_bytes"]) for page_meta in page_metas),
     }
-    with open(paged_state_manifest_path(stage_dir, prefix), "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, sort_keys=True)
-    return manifest
+    return manifest, pages
 
 
 def iter_paged_state_dict(stage_dir: str, prefix: str) -> Iterator[dict[str, Any]]:
@@ -389,3 +415,10 @@ def _normalize_optimizer_restore_policy(value: Any) -> str:
     if policy not in {"immediate", "deferred"}:
         return "deferred"
     return policy
+
+
+def _normalize_optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None

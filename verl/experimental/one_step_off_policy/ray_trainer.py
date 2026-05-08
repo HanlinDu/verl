@@ -45,6 +45,7 @@ from verl.experimental.one_step_off_policy.communicator_cache import (
     WeightSyncCommunicatorCache,
     build_topology_key,
 )
+from verl.experimental.one_step_off_policy.pinned_cpu_staging import get_or_create_pinned_cpu_staging_service
 from verl.experimental.one_step_off_policy.resize_budget import (
     ResizeBudgetConfig,
     ResizeBudgetController,
@@ -225,6 +226,8 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self._resize_budget_config = self._build_resize_budget_config()
         self._resize_budget_controller = ResizeBudgetController(self._resize_budget_config)
         self._latest_resize_budget_metrics: dict[str, float | str | int] = self._default_resize_budget_metrics()
+        self._pinned_cpu_staging_service_name = f"one_step_off_pinned_cpu_{uuid.uuid4().hex}"
+        self._pinned_cpu_staging_service = None
 
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
         if lora_rank <= 0:
@@ -388,7 +391,18 @@ class OneStepOffRayTrainer(RayPPOTrainer):
     def _make_runtime_handoff_staging_dict(self, *, effective_backend: str) -> dict[str, float | str | bool | int]:
         runtime_cfg = self._handoff_staging_config.to_manifest_dict()
         runtime_cfg["backend"] = effective_backend
+        if effective_backend == "pinned_cpu":
+            self._ensure_pinned_cpu_staging_service()
+            runtime_cfg["service_name"] = self._pinned_cpu_staging_service_name
         return runtime_cfg
+
+    def _ensure_pinned_cpu_staging_service(self):
+        """Create the pinned CPU staging service lazily on the driver."""
+        if self._pinned_cpu_staging_service is None:
+            self._pinned_cpu_staging_service = get_or_create_pinned_cpu_staging_service(
+                self._pinned_cpu_staging_service_name
+            )
+        return self._pinned_cpu_staging_service
 
     def _get_role_group_resource_snapshot(self, role: Role, role_wg: RayWorkerGroup, staging_path: str | None = None) -> ResizeBudgetSnapshot:
         # Query one representative worker before resize so the trainer can make
@@ -1727,7 +1741,9 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         actor_resume_path, should_cleanup_actor_resume, actor_resume_kind = self._resolve_staged_actor_resume(
             actor_resume_path,
         )
-        runtime_staging_cfg = self._handoff_staging_config.to_manifest_dict()
+        runtime_staging_cfg = self._make_runtime_handoff_staging_dict(
+            effective_backend=self._handoff_staging_config.effective_backend()
+        )
 
         if actor_resume_kind in {"host_staging", "handoff"}:
             # The same budget gate covers both host-staging export and legacy

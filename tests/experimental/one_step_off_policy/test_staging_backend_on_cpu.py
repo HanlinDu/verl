@@ -26,6 +26,7 @@ def test_host_staging_manifest_roundtrip(tmp_path: Path):
         {
             "enable": True,
             "backend": "disk_fallback",
+            "service_name": "service-a",
             "chunk_mb": 512,
             "stage_optimizer": False,
             "optimizer_restore_policy": "immediate",
@@ -40,6 +41,7 @@ def test_host_staging_manifest_roundtrip(tmp_path: Path):
 
     assert manifest["backend"] == "disk_fallback"
     assert manifest["requested_backend"] == "disk_fallback"
+    assert manifest["service_name"] == "service-a"
     assert manifest["chunk_mb"] == 512
     assert manifest["stage_optimizer"] is False
     assert manifest["optimizer_restore_policy"] == "immediate"
@@ -50,7 +52,7 @@ def test_pinned_cpu_request_falls_back_to_disk_backend():
     cfg = HostStagingConfig.from_dict({"backend": "pinned_cpu"})
 
     assert cfg.backend == "pinned_cpu"
-    assert cfg.effective_backend() == "disk_fallback"
+    assert cfg.effective_backend() == "pinned_cpu"
 
 
 def test_optimizer_restore_policy_defaults_to_deferred():
