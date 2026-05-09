@@ -324,6 +324,9 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             "resize/comm_cache_enabled": 1.0 if self._communicator_cache_config.enable else 0.0,
             "resize/comm_cache_hit": 0.0,
             "resize/comm_cache_miss": 0.0,
+            "resize/comm_live_cache_hit": 0.0,
+            "resize/comm_registry_hit": 0.0,
+            "resize/comm_registry_miss": 0.0,
             "resize/comm_cache_reused_group": "",
         }
 
@@ -437,6 +440,13 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             topology_key = self._candidate_topology_key(
                 actor_spec=item.get("actor_pool"),
                 rollout_spec=item.get("rollout_pool"),
+            )
+            self._weight_sync_communicator_cache.register_topology(
+                topology_key,
+                actor_spec=item.get("actor_pool"),
+                rollout_spec=item.get("rollout_pool"),
+                actor_world_size=self._pool_world_size_from_spec(Role.Actor, item.get("actor_pool")),
+                rollout_world_size=self._pool_world_size_from_spec(Role.Rollout, item.get("rollout_pool")),
             )
             self._weight_sync_communicator_cache.reserve(topology_key)
 
@@ -1336,12 +1346,33 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                         f"group_name={group_name}: {exc}"
                     )
 
-    def _create_weight_sync_group(self, *, group_name: str | None = None, topology_key: str | None = None):
+    def _create_weight_sync_group(
+        self,
+        *,
+        group_name: str | None = None,
+        topology_key: str | None = None,
+        actor_spec: dict | None = None,
+        rollout_spec: dict | None = None,
+    ):
         from verl.utils.device import get_nccl_backend
 
         actor_rollout_workers = self.actor_wg.workers + self.rollout_wg.workers
         n_workers = len(actor_rollout_workers)
         topology_key = topology_key or self._current_topology_key()
+        actor_spec = actor_spec if actor_spec is not None else self._active_topology_specs.get(Role.Actor)
+        rollout_spec = rollout_spec if rollout_spec is not None else self._active_topology_specs.get(Role.Rollout)
+        had_registry_entry = self._weight_sync_communicator_cache.get_topology(topology_key) is not None
+        # Track topology-scoped metadata separately from live worker bindings.
+        # This commit does not prewarm communicators yet; it only makes the
+        # future prewarm input explicit and reusable across worker lifecycles.
+        self._weight_sync_communicator_cache.register_topology(
+            topology_key,
+            actor_spec=actor_spec,
+            rollout_spec=rollout_spec,
+            actor_world_size=len(self.actor_wg.workers),
+            rollout_world_size=len(self.rollout_wg.workers),
+            world_size=n_workers,
+        )
 
         cached_entry = self._weight_sync_communicator_cache.get(
             topology_key=topology_key,
@@ -1359,6 +1390,9 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 **{
                     "resize/comm_cache_hit": 1.0,
                     "resize/comm_cache_miss": 0.0,
+                    "resize/comm_live_cache_hit": 1.0,
+                    "resize/comm_registry_hit": 1.0 if had_registry_entry else 0.0,
+                    "resize/comm_registry_miss": 0.0 if had_registry_entry else 1.0,
                     "resize/comm_cache_reused_group": reused_group_name,
                 }
             )
@@ -1371,6 +1405,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         if self._is_weight_sync_group_name_busy(candidate_group_name):
             candidate_group_name = None
         group_name = candidate_group_name or self._next_weight_sync_group_name()
+        registry_hit = had_registry_entry
 
         if self.device_name == "npu":
             master_address = ray.get(self.actor_wg.workers[0]._get_node_ip.remote()).strip("[]")
@@ -1426,11 +1461,19 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             group_name=group_name,
             actor_wg=self.actor_wg,
             rollout_wg=self.rollout_wg,
+            actor_spec=actor_spec,
+            rollout_spec=rollout_spec,
+            actor_world_size=len(self.actor_wg.workers),
+            rollout_world_size=len(self.rollout_wg.workers),
+            world_size=n_workers,
         )
         self._update_communicator_cache_metrics(
             **{
                 "resize/comm_cache_hit": 0.0,
                 "resize/comm_cache_miss": 1.0,
+                "resize/comm_live_cache_hit": 0.0,
+                "resize/comm_registry_hit": 1.0 if registry_hit else 0.0,
+                "resize/comm_registry_miss": 0.0 if registry_hit else 1.0,
                 "resize/comm_cache_reused_group": group_name,
             }
         )
@@ -1457,7 +1500,12 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self.actor_wg = new_actor_wg
         self.rollout_wg = new_rollout_wg
         self.actor_rollout_wg = new_actor_wg
-        self._create_weight_sync_group(group_name=new_group_name, topology_key=topology_key)
+        self._create_weight_sync_group(
+            group_name=new_group_name,
+            topology_key=topology_key,
+            actor_spec=actor_spec,
+            rollout_spec=rollout_spec,
+        )
 
         if old_group_name is not None and old_actor_wg is not None and old_rollout_wg is not None:
             self._register_weight_sync_group_for_cleanup(old_group_name, old_actor_wg, old_rollout_wg)
