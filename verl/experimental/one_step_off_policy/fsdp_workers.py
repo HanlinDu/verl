@@ -56,6 +56,7 @@ from verl.experimental.one_step_off_policy.staging_backend import (
     update_restore_session_manifest,
     write_host_staging_manifest,
 )
+from verl.experimental.one_step_off_policy.worker_init_plan import WorkerCommInitPlan, build_worker_comm_init_plan
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.utils.config import omega_conf_to_dataclass
@@ -310,6 +311,13 @@ class LocalInitActorRolloutRefWorker(Worker, DistProfilerExtension):
             f"role={role}, tool={omega_profiler_config.get('tool', None)}"
         )
 
+        worker_comm_plan = build_worker_comm_init_plan(
+            config,
+            role,
+            device_type=get_device_name(),
+            nccl_backend=get_nccl_backend(),
+        )
+
         plan = {
             "config": config,
             "role": role,
@@ -318,6 +326,10 @@ class LocalInitActorRolloutRefWorker(Worker, DistProfilerExtension):
             "is_rollout": is_rollout,
             "is_ref": is_ref,
             "omega_profiler_config": omega_profiler_config,
+            # Prepare now records the communication contract as pure metadata so
+            # commit can execute against an explicit plan instead of re-reading
+            # environment/config ad hoc inside the critical window.
+            "worker_comm_plan": worker_comm_plan.to_dict(),
         }
         return plan
 
@@ -345,27 +357,34 @@ class LocalInitActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._is_rollout = worker_ctx["is_rollout"]
         self._is_ref = worker_ctx["is_ref"]
 
+        comm_plan = WorkerCommInitPlan.from_dict(worker_ctx["worker_comm_plan"])
+
         if not torch.distributed.is_initialized():
-            rank = int(os.environ.get("RANK", 0))
-            world_size = int(os.environ.get("WORLD_SIZE", 1))
-            init_method = os.environ.get("DIST_INIT_METHOD") or "env://"
             torch.distributed.init_process_group(
-                backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
-                rank=rank,
-                world_size=world_size,
-                timeout=datetime.timedelta(seconds=config.get("nccl_timeout", 600)),
-                init_method=init_method,
+                backend=comm_plan.backend,
+                rank=comm_plan.rank,
+                world_size=comm_plan.world_size,
+                timeout=datetime.timedelta(seconds=comm_plan.timeout_seconds),
+                init_method=comm_plan.init_method,
             )
 
-        world_size = torch.distributed.get_world_size()
-        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=config.actor.fsdp_config.fsdp_size)
+        runtime_world_size = torch.distributed.get_world_size()
+        if runtime_world_size != comm_plan.world_size:
+            logger.warning(
+                "[one-step-off][worker] runtime world_size differs from prepared comm plan: "
+                "role=%s prepared_world_size=%s runtime_world_size=%s",
+                role,
+                comm_plan.world_size,
+                runtime_world_size,
+            )
+        world_size = runtime_world_size
+        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=comm_plan.fsdp_size)
 
         self.ulysses_device_mesh = None
-        self.ulysses_sequence_parallel_size = config.actor.get("ulysses_sequence_parallel_size", 1)
-        dp = world_size // self.ulysses_sequence_parallel_size
-        if self.ulysses_sequence_parallel_size > 1:
+        self.ulysses_sequence_parallel_size = comm_plan.ulysses_sequence_parallel_size
+        if comm_plan.ulysses_mesh_shape is not None:
             self.ulysses_device_mesh = init_device_mesh(
-                device_name, mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"]
+                device_name, mesh_shape=comm_plan.ulysses_mesh_shape, mesh_dim_names=["dp", "sp"]
             )
 
         if self.ulysses_device_mesh is not None:
