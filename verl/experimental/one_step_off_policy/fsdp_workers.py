@@ -847,41 +847,78 @@ class DetachSync(LocalInitActorRolloutRefWorker, AsyncActorRolloutRefWorker):
 
         return collective_rank, collective_world_size, group_initialized
 
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size, group_name="actor_rollout"):
+    def _ensure_weight_sync_group(
+        self,
+        master_address,
+        master_port,
+        rank_offset,
+        world_size,
+        *,
+        group_name: str,
+        activate: bool,
+    ) -> None:
         rank = torch.distributed.get_rank() + rank_offset
         self._actor_rollout_collective_rank = rank
         self._actor_rollout_collective_world_size = world_size
         metadata = self._get_weight_sync_group_metadata()
         cached_key = metadata.get(group_name)
         current_key = (rank, world_size)
-        self._set_active_weight_sync_group_name(group_name)
 
-        # Reuse only when the group name already maps to the same rank/world-size
-        # contract on this worker. Any topology shape change forces a rebuild.
+        # Keep prepare idempotent: if the group for this worker already matches
+        # the requested rank/world-size contract, only activate when asked.
         if cached_key == current_key:
+            if activate:
+                self._set_active_weight_sync_group_name(group_name)
             if device_name == "npu":
                 cache = self._get_weight_sync_group_cache()
                 cached_group = cache.get(group_name)
-                if cached_group is not None:
+                if cached_group is not None and activate:
                     self._weight_sync_group = cached_group
-                    return
-            else:
-                self._maybe_init_collective_group(group_name=group_name)
                 return
+            self._maybe_init_collective_group(group_name=group_name)
+            return
 
         if device_name == "npu":
-            self._weight_sync_group = vllm_stateless_init_process_group(
+            prepared_group = vllm_stateless_init_process_group(
                 master_address,
                 master_port,
                 rank,
                 world_size,
                 get_torch_device().current_device(),
             )
-            self._get_weight_sync_group_cache()[group_name] = self._weight_sync_group
+            self._get_weight_sync_group_cache()[group_name] = prepared_group
+            if activate:
+                self._weight_sync_group = prepared_group
         else:
             self._maybe_init_collective_group(group_name=group_name)
         metadata[group_name] = current_key
+        if activate:
+            self._set_active_weight_sync_group_name(group_name)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size, group_name="actor_rollout"):
+        self._ensure_weight_sync_group(
+            master_address,
+            master_port,
+            rank_offset,
+            world_size,
+            group_name=group_name,
+            activate=True,
+        )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def prepare_weight_sync_group(self, master_address, master_port, rank_offset, world_size, group_name="actor_rollout"):
+        # Build the communicator eagerly on the new worker lifecycle without
+        # rebinding the active path yet. The trainer will activate it only after
+        # the new actor/rollout pair is published together.
+        self._ensure_weight_sync_group(
+            master_address,
+            master_port,
+            rank_offset,
+            world_size,
+            group_name=group_name,
+            activate=False,
+        )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def activate_weight_sync_group(self, group_name: str):

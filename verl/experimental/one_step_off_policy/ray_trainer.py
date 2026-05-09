@@ -327,6 +327,10 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             "resize/comm_live_cache_hit": 0.0,
             "resize/comm_registry_hit": 0.0,
             "resize/comm_registry_miss": 0.0,
+            "resize/comm_prewarm_ready": 0.0,
+            "resize/comm_prewarm_create_s": 0.0,
+            "resize/comm_activate_s": 0.0,
+            "resize/comm_prepare_path": "",
             "resize/comm_cache_reused_group": "",
         }
 
@@ -1144,6 +1148,42 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             group_name,
         )
 
+    def _prepare_actor_weight_sync_group(
+        self,
+        actor_wg: RayWorkerGroup,
+        master_address,
+        master_port,
+        rank_offset: int,
+        world_size: int,
+        group_name: str,
+    ):
+        return actor_wg.execute_all_sync(
+            f"{str(Role.Actor)}_prepare_weight_sync_group",
+            master_address,
+            master_port,
+            rank_offset,
+            world_size,
+            group_name,
+        )
+
+    def _prepare_rollout_weight_sync_group(
+        self,
+        rollout_wg: RayWorkerGroup,
+        master_address,
+        master_port,
+        rank_offset: int,
+        world_size: int,
+        group_name: str,
+    ):
+        return rollout_wg.execute_all_sync(
+            f"{str(Role.Rollout)}_prepare_weight_sync_group",
+            master_address,
+            master_port,
+            rank_offset,
+            world_size,
+            group_name,
+        )
+
     def _destroy_actor_weight_sync_group(self, actor_wg: RayWorkerGroup, group_name: str):
         return actor_wg.execute_all_sync(f"{str(Role.Actor)}_destroy_weight_sync_group", group_name)
 
@@ -1346,6 +1386,113 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                         f"group_name={group_name}: {exc}"
                     )
 
+    def _prepare_weight_sync_group(
+        self,
+        actor_wg: RayWorkerGroup,
+        rollout_wg: RayWorkerGroup,
+        *,
+        group_name: str | None = None,
+        topology_key: str | None = None,
+        actor_spec: dict | None = None,
+        rollout_spec: dict | None = None,
+    ) -> str:
+        from verl.utils.device import get_nccl_backend
+
+        actor_rollout_workers = actor_wg.workers + rollout_wg.workers
+        n_workers = len(actor_rollout_workers)
+        topology_key = topology_key or self._candidate_topology_key(actor_spec=actor_spec, rollout_spec=rollout_spec)
+        actor_spec = actor_spec if actor_spec is not None else self._active_topology_specs.get(Role.Actor)
+        rollout_spec = rollout_spec if rollout_spec is not None else self._active_topology_specs.get(Role.Rollout)
+        had_registry_entry = self._weight_sync_communicator_cache.get_topology(topology_key) is not None
+        self._weight_sync_communicator_cache.register_topology(
+            topology_key,
+            actor_spec=actor_spec,
+            rollout_spec=rollout_spec,
+            actor_world_size=len(actor_wg.workers),
+            rollout_world_size=len(rollout_wg.workers),
+            world_size=n_workers,
+        )
+
+        cached_entry = self._weight_sync_communicator_cache.get(
+            topology_key=topology_key,
+            actor_wg=actor_wg,
+            rollout_wg=rollout_wg,
+        )
+        if cached_entry is not None:
+            self._update_communicator_cache_metrics(
+                **{
+                    "resize/comm_registry_hit": 1.0 if had_registry_entry else 0.0,
+                    "resize/comm_registry_miss": 0.0 if had_registry_entry else 1.0,
+                    "resize/comm_prewarm_ready": 1.0 if cached_entry.is_prewarmed else 0.0,
+                    "resize/comm_prepare_path": "live_hit",
+                    "resize/comm_cache_reused_group": cached_entry.group_name,
+                }
+            )
+            return cached_entry.group_name
+
+        candidate_group_name = group_name or self._weight_sync_communicator_cache.reserve(topology_key)
+        if self._is_weight_sync_group_name_busy(candidate_group_name):
+            candidate_group_name = None
+        group_name = candidate_group_name or self._next_weight_sync_group_name()
+
+        started_at = time.monotonic()
+        if self.device_name == "npu":
+            master_address = ray.get(actor_wg.workers[0]._get_node_ip.remote()).strip("[]")
+            master_port = ray.get(actor_wg.workers[0]._get_free_port.remote())
+            self._prepare_actor_weight_sync_group(actor_wg, master_address, master_port, 0, n_workers, group_name)
+            self._prepare_rollout_weight_sync_group(
+                rollout_wg,
+                master_address,
+                master_port,
+                len(actor_wg.workers),
+                n_workers,
+                group_name,
+            )
+        else:
+            collective.create_collective_group(
+                actor_rollout_workers,
+                n_workers,
+                list(range(0, n_workers)),
+                backend=get_nccl_backend(),
+                group_name=group_name,
+            )
+            master_address = ray.get(actor_wg.workers[0]._get_node_ip.remote()).strip("[]")
+            master_port = ray.get(actor_wg.workers[0]._get_free_port.remote())
+            self._prepare_actor_weight_sync_group(actor_wg, master_address, master_port, 0, n_workers, group_name)
+            self._prepare_rollout_weight_sync_group(
+                rollout_wg,
+                master_address,
+                master_port,
+                len(actor_wg.workers),
+                n_workers,
+                group_name,
+            )
+        prewarm_duration = time.monotonic() - started_at
+
+        self._weight_sync_communicator_cache.put(
+            topology_key=topology_key,
+            group_name=group_name,
+            actor_wg=actor_wg,
+            rollout_wg=rollout_wg,
+            is_prewarmed=True,
+            actor_spec=actor_spec,
+            rollout_spec=rollout_spec,
+            actor_world_size=len(actor_wg.workers),
+            rollout_world_size=len(rollout_wg.workers),
+            world_size=n_workers,
+        )
+        self._update_communicator_cache_metrics(
+            **{
+                "resize/comm_registry_hit": 1.0 if had_registry_entry else 0.0,
+                "resize/comm_registry_miss": 0.0 if had_registry_entry else 1.0,
+                "resize/comm_prewarm_ready": 1.0,
+                "resize/comm_prewarm_create_s": prewarm_duration,
+                "resize/comm_prepare_path": "registry_prewarm" if had_registry_entry else "full_build",
+                "resize/comm_cache_reused_group": group_name,
+            }
+        )
+        return group_name
+
     def _create_weight_sync_group(
         self,
         *,
@@ -1383,8 +1530,17 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             # Fast path: the communicator for this exact live actor/rollout pair
             # is already available, so only switch the active group binding.
             reused_group_name = cached_entry.group_name
+            was_prewarmed = cached_entry.is_prewarmed
+            activate_started_at = time.monotonic()
             self.actor_wg.execute_all_sync(f"{str(Role.Actor)}_activate_weight_sync_group", reused_group_name)
             self.rollout_wg.execute_all_sync(f"{str(Role.Rollout)}_activate_weight_sync_group", reused_group_name)
+            activate_duration = time.monotonic() - activate_started_at
+            if was_prewarmed:
+                self._weight_sync_communicator_cache.mark_activated(
+                    topology_key=topology_key,
+                    actor_wg=self.actor_wg,
+                    rollout_wg=self.rollout_wg,
+                )
             self._active_weight_sync_group_name = reused_group_name
             self._update_communicator_cache_metrics(
                 **{
@@ -1393,6 +1549,9 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                     "resize/comm_live_cache_hit": 1.0,
                     "resize/comm_registry_hit": 1.0 if had_registry_entry else 0.0,
                     "resize/comm_registry_miss": 0.0 if had_registry_entry else 1.0,
+                    "resize/comm_prewarm_ready": 1.0 if was_prewarmed else 0.0,
+                    "resize/comm_activate_s": activate_duration,
+                    "resize/comm_prepare_path": "prewarmed_activate" if was_prewarmed else "live_hit",
                     "resize/comm_cache_reused_group": reused_group_name,
                 }
             )
@@ -1474,6 +1633,8 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 "resize/comm_live_cache_hit": 0.0,
                 "resize/comm_registry_hit": 1.0 if registry_hit else 0.0,
                 "resize/comm_registry_miss": 0.0 if registry_hit else 1.0,
+                "resize/comm_prewarm_ready": 0.0,
+                "resize/comm_prepare_path": "full_build",
                 "resize/comm_cache_reused_group": group_name,
             }
         )
@@ -2052,6 +2213,18 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         weights_info = self._get_actor_weights_info(new_actor_wg)[0]
         self._set_actor_weights_info(new_rollout_wg, weights_info)
 
+        # Keep the staged shared-pool path aligned with the non-staged switch
+        # flow: prewarm the inter-role communicator on the new worker lifecycle
+        # before publishing the topology, so the final switch can use activate
+        # instead of rebuilding the communicator in the critical window.
+        self._prepare_weight_sync_group(
+            new_actor_wg,
+            new_rollout_wg,
+            topology_key=self._candidate_topology_key(actor_spec=actor_spec, rollout_spec=rollout_spec),
+            actor_spec=actor_spec,
+            rollout_spec=rollout_spec,
+        )
+
         # Publish the new pair together.
         self._switch_weight_sync_group(
             new_actor_wg,
@@ -2220,6 +2393,17 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
         weights_info = self._get_actor_weights_info(new_actor_wg)[0]
         self._set_actor_weights_info(new_rollout_wg, weights_info)
+
+        # Prewarm the inter-role communicator on the new worker lifecycle before
+        # publishing the new topology. The final switch can then be reduced to a
+        # lightweight activation step instead of an in-window rendezvous.
+        self._prepare_weight_sync_group(
+            new_actor_wg,
+            new_rollout_wg,
+            topology_key=self._candidate_topology_key(actor_spec=actor_spec, rollout_spec=rollout_spec),
+            actor_spec=actor_spec,
+            rollout_spec=rollout_spec,
+        )
 
         # Phase 4: 发布新拓扑。
         # actor/rollout 必须作为一对同时对外可见，避免混合拓扑。

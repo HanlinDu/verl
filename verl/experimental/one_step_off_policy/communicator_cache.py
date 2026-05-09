@@ -50,6 +50,7 @@ class WeightSyncGroupCacheEntry:
     group_name: str
     actor_group_id: int
     rollout_group_id: int
+    is_prewarmed: bool = False
 
 
 @dataclass(slots=True)
@@ -161,6 +162,13 @@ class WeightSyncCommunicatorCache:
             return None
         return entry
 
+    def mark_activated(self, *, topology_key: str, actor_wg, rollout_wg) -> WeightSyncGroupCacheEntry | None:
+        entry = self.get(topology_key=topology_key, actor_wg=actor_wg, rollout_wg=rollout_wg)
+        if entry is None:
+            return None
+        entry.is_prewarmed = False
+        return entry
+
     def put(
         self,
         *,
@@ -168,6 +176,7 @@ class WeightSyncCommunicatorCache:
         group_name: str,
         actor_wg,
         rollout_wg,
+        is_prewarmed: bool = False,
         actor_spec: dict[str, Any] | None = None,
         rollout_spec: dict[str, Any] | None = None,
         actor_world_size: int | None = None,
@@ -191,6 +200,7 @@ class WeightSyncCommunicatorCache:
             group_name=group_name,
             actor_group_id=id(actor_wg),
             rollout_group_id=id(rollout_wg),
+            is_prewarmed=bool(is_prewarmed),
         )
         self._entries[topology_key] = entry
         return entry
