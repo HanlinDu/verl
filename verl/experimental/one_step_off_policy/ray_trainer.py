@@ -2300,7 +2300,11 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             actor_resume_path = item.get("actor_resume_from_path")
 
             staged_enabled = self._should_use_staged_shared_pool_resize(item)
-            if not release_old and staged_enabled:
+            if staged_enabled:
+                if release_old:
+                    logger.info(
+                        "[one-step-off][resize] normalize release_old=true shared-pool split resize to staged path"
+                    )
                 logger.info("[one-step-off][resize] using staged shared-pool resize path")
                 resize_applied = await self._staged_resize_shared_pool(item, actor_resume_path=actor_resume_path)
                 if resize_applied:
