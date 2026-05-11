@@ -311,9 +311,19 @@ class LocalInitActorRolloutRefWorker(Worker, DistProfilerExtension):
             f"role={role}, tool={omega_profiler_config.get('tool', None)}"
         )
 
+        init_method = None
+        master_addr = getattr(self, "_master_addr", None)
+        master_port = getattr(self, "_master_port", None)
+        if master_addr is not None and master_port is not None:
+            normalized_master_addr = str(master_addr).replace("[", "").replace("]", "")
+            init_method = f"tcp://{normalized_master_addr}:{master_port}"
+
         worker_comm_plan = build_worker_comm_init_plan(
             config,
             role,
+            rank=getattr(self, "rank", None),
+            world_size=getattr(self, "world_size", None),
+            init_method=init_method,
             device_type=get_device_name(),
             nccl_backend=get_nccl_backend(),
         )
