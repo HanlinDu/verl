@@ -62,6 +62,7 @@ from verl.experimental.one_step_off_policy.resize_controller import (
 )
 from verl.experimental.one_step_off_policy.resize_metrics import build_resize_observation
 from verl.experimental.one_step_off_policy.staging_backend import HostStagingConfig, has_restore_session_manifest, read_restore_session_manifest
+from verl.experimental.one_step_off_policy.trace_utils import build_resize_trace_config, resize_trace_span
 from verl.experimental.one_step_off_policy.utils import need_critic
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls, split_resource_pool
@@ -142,6 +143,9 @@ class OneStepOffRayTrainer(RayPPOTrainer):
     # over-allocate the pool and leave new workers stuck in PENDING_CREATION.
     # TODO: support each role have individual ray_worker_group_cls,
     # i.e., support different backend of different role
+    def _trace_step(self) -> int:
+        return int(getattr(self, "global_steps", 0))
+
     def __init__(
         self,
         config,
@@ -215,6 +219,12 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self._dynamic_resize_mode = self._resolve_dynamic_resize_mode()
         self._resize_controller = self._build_resize_controller()
         self._latest_resize_control_metrics: dict[str, float | str | int] = self._default_resize_control_metrics()
+        self._resize_trace_config = build_resize_trace_config(self.config)
+        self._dynamic_resize_enabled = self._build_dynamic_resize_flag("enable", default=False)
+        self._dynamic_resize_phased_init_enabled = self._build_dynamic_resize_flag("phased_init.enable", default=True)
+        self._dynamic_resize_async_comm_prewarm_enabled = self._build_dynamic_resize_flag(
+            "async_comm_prewarm.enable", default=True
+        )
         # Round two: handoff is configured through a staging backend abstraction
         # so the staged resize path can evolve from disk-backed transfer toward
         # richer host-memory implementations without changing the trainer flow.
@@ -276,6 +286,12 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         cfg = OmegaConf.to_container(cfg, resolve=True)
         return CommunicatorCacheConfig.from_dict(cfg.get("communicator_cache", {}))
 
+    def _build_dynamic_resize_flag(self, key: str, *, default: bool) -> bool:
+        value = OmegaConf.select(self.config.trainer, f"dynamic_resize.{key}")
+        if value is None:
+            return default
+        return bool(value)
+
     def _build_resize_budget_config(self) -> ResizeBudgetConfig:
         cfg = OmegaConf.select(self.config.trainer, "dynamic_resize")
         if cfg is None:
@@ -304,6 +320,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
     def _default_resize_execution_metrics(self) -> dict[str, float | str | int]:
         return {
             "resize/host_stage_enabled": 1.0 if self._handoff_staging_config.enable else 0.0,
+            "resize/phased_init_enabled": 1.0 if self._dynamic_resize_phased_init_enabled else 0.0,
             "resize/host_stage_backend": self._handoff_staging_config.effective_backend(),
             "resize/host_stage_requested_backend": self._handoff_staging_config.backend,
             "resize/host_stage_export_s": 0.0,
@@ -315,6 +332,14 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             "resize/optimizer_pending_pages": 0.0,
             "resize/optimizer_materialize_s": 0.0,
             "resize/optimizer_materialize_count": 0.0,
+            "resize/actor_prepare_worker_init_s": 0.0,
+            "resize/actor_commit_worker_init_s": 0.0,
+            "resize/actor_prepare_model_init_s": 0.0,
+            "resize/actor_commit_model_init_s": 0.0,
+            "resize/rollout_prepare_worker_init_s": 0.0,
+            "resize/rollout_commit_worker_init_s": 0.0,
+            "resize/rollout_prepare_model_init_s": 0.0,
+            "resize/rollout_commit_model_init_s": 0.0,
             "resize/restore_failed": 0.0,
             "resize/partial_restore_cleanup_count": 0.0,
         }
@@ -322,6 +347,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
     def _default_communicator_cache_metrics(self) -> dict[str, float | str | int]:
         return {
             "resize/comm_cache_enabled": 1.0 if self._communicator_cache_config.enable else 0.0,
+            "resize/async_comm_prewarm_enabled": 1.0 if self._dynamic_resize_async_comm_prewarm_enabled else 0.0,
             "resize/comm_cache_hit": 0.0,
             "resize/comm_cache_miss": 0.0,
             "resize/comm_live_cache_hit": 0.0,
@@ -330,6 +356,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             "resize/comm_prewarm_ready": 0.0,
             "resize/comm_prewarm_create_s": 0.0,
             "resize/comm_activate_s": 0.0,
+            "resize/comm_full_build_s": 0.0,
             "resize/comm_prepare_path": "",
             "resize/comm_cache_reused_group": "",
         }
@@ -366,6 +393,26 @@ class OneStepOffRayTrainer(RayPPOTrainer):
     def _update_resize_budget_metrics(self, **kwargs) -> dict[str, float | str | int]:
         self._latest_resize_budget_metrics.update(kwargs)
         return dict(self._latest_resize_budget_metrics)
+
+    @staticmethod
+    def _extract_max_metric_value(results, key: str) -> float:
+        values: list[float] = []
+
+        def _collect(item) -> None:
+            if item is None:
+                return
+            if isinstance(item, list):
+                for sub in item:
+                    _collect(sub)
+                return
+            if isinstance(item, dict) and key in item:
+                try:
+                    values.append(float(item[key]))
+                except (TypeError, ValueError):
+                    return
+
+        _collect(results)
+        return max(values) if values else 0.0
 
     @staticmethod
     def _estimate_weights_info_bytes(weights_info) -> int:
@@ -980,10 +1027,14 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
         self.actor_wg = self.all_wg[str(Role.Actor)]
         self.rollout_wg = self.all_wg[str(Role.Rollout)]
-        self._prepare_role_group_init(self.actor_wg, role=Role.Actor)
-        self._prepare_role_group_init(self.rollout_wg, role=Role.Rollout)
-        self._commit_role_group_init(self.actor_wg, role=Role.Actor)
-        self._commit_role_group_init(self.rollout_wg, role=Role.Rollout)
+        if self._dynamic_resize_enabled and self._dynamic_resize_phased_init_enabled:
+            self._prepare_role_group_init(self.actor_wg, role=Role.Actor)
+            self._prepare_role_group_init(self.rollout_wg, role=Role.Rollout)
+            self._commit_role_group_init(self.actor_wg, role=Role.Actor)
+            self._commit_role_group_init(self.rollout_wg, role=Role.Rollout)
+        else:
+            self.actor_wg.init_model()
+            self.rollout_wg.init_model()
         self.actor_rollout_wg = self.actor_wg
         # Register the initial groups as the default targets.
         self.role_groups[Role.Actor] = {"primary": self.actor_wg}
@@ -1008,6 +1059,10 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         schedule = []
         if cfg is not None:
             cfg = OmegaConf.to_container(cfg, resolve=True)
+            if not cfg.get("enable", False):
+                self._active_role_world_sizes[Role.Actor] = self._pool_world_size_from_spec(Role.Actor, None)
+                self._active_role_world_sizes[Role.Rollout] = self._pool_world_size_from_spec(Role.Rollout, None)
+                return
             schedule = cfg.get("schedule", []) or []
             if isinstance(schedule, dict):
                 schedule = list(schedule.values())
@@ -1068,11 +1123,23 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         对 one-step-off 实验 worker，优先调用显式 prepare 生命周期；
         对未实现该接口的旧 worker，静默回退，保持兼容。
         """
+        if not self._dynamic_resize_phased_init_enabled:
+            return
         role_prefix = str(role)
         for method_name in ("prepare_worker_init", "prepare_model_init"):
             remote_method_name = f"{role_prefix}_{method_name}"
-            role_wg.execute_rank_zero_sync(remote_method_name)
-            role_wg.execute_all_sync(remote_method_name)
+            with resize_trace_span(
+                self._resize_trace_config,
+                f"{role_prefix}_{method_name}_group",
+                step=self._trace_step(),
+                lane="trainer_main",
+                metadata={"role": role_prefix, "phase": "prepare"},
+            ):
+                rank0_result = role_wg.execute_rank_zero_sync(remote_method_name)
+                all_results = role_wg.execute_all_sync(remote_method_name)
+            duration = self._extract_max_metric_value([rank0_result, all_results], f"resize/{method_name}_s")
+            if duration > 0:
+                self._update_resize_execution_metrics(**{f"resize/{role_prefix}_{method_name}_s": duration})
 
     async def _prepare_role_group_init_async(self, role_wg: RayWorkerGroup, *, role: Role) -> None:
         """异步 prepare 接口骨架。
@@ -1093,8 +1160,39 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         role_prefix = str(role)
         commit_worker_method = f"{role_prefix}_commit_worker_init"
         commit_model_method = f"{role_prefix}_commit_model_init"
-        role_wg.execute_all_sync(commit_worker_method)
-        role_wg.execute_all_sync(commit_model_method)
+        with resize_trace_span(
+            self._resize_trace_config,
+            f"{role_prefix}_commit_worker_init_group",
+            step=self._trace_step(),
+            lane="trainer_main",
+            metadata={"role": role_prefix, "phase": "commit_worker"},
+        ):
+            worker_results = role_wg.execute_all_sync(commit_worker_method)
+        with resize_trace_span(
+            self._resize_trace_config,
+            f"{role_prefix}_commit_model_init_group",
+            step=self._trace_step(),
+            lane="trainer_main",
+            metadata={"role": role_prefix, "phase": "commit_model"},
+        ):
+            model_results = role_wg.execute_all_sync(commit_model_method)
+
+        self._update_resize_execution_metrics(
+            **{
+                f"resize/{role_prefix}_prepare_worker_init_s": self._extract_max_metric_value(
+                    worker_results, "resize/prepare_worker_init_s"
+                ),
+                f"resize/{role_prefix}_commit_worker_init_s": self._extract_max_metric_value(
+                    worker_results, "resize/commit_worker_init_s"
+                ),
+                f"resize/{role_prefix}_prepare_model_init_s": self._extract_max_metric_value(
+                    model_results, "resize/prepare_model_init_s"
+                ),
+                f"resize/{role_prefix}_commit_model_init_s": self._extract_max_metric_value(
+                    model_results, "resize/commit_model_init_s"
+                ),
+            }
+        )
 
     async def _commit_role_group_init_async(self, role_wg: RayWorkerGroup, *, role: Role) -> None:
         """异步 commit 接口骨架。
@@ -1435,39 +1533,46 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             candidate_group_name = None
         group_name = candidate_group_name or self._next_weight_sync_group_name()
 
-        started_at = time.monotonic()
-        if self.device_name == "npu":
-            master_address = ray.get(actor_wg.workers[0]._get_node_ip.remote()).strip("[]")
-            master_port = ray.get(actor_wg.workers[0]._get_free_port.remote())
-            self._prepare_actor_weight_sync_group(actor_wg, master_address, master_port, 0, n_workers, group_name)
-            self._prepare_rollout_weight_sync_group(
-                rollout_wg,
-                master_address,
-                master_port,
-                len(actor_wg.workers),
-                n_workers,
-                group_name,
-            )
-        else:
-            collective.create_collective_group(
-                actor_rollout_workers,
-                n_workers,
-                list(range(0, n_workers)),
-                backend=get_nccl_backend(),
-                group_name=group_name,
-            )
-            master_address = ray.get(actor_wg.workers[0]._get_node_ip.remote()).strip("[]")
-            master_port = ray.get(actor_wg.workers[0]._get_free_port.remote())
-            self._prepare_actor_weight_sync_group(actor_wg, master_address, master_port, 0, n_workers, group_name)
-            self._prepare_rollout_weight_sync_group(
-                rollout_wg,
-                master_address,
-                master_port,
-                len(actor_wg.workers),
-                n_workers,
-                group_name,
-            )
-        prewarm_duration = time.monotonic() - started_at
+        with resize_trace_span(
+            self._resize_trace_config,
+            "comm_prewarm_create",
+            step=self._trace_step(),
+            lane="comm_prewarm",
+            metadata={"topology_key": topology_key, "group_name": group_name},
+        ):
+            started_at = time.monotonic()
+            if self.device_name == "npu":
+                master_address = ray.get(actor_wg.workers[0]._get_node_ip.remote()).strip("[]")
+                master_port = ray.get(actor_wg.workers[0]._get_free_port.remote())
+                self._prepare_actor_weight_sync_group(actor_wg, master_address, master_port, 0, n_workers, group_name)
+                self._prepare_rollout_weight_sync_group(
+                    rollout_wg,
+                    master_address,
+                    master_port,
+                    len(actor_wg.workers),
+                    n_workers,
+                    group_name,
+                )
+            else:
+                collective.create_collective_group(
+                    actor_rollout_workers,
+                    n_workers,
+                    list(range(0, n_workers)),
+                    backend=get_nccl_backend(),
+                    group_name=group_name,
+                )
+                master_address = ray.get(actor_wg.workers[0]._get_node_ip.remote()).strip("[]")
+                master_port = ray.get(actor_wg.workers[0]._get_free_port.remote())
+                self._prepare_actor_weight_sync_group(actor_wg, master_address, master_port, 0, n_workers, group_name)
+                self._prepare_rollout_weight_sync_group(
+                    rollout_wg,
+                    master_address,
+                    master_port,
+                    len(actor_wg.workers),
+                    n_workers,
+                    group_name,
+                )
+            prewarm_duration = time.monotonic() - started_at
 
         self._weight_sync_communicator_cache.put(
             topology_key=topology_key,
@@ -1531,10 +1636,17 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             # is already available, so only switch the active group binding.
             reused_group_name = cached_entry.group_name
             was_prewarmed = cached_entry.is_prewarmed
-            activate_started_at = time.monotonic()
-            self.actor_wg.execute_all_sync(f"{str(Role.Actor)}_activate_weight_sync_group", reused_group_name)
-            self.rollout_wg.execute_all_sync(f"{str(Role.Rollout)}_activate_weight_sync_group", reused_group_name)
-            activate_duration = time.monotonic() - activate_started_at
+            with resize_trace_span(
+                self._resize_trace_config,
+                "comm_activate",
+                step=self._trace_step(),
+                lane="trainer_main",
+                metadata={"topology_key": topology_key, "group_name": reused_group_name},
+            ):
+                activate_started_at = time.monotonic()
+                self.actor_wg.execute_all_sync(f"{str(Role.Actor)}_activate_weight_sync_group", reused_group_name)
+                self.rollout_wg.execute_all_sync(f"{str(Role.Rollout)}_activate_weight_sync_group", reused_group_name)
+                activate_duration = time.monotonic() - activate_started_at
             if was_prewarmed:
                 self._weight_sync_communicator_cache.mark_activated(
                     topology_key=topology_key,
@@ -1566,54 +1678,63 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         group_name = candidate_group_name or self._next_weight_sync_group_name()
         registry_hit = had_registry_entry
 
-        if self.device_name == "npu":
-            master_address = ray.get(self.actor_wg.workers[0]._get_node_ip.remote()).strip("[]")
-            master_port = ray.get(self.actor_wg.workers[0]._get_free_port.remote())
-            self._create_actor_weight_sync_group(
-                self.actor_wg,
-                master_address,
-                master_port,
-                0,
-                n_workers,
-                group_name,
-            )
-            self._create_rollout_weight_sync_group(
-                self.rollout_wg,
-                master_address,
-                master_port,
-                len(self.actor_wg.workers),
-                n_workers,
-                group_name,
-            )
-        else:
-            # Create Ray collective group for fallback communication
-            collective.create_collective_group(
-                actor_rollout_workers,
-                n_workers,
-                list(range(0, n_workers)),
-                backend=get_nccl_backend(),
-                group_name=group_name,
-            )
-            # NOTE(HanlinDu): collective init not finished before broadcast, so we init here to avoid potential issues
-            # may not be necessary for all cases, but safer to have it
-            master_address = ray.get(self.actor_wg.workers[0]._get_node_ip.remote()).strip("[]")
-            master_port = ray.get(self.actor_wg.workers[0]._get_free_port.remote())
-            self._create_actor_weight_sync_group(
-                self.actor_wg,
-                master_address,
-                master_port,
-                0,
-                n_workers,
-                group_name,
-            )
-            self._create_rollout_weight_sync_group(
-                self.rollout_wg,
-                master_address,
-                master_port,
-                len(self.actor_wg.workers),
-                n_workers,
-                group_name,
-            )
+        with resize_trace_span(
+            self._resize_trace_config,
+            "comm_full_build",
+            step=self._trace_step(),
+            lane="trainer_main",
+            metadata={"topology_key": topology_key, "group_name": group_name},
+        ):
+            started_at = time.monotonic()
+            if self.device_name == "npu":
+                master_address = ray.get(self.actor_wg.workers[0]._get_node_ip.remote()).strip("[]")
+                master_port = ray.get(self.actor_wg.workers[0]._get_free_port.remote())
+                self._create_actor_weight_sync_group(
+                    self.actor_wg,
+                    master_address,
+                    master_port,
+                    0,
+                    n_workers,
+                    group_name,
+                )
+                self._create_rollout_weight_sync_group(
+                    self.rollout_wg,
+                    master_address,
+                    master_port,
+                    len(self.actor_wg.workers),
+                    n_workers,
+                    group_name,
+                )
+            else:
+                # Create Ray collective group for fallback communication
+                collective.create_collective_group(
+                    actor_rollout_workers,
+                    n_workers,
+                    list(range(0, n_workers)),
+                    backend=get_nccl_backend(),
+                    group_name=group_name,
+                )
+                # NOTE(HanlinDu): collective init not finished before broadcast, so we init here to avoid potential issues
+                # may not be necessary for all cases, but safer to have it
+                master_address = ray.get(self.actor_wg.workers[0]._get_node_ip.remote()).strip("[]")
+                master_port = ray.get(self.actor_wg.workers[0]._get_free_port.remote())
+                self._create_actor_weight_sync_group(
+                    self.actor_wg,
+                    master_address,
+                    master_port,
+                    0,
+                    n_workers,
+                    group_name,
+                )
+                self._create_rollout_weight_sync_group(
+                    self.rollout_wg,
+                    master_address,
+                    master_port,
+                    len(self.actor_wg.workers),
+                    n_workers,
+                    group_name,
+                )
+            full_build_duration = time.monotonic() - started_at
         self._active_weight_sync_group_name = group_name
         self._weight_sync_communicator_cache.put(
             topology_key=topology_key,
@@ -1634,6 +1755,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 "resize/comm_registry_hit": 1.0 if registry_hit else 0.0,
                 "resize/comm_registry_miss": 0.0 if registry_hit else 1.0,
                 "resize/comm_prewarm_ready": 0.0,
+                "resize/comm_full_build_s": full_build_duration,
                 "resize/comm_prepare_path": "full_build",
                 "resize/comm_cache_reused_group": group_name,
             }
@@ -1990,12 +2112,19 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         # new role has already been preloaded into free VRAM.
         if actor_resume_kind == "host_staging":
             logger.info("[one-step-off][resize][host-stage] exporting actor state before staged switch")
-            export_started_at = time.monotonic()
-            old_actor_wg.stage_actor_handoff_state_to_host(
-                actor_resume_path,
-                staging_config=runtime_staging_cfg,
-            )
-            export_duration = time.monotonic() - export_started_at
+            with resize_trace_span(
+                self._resize_trace_config,
+                "resize_export",
+                step=self._trace_step(),
+                lane="trainer_main",
+                metadata={"backend": runtime_staging_cfg.get("backend", "disk_fallback")},
+            ):
+                export_started_at = time.monotonic()
+                old_actor_wg.stage_actor_handoff_state_to_host(
+                    actor_resume_path,
+                    staging_config=runtime_staging_cfg,
+                )
+                export_duration = time.monotonic() - export_started_at
             self._update_resize_execution_metrics(**{"resize/host_stage_export_s": export_duration})
             if self._handoff_staging_config.preclear_rollout_kv_cache:
                 # Reclaim rollout-side transient memory before the switch window.
@@ -2003,9 +2132,16 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 self._update_resize_execution_metrics(**{"resize/kv_cache_preclear_s": kv_cache_preclear_s})
         elif actor_resume_kind == "handoff":
             logger.info("[one-step-off][resize][handoff] exporting actor state before staged switch")
-            export_started_at = time.monotonic()
-            old_actor_wg.save_actor_handoff_state(actor_resume_path)
-            export_duration = time.monotonic() - export_started_at
+            with resize_trace_span(
+                self._resize_trace_config,
+                "resize_export",
+                step=self._trace_step(),
+                lane="trainer_main",
+                metadata={"backend": "handoff"},
+            ):
+                export_started_at = time.monotonic()
+                old_actor_wg.save_actor_handoff_state(actor_resume_path)
+                export_duration = time.monotonic() - export_started_at
             self._update_resize_execution_metrics(**{"resize/host_stage_export_s": export_duration})
 
         # GPU restore is checked after KV-cache preclear/export, because the
@@ -2076,30 +2212,37 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         # and makes the host-staging timing visible in metrics.
         if actor_resume_kind == "host_staging" and actor_resume_path is not None:
             logger.info("[one-step-off][resize][host-stage] importing actor state into new actor")
-            import_started_at = time.monotonic()
-            try:
-                new_actor_wg.load_actor_handoff_state_from_host(
-                    actor_resume_path,
-                    staging_config=runtime_staging_cfg,
-                )
-            except Exception as exc:
-                self._update_resize_execution_metrics(
-                    **{
-                        "resize/restore_failed": 1.0,
-                        "resize/partial_restore_cleanup_count": 1.0,
-                    }
-                )
-                logger.exception(
-                    "[one-step-off][resize][host-stage] restore failed: path=%s "
-                    "resize/restore_failed=1.0 resize/partial_restore_cleanup_count=1.0 error=%r",
-                    actor_resume_path,
-                    exc,
-                )
+            with resize_trace_span(
+                self._resize_trace_config,
+                "resize_import",
+                step=self._trace_step(),
+                lane="trainer_main",
+                metadata={"backend": runtime_staging_cfg.get("backend", "disk_fallback")},
+            ):
+                import_started_at = time.monotonic()
                 try:
-                    new_actor_wg.cleanup_actor_handoff_restore_session(actor_resume_path)
-                finally:
-                    raise
-            import_duration = time.monotonic() - import_started_at
+                    new_actor_wg.load_actor_handoff_state_from_host(
+                        actor_resume_path,
+                        staging_config=runtime_staging_cfg,
+                    )
+                except Exception as exc:
+                    self._update_resize_execution_metrics(
+                        **{
+                            "resize/restore_failed": 1.0,
+                            "resize/partial_restore_cleanup_count": 1.0,
+                        }
+                    )
+                    logger.exception(
+                        "[one-step-off][resize][host-stage] restore failed: path=%s "
+                        "resize/restore_failed=1.0 resize/partial_restore_cleanup_count=1.0 error=%r",
+                        actor_resume_path,
+                        exc,
+                    )
+                    try:
+                        new_actor_wg.cleanup_actor_handoff_restore_session(actor_resume_path)
+                    finally:
+                        raise
+                import_duration = time.monotonic() - import_started_at
             self._update_resize_execution_metrics(
                 **{
                     "resize/host_stage_import_s": import_duration,
@@ -2133,27 +2276,34 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                     )
         elif actor_resume_kind == "handoff" and actor_resume_path is not None:
             logger.info("[one-step-off][resize][handoff] importing actor state into new actor")
-            import_started_at = time.monotonic()
-            try:
-                new_actor_wg.load_actor_handoff_state(actor_resume_path)
-            except Exception as exc:
-                self._update_resize_execution_metrics(
-                    **{
-                        "resize/restore_failed": 1.0,
-                        "resize/partial_restore_cleanup_count": 1.0,
-                    }
-                )
-                logger.exception(
-                    "[one-step-off][resize][handoff] restore failed: path=%s "
-                    "resize/restore_failed=1.0 resize/partial_restore_cleanup_count=1.0 error=%r",
-                    actor_resume_path,
-                    exc,
-                )
+            with resize_trace_span(
+                self._resize_trace_config,
+                "resize_import",
+                step=self._trace_step(),
+                lane="trainer_main",
+                metadata={"backend": "handoff"},
+            ):
+                import_started_at = time.monotonic()
                 try:
-                    new_actor_wg.cleanup_actor_handoff_restore_session(actor_resume_path)
-                finally:
-                    raise
-            import_duration = time.monotonic() - import_started_at
+                    new_actor_wg.load_actor_handoff_state(actor_resume_path)
+                except Exception as exc:
+                    self._update_resize_execution_metrics(
+                        **{
+                            "resize/restore_failed": 1.0,
+                            "resize/partial_restore_cleanup_count": 1.0,
+                        }
+                    )
+                    logger.exception(
+                        "[one-step-off][resize][handoff] restore failed: path=%s "
+                        "resize/restore_failed=1.0 resize/partial_restore_cleanup_count=1.0 error=%r",
+                        actor_resume_path,
+                        exc,
+                    )
+                    try:
+                        new_actor_wg.cleanup_actor_handoff_restore_session(actor_resume_path)
+                    finally:
+                        raise
+                import_duration = time.monotonic() - import_started_at
             self._update_resize_execution_metrics(**{"resize/host_stage_import_s": import_duration})
             if should_cleanup_actor_resume:
                 try:
@@ -2217,13 +2367,14 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         # flow: prewarm the inter-role communicator on the new worker lifecycle
         # before publishing the topology, so the final switch can use activate
         # instead of rebuilding the communicator in the critical window.
-        self._prepare_weight_sync_group(
-            new_actor_wg,
-            new_rollout_wg,
-            topology_key=self._candidate_topology_key(actor_spec=actor_spec, rollout_spec=rollout_spec),
-            actor_spec=actor_spec,
-            rollout_spec=rollout_spec,
-        )
+        if self._dynamic_resize_async_comm_prewarm_enabled:
+            self._prepare_weight_sync_group(
+                new_actor_wg,
+                new_rollout_wg,
+                topology_key=self._candidate_topology_key(actor_spec=actor_spec, rollout_spec=rollout_spec),
+                actor_spec=actor_spec,
+                rollout_spec=rollout_spec,
+            )
 
         # Publish the new pair together.
         self._switch_weight_sync_group(
@@ -2401,13 +2552,14 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         # Prewarm the inter-role communicator on the new worker lifecycle before
         # publishing the new topology. The final switch can then be reduced to a
         # lightweight activation step instead of an in-window rendezvous.
-        self._prepare_weight_sync_group(
-            new_actor_wg,
-            new_rollout_wg,
-            topology_key=self._candidate_topology_key(actor_spec=actor_spec, rollout_spec=rollout_spec),
-            actor_spec=actor_spec,
-            rollout_spec=rollout_spec,
-        )
+        if self._dynamic_resize_async_comm_prewarm_enabled:
+            self._prepare_weight_sync_group(
+                new_actor_wg,
+                new_rollout_wg,
+                topology_key=self._candidate_topology_key(actor_spec=actor_spec, rollout_spec=rollout_spec),
+                actor_spec=actor_spec,
+                rollout_spec=rollout_spec,
+            )
 
         # Phase 4: 发布新拓扑。
         # actor/rollout 必须作为一对同时对外可见，避免混合拓扑。
@@ -2466,8 +2618,15 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 "Please create actor/rollout as separate Ray Actors (no shared spawn/from_detached)."
             )
 
-        rollout_refs = self.rollout_wg.sync_rollout_weights()
-        actor_refs = self.actor_wg.sync_rollout_weights()
+        with resize_trace_span(
+            self._resize_trace_config,
+            "sync_rollout_weights",
+            step=self._trace_step(),
+            lane="trainer_main",
+            metadata={"actor_workers": len(actor_workers), "rollout_workers": len(rollout_workers)},
+        ):
+            rollout_refs = self.rollout_wg.sync_rollout_weights()
+            actor_refs = self.actor_wg.sync_rollout_weights()
         if rollout_refs is None and actor_refs is None:
             return
         refs = []
@@ -2524,7 +2683,14 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
         # async generation
         with marked_timer("generate_async", timing_raw, color="purple"):
-            gen_batch_output = await self.async_rollout_manager.generate_sequences_async(gen_batch_output)
+            with resize_trace_span(
+                self._resize_trace_config,
+                "generate_async_background",
+                step=self._trace_step(),
+                lane="trainer_async",
+                metadata={"batch_size": len(batch.batch)},
+            ):
+                gen_batch_output = await self.async_rollout_manager.generate_sequences_async(gen_batch_output)
 
         # repeat to align with repeated responses in rollout
         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
@@ -2683,11 +2849,18 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             with marked_timer("step", timing_raw):
                 # wait for the previous batch
                 with marked_timer("gen", timing_raw, color="red"):
-                    _metrics, _timing_raw, epoch, batch, future_reward = await batch_data_future
-                    timing_raw.update(batch.meta_info["timing"])
-                    timing_raw.update(_timing_raw)
-                    metrics.update(_metrics)
-                    batch.meta_info.pop("timing", None)
+                    with resize_trace_span(
+                        self._resize_trace_config,
+                        "generate_async_wait",
+                        step=self.global_steps,
+                        lane="trainer_main",
+                        metadata={},
+                    ):
+                        _metrics, _timing_raw, epoch, batch, future_reward = await batch_data_future
+                        timing_raw.update(batch.meta_info["timing"])
+                        timing_raw.update(_timing_raw)
+                        metrics.update(_metrics)
+                        batch.meta_info.pop("timing", None)
 
                 # sync weights from actor to rollout
                 with marked_timer("sync_rollout_weights", timing_raw, color="purple"):

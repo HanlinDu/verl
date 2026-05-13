@@ -56,6 +56,7 @@ from verl.experimental.one_step_off_policy.staging_backend import (
     update_restore_session_manifest,
     write_host_staging_manifest,
 )
+from verl.experimental.one_step_off_policy.trace_utils import build_resize_trace_config, resize_trace_span
 from verl.experimental.one_step_off_policy.worker_init_plan import WorkerCommInitPlan, build_worker_comm_init_plan
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
@@ -212,6 +213,7 @@ class LocalInitActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.config = config
         self.role = role
         self._dynamic_resize_enabled = bool(getattr(getattr(config, "dynamic_resize", None), "enable", False))
+        self._resize_trace_config = build_resize_trace_config(config)
 
         # 这些字段属于“安全基础成员”：
         # - 仅依赖 config/role 的静态判定
@@ -489,55 +491,93 @@ class LocalInitActorRolloutRefWorker(Worker, DistProfilerExtension):
         """
         if not self._dynamic_resize_enabled:
             logger.debug("[one-step-off][worker] prepare_worker_init skipped: dynamic_resize disabled, role=%s", self.role)
-            return None
+            return {"resize/prepare_worker_init_s": 0.0}
         if getattr(self, "_worker_init_prepared", False):
             logger.debug("[one-step-off][worker] prepare_worker_init skipped: already prepared, role=%s", self.role)
-            return None
-        self._worker_init_plan = self._prepare_local_init_worker_state(config=self.config, role=self.role)
+            return {"resize/prepare_worker_init_s": 0.0}
+        started_at = time.monotonic()
+        with resize_trace_span(
+            self._resize_trace_config,
+            "prepare_worker_init",
+            lane=f"{self.role}_rank{getattr(self, 'rank', 'na')}",
+            metadata={"role": self.role, "rank": getattr(self, "rank", None)},
+        ):
+            self._worker_init_plan = self._prepare_local_init_worker_state(config=self.config, role=self.role)
         self._worker_init_prepared = True
-        return None
+        return {"resize/prepare_worker_init_s": time.monotonic() - started_at}
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def commit_worker_init(self):
         """显式 worker-init commit 入口。"""
         if not self._dynamic_resize_enabled:
             logger.debug("[one-step-off][worker] commit_worker_init skipped: dynamic_resize disabled, role=%s", self.role)
-            return None
+            return {"resize/prepare_worker_init_s": 0.0, "resize/commit_worker_init_s": 0.0}
         if getattr(self, "_worker_init_committed", False):
             logger.debug("[one-step-off][worker] commit_worker_init skipped: already committed, role=%s", self.role)
-            return None
+            return {"resize/prepare_worker_init_s": 0.0, "resize/commit_worker_init_s": 0.0}
+        prepare_duration = 0.0
         if not getattr(self, "_worker_init_prepared", False):
             logger.debug("[one-step-off][worker] commit_worker_init auto prepare: role=%s", self.role)
-            self.prepare_worker_init()
-        self._commit_local_init_worker_state(self._worker_init_plan)
+            prepare_metrics = self.prepare_worker_init() or {}
+            prepare_duration = float(prepare_metrics.get("resize/prepare_worker_init_s", 0.0))
+        started_at = time.monotonic()
+        with resize_trace_span(
+            self._resize_trace_config,
+            "commit_worker_init",
+            lane=f"{self.role}_rank{getattr(self, 'rank', 'na')}",
+            metadata={"role": self.role, "rank": getattr(self, "rank", None)},
+        ):
+            self._commit_local_init_worker_state(self._worker_init_plan)
         self._worker_init_committed = True
-        return None
+        return {
+            "resize/prepare_worker_init_s": prepare_duration,
+            "resize/commit_worker_init_s": time.monotonic() - started_at,
+        }
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def prepare_model_init(self):
         """显式 model-init prepare 入口。"""
         if not self._dynamic_resize_enabled:
-            return None
+            return {"resize/prepare_model_init_s": 0.0}
         if getattr(self, "_model_init_prepared", False):
-            return None
-        self._model_init_plan = self._prepare_local_init_model()
+            return {"resize/prepare_model_init_s": 0.0}
+        started_at = time.monotonic()
+        with resize_trace_span(
+            self._resize_trace_config,
+            "prepare_model_init",
+            lane=f"{self.role}_rank{getattr(self, 'rank', 'na')}",
+            metadata={"role": self.role, "rank": getattr(self, "rank", None)},
+        ):
+            self._model_init_plan = self._prepare_local_init_model()
         self._model_init_prepared = True
-        return None
+        return {"resize/prepare_model_init_s": time.monotonic() - started_at}
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def commit_model_init(self):
         """显式 model-init commit 入口。"""
         if not self._dynamic_resize_enabled:
-            return None
+            return {"resize/prepare_model_init_s": 0.0, "resize/commit_model_init_s": 0.0}
         if getattr(self, "_model_init_committed", False):
-            return None
+            return {"resize/prepare_model_init_s": 0.0, "resize/commit_model_init_s": 0.0}
         if not getattr(self, "_worker_init_committed", False):
             self.commit_worker_init()
+        prepare_duration = 0.0
         if not getattr(self, "_model_init_prepared", False):
-            self.prepare_model_init()
-        self._commit_local_init_model(self._model_init_plan)
+            prepare_metrics = self.prepare_model_init() or {}
+            prepare_duration = float(prepare_metrics.get("resize/prepare_model_init_s", 0.0))
+        started_at = time.monotonic()
+        with resize_trace_span(
+            self._resize_trace_config,
+            "commit_model_init",
+            lane=f"{self.role}_rank{getattr(self, 'rank', 'na')}",
+            metadata={"role": self.role, "rank": getattr(self, "rank", None)},
+        ):
+            self._commit_local_init_model(self._model_init_plan)
         self._model_init_committed = True
-        return None
+        return {
+            "resize/prepare_model_init_s": prepare_duration,
+            "resize/commit_model_init_s": time.monotonic() - started_at,
+        }
 
     def _local_init_model(self):
         """dynamic_resize 模式下的本地化 init_model。
@@ -1642,13 +1682,19 @@ class DetachActorWorker(DetachSync):
         started_at = time.monotonic()
 
         try:
-            optim_state_dict, page_count = self._load_optimizer_state_from_handoff_path(
-                local_path,
-                progressive_swap=self._pending_optimizer_restore_progressive_swap,
-            )
-            StateDictOptions, _, set_optimizer_state_dict = _get_reshardable_optimizer_state_dict_api()
-            options = StateDictOptions(full_state_dict=True, cpu_offload=True, broadcast_from_rank0=True)
-            set_optimizer_state_dict(self.actor_module_fsdp, self.actor_optimizer, optim_state_dict, options=options)
+            with resize_trace_span(
+                self._resize_trace_config,
+                "optimizer_materialize",
+                lane=f"{self.role}_rank{getattr(self, 'rank', 'na')}",
+                metadata={"role": self.role, "rank": getattr(self, "rank", None)},
+            ):
+                optim_state_dict, page_count = self._load_optimizer_state_from_handoff_path(
+                    local_path,
+                    progressive_swap=self._pending_optimizer_restore_progressive_swap,
+                )
+                StateDictOptions, _, set_optimizer_state_dict = _get_reshardable_optimizer_state_dict_api()
+                options = StateDictOptions(full_state_dict=True, cpu_offload=True, broadcast_from_rank0=True)
+                set_optimizer_state_dict(self.actor_module_fsdp, self.actor_optimizer, optim_state_dict, options=options)
 
             applied_page_count = max(int(page_count), int(page_count_hint), 0)
             if self.rank == 0 and has_restore_session_manifest(local_path):
@@ -1915,13 +1961,19 @@ class DetachActorWorker(DetachSync):
             cfg.effective_backend(),
             local_path,
         )
-        if self.rank == 0:
-            write_host_staging_manifest(local_path, cfg)
-        torch.distributed.barrier()
-        if cfg.effective_backend() == "pinned_cpu":
-            self._export_actor_handoff_state_to_pinned_cpu(local_path, cfg)
-        else:
-            self._export_actor_handoff_state(local_path, stage_optimizer=cfg.stage_optimizer, chunk_mb=cfg.chunk_mb)
+        with resize_trace_span(
+            self._resize_trace_config,
+            "worker_resize_export",
+            lane=f"{self.role}_rank{getattr(self, 'rank', 'na')}",
+            metadata={"role": self.role, "rank": self.rank, "backend": cfg.effective_backend()},
+        ):
+            if self.rank == 0:
+                write_host_staging_manifest(local_path, cfg)
+            torch.distributed.barrier()
+            if cfg.effective_backend() == "pinned_cpu":
+                self._export_actor_handoff_state_to_pinned_cpu(local_path, cfg)
+            else:
+                self._export_actor_handoff_state(local_path, stage_optimizer=cfg.stage_optimizer, chunk_mb=cfg.chunk_mb)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_actor_handoff_state_from_host(self, local_path: str, staging_config: dict | None = None):
@@ -1935,16 +1987,22 @@ class DetachActorWorker(DetachSync):
         torch.distributed.broadcast_object_list(manifest_list, src=0)
         manifest = manifest_list[0] or {}
         cfg = HostStagingConfig.from_dict({**manifest, **(staging_config or {})})
-        self._restore_actor_handoff_state(
-            local_path,
-            load_optimizer=cfg.stage_optimizer,
-            optimizer_restore_policy=cfg.optimizer_restore_policy,
-            progressive_swap=cfg.progressive_swap,
-            chunk_mb=cfg.chunk_mb,
-            cleanup_after_load=cfg.cleanup_after_load,
-            backend=cfg.effective_backend(),
-            service_name=cfg.service_name,
-        )
+        with resize_trace_span(
+            self._resize_trace_config,
+            "worker_resize_import",
+            lane=f"{self.role}_rank{getattr(self, 'rank', 'na')}",
+            metadata={"role": self.role, "rank": self.rank, "backend": cfg.effective_backend()},
+        ):
+            self._restore_actor_handoff_state(
+                local_path,
+                load_optimizer=cfg.stage_optimizer,
+                optimizer_restore_policy=cfg.optimizer_restore_policy,
+                progressive_swap=cfg.progressive_swap,
+                chunk_mb=cfg.chunk_mb,
+                cleanup_after_load=cfg.cleanup_after_load,
+                backend=cfg.effective_backend(),
+                service_name=cfg.service_name,
+            )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def release_host_staging_buffer(self, local_path: str, staging_config: dict | None = None):

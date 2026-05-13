@@ -17,6 +17,11 @@ rollout:
 actor_rollout_ref:
   dynamic_resize:
     enable: ${trainer.dynamic_resize.enable}
+    trace:
+      enable: ${trainer.dynamic_resize.trace.enable}
+      path: ${trainer.dynamic_resize.trace.path}
+      run_name: ${trainer.dynamic_resize.trace.run_name}
+      flush: ${trainer.dynamic_resize.trace.flush}
   rollout:
     # Must be turned off! Otherwise, Parameter synchronization cannot be performed.
     free_cache_engine: False
@@ -34,6 +39,15 @@ trainer:
   dynamic_resize:
     enable: true
     mode: schedule
+    trace:
+      enable: false
+      path: ""
+      run_name: ""
+      flush: false
+    phased_init:
+      enable: true
+    async_comm_prewarm:
+      enable: true
     handoff:
       enable: true
       backend: disk_fallback
