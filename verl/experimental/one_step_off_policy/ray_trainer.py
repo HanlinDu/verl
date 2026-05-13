@@ -299,6 +299,41 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         cfg = OmegaConf.to_container(cfg, resolve=True)
         return ResizeBudgetConfig.from_dict(cfg.get("budget_protection", {}))
 
+    def _build_step_path_debug_metrics(self, timing_raw: dict[str, float]) -> dict[str, float | int]:
+        rollout_background_s = float(timing_raw.get("generate_async", 0.0) or 0.0)
+        rollout_wait_exposed_s = float(timing_raw.get("gen", 0.0) or 0.0)
+        sync_s = float(timing_raw.get("sync_rollout_weights", 0.0) or 0.0)
+        reward_s = float(timing_raw.get("reward", 0.0) or 0.0)
+        adv_s = float(timing_raw.get("adv", 0.0) or 0.0)
+        old_log_prob_s = float(timing_raw.get("old_log_prob", 0.0) or 0.0)
+        ref_s = float(timing_raw.get(str(Role.RefPolicy), 0.0) or 0.0)
+        values_s = float(timing_raw.get("values", 0.0) or 0.0)
+        update_actor_s = float(timing_raw.get("update_actor", 0.0) or 0.0)
+        update_critic_s = float(timing_raw.get("update_critic", 0.0) or 0.0)
+        step_s = float(timing_raw.get("step", 0.0) or 0.0)
+
+        train_update_s = update_actor_s + update_critic_s
+        train_post_wait_s = sync_s + reward_s + adv_s + old_log_prob_s + ref_s + values_s + train_update_s
+        rollout_hidden_by_overlap_s = max(rollout_background_s - rollout_wait_exposed_s, 0.0)
+        step_reconstructed_s = rollout_wait_exposed_s + train_post_wait_s
+
+        actor_world_size = len(getattr(getattr(self, "actor_wg", None), "workers", []) or [])
+        rollout_world_size = len(getattr(getattr(self, "rollout_wg", None), "workers", []) or [])
+        agent_loop_workers = len(getattr(getattr(self, "async_rollout_manager", None), "agent_loop_workers", []) or [])
+
+        return {
+            "debug/actor_world_size": actor_world_size,
+            "debug/rollout_world_size": rollout_world_size,
+            "debug/agent_loop_worker_count": agent_loop_workers,
+            "debug/timing_rollout_background_total_s": rollout_background_s,
+            "debug/timing_rollout_wait_exposed_s": rollout_wait_exposed_s,
+            "debug/timing_rollout_hidden_by_overlap_s": rollout_hidden_by_overlap_s,
+            "debug/timing_train_update_total_s": train_update_s,
+            "debug/timing_train_post_wait_total_s": train_post_wait_s,
+            "debug/timing_step_reconstructed_s": step_reconstructed_s,
+            "debug/timing_step_reconstruction_error_s": step_s - step_reconstructed_s,
+        }
+
     def _default_resize_control_metrics(self) -> dict[str, float | str | int]:
         enabled = 1.0 if self._resize_controller is not None else 0.0
         return {
@@ -3120,6 +3155,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             # collect metrics
             metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
             metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+            metrics.update(self._build_step_path_debug_metrics(timing_raw))
             # TODO: implement actual tflpo and theoretical tflpo
             n_gpus = self.resource_pool_manager.get_n_gpus()
             metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
