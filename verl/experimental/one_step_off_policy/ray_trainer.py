@@ -315,7 +315,12 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         train_update_s = update_actor_s + update_critic_s
         train_post_wait_s = sync_s + reward_s + adv_s + old_log_prob_s + ref_s + values_s + train_update_s
         rollout_hidden_by_overlap_s = max(rollout_background_s - rollout_wait_exposed_s, 0.0)
-        step_reconstructed_s = rollout_wait_exposed_s + train_post_wait_s
+
+        # For async off-policy execution, rollout and train happen on different ranks and
+        # overlap in wall-clock time. A per-step system time should therefore be compared
+        # against the longest rank path rather than a train+rollout sum.
+        step_driver_path_s = rollout_wait_exposed_s + train_post_wait_s
+        step_reconstructed_s = max(rollout_background_s, train_post_wait_s)
 
         actor_world_size = len(getattr(getattr(self, "actor_wg", None), "workers", []) or [])
         rollout_world_size = len(getattr(getattr(self, "rollout_wg", None), "workers", []) or [])
@@ -330,6 +335,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             "debug/timing_rollout_hidden_by_overlap_s": rollout_hidden_by_overlap_s,
             "debug/timing_train_update_total_s": train_update_s,
             "debug/timing_train_post_wait_total_s": train_post_wait_s,
+            "debug/timing_step_driver_path_s": step_driver_path_s,
             "debug/timing_step_reconstructed_s": step_reconstructed_s,
             "debug/timing_step_reconstruction_error_s": step_s - step_reconstructed_s,
         }

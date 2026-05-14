@@ -70,11 +70,13 @@ class OneStepOffAgentLoopManager(AgentLoopManager):
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
         )
+        worker_debugs = [output.meta_info.pop("worker_debug", {}) for output in outputs]
         output = DataProto.concat(outputs)
 
         # calculate performance metrics
         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
         timing = self._performance_metrics(metrics, output)
+        timing.update(self._aggregate_worker_debug_metrics(worker_debugs, batch_size=len(prompts)))
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
         return output

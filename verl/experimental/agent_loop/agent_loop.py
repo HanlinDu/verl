@@ -16,6 +16,7 @@ import heapq
 import logging
 import os
 import random
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from uuid import uuid4
@@ -72,6 +73,7 @@ class AsyncLLMServerManager:
         self.config = config
         self.server_handles = server_handles
         random.shuffle(self.server_handles)
+        self._server_index = {server: idx for idx, server in enumerate(self.server_handles)}
 
         # Least requests load balancing
         self.weighted_serveres = [[0, idx, server] for idx, server in enumerate(self.server_handles)]
@@ -80,16 +82,24 @@ class AsyncLLMServerManager:
         # LRU cache to map request_id to server
         self.request_id_to_server = LRUCache(maxsize=max_cache_size)
 
-    def _choose_server(self, request_id: str) -> ray.actor.ActorHandle:
+    def _peek_server_load(self, server: ray.actor.ActorHandle) -> int:
+        server_idx = self._server_index[server]
+        for load, idx, handle in self.weighted_serveres:
+            if idx == server_idx and handle == server:
+                return int(load)
+        return 0
+
+    def _choose_server(self, request_id: str) -> tuple[ray.actor.ActorHandle, int, int, bool]:
         # TODO: implement server pressure awareness load balancing
         if request_id in self.request_id_to_server:
-            return self.request_id_to_server[request_id]
+            server = self.request_id_to_server[request_id]
+            return server, self._server_index[server], self._peek_server_load(server), True
 
-        _, _, server = self.weighted_serveres[0]
+        load_before, idx, server = self.weighted_serveres[0]
         self.weighted_serveres[0][0] += 1
         heapq.heapreplace(self.weighted_serveres, self.weighted_serveres[0])
         self.request_id_to_server[request_id] = server
-        return server
+        return server, idx, int(load_before), False
 
     @rollout_trace_op
     async def generate(
@@ -111,13 +121,25 @@ class AsyncLLMServerManager:
         Returns:
             TokenOutput: token output
         """
-        server = self._choose_server(request_id)
+        server, server_idx, load_before, cache_hit = self._choose_server(request_id)
+        start_time = time.perf_counter()
         output = await server.generate.remote(
             request_id=uuid4().hex,  # use new request_id for each turn
             prompt_ids=prompt_ids,
             sampling_params=sampling_params,
             image_data=image_data,
             video_data=video_data,
+        )
+        elapsed_s = time.perf_counter() - start_time
+        output.debug_info.update(
+            {
+                "server_idx": int(server_idx),
+                "manager_request_s": float(elapsed_s),
+                "manager_server_load_before": float(load_before),
+                "manager_cache_hit": 1.0 if cache_hit else 0.0,
+                "prompt_tokens": float(len(prompt_ids)),
+                "response_tokens": float(len(output.token_ids)),
+            }
         )
         return output
 
@@ -477,9 +499,92 @@ class AgentLoopWorker:
             )
         outputs = await asyncio.gather(*tasks)
 
+        worker_debug = self._summarize_worker_debug(outputs, batch_size=len(batch))
         output = self._postprocess(outputs)
+        output.meta_info["worker_debug"] = worker_debug
 
         return output
+
+    def _summarize_worker_debug(self, outputs: list[_InternalAgentLoopOutput], *, batch_size: int) -> dict[str, float]:
+        server_indices = [
+            int(item.extra_fields["server_idx"])
+            for item in outputs
+            if item.extra_fields.get("server_idx") is not None
+        ]
+        request_s = [
+            float(item.extra_fields["manager_request_s"])
+            for item in outputs
+            if item.extra_fields.get("manager_request_s") is not None
+        ]
+        server_load_before = [
+            float(item.extra_fields["manager_server_load_before"])
+            for item in outputs
+            if item.extra_fields.get("manager_server_load_before") is not None
+        ]
+        prompt_tokens = [
+            float(item.extra_fields["prompt_tokens"])
+            for item in outputs
+            if item.extra_fields.get("prompt_tokens") is not None
+        ]
+        response_tokens = [
+            float(item.extra_fields["response_tokens"])
+            for item in outputs
+            if item.extra_fields.get("response_tokens") is not None
+        ]
+
+        summary: dict[str, float] = {
+            "request_count": float(len(outputs)),
+            "chunk_size": float(batch_size),
+            "server_count": float(len(getattr(self.server_manager, "server_handles", []) or [])),
+        }
+        if server_indices:
+            counts = np.bincount(server_indices, minlength=len(self.server_manager.server_handles))
+            used_servers = counts[counts > 0]
+            summary.update(
+                {
+                    "used_servers": float((counts > 0).sum()),
+                    "requests_per_server/max": float(counts.max()),
+                    "requests_per_server/min": float(used_servers.min()) if used_servers.size > 0 else 0.0,
+                    "requests_per_server/mean": float(counts.mean()),
+                    "requests_per_server/std": float(counts.std()),
+                }
+            )
+        if request_s:
+            request_s_arr = np.asarray(request_s, dtype=float)
+            summary.update(
+                {
+                    "request_s/max": float(request_s_arr.max()),
+                    "request_s/min": float(request_s_arr.min()),
+                    "request_s/mean": float(request_s_arr.mean()),
+                    "request_s/std": float(request_s_arr.std()),
+                }
+            )
+        if server_load_before:
+            load_arr = np.asarray(server_load_before, dtype=float)
+            summary.update(
+                {
+                    "server_load_before/max": float(load_arr.max()),
+                    "server_load_before/min": float(load_arr.min()),
+                    "server_load_before/mean": float(load_arr.mean()),
+                }
+            )
+        if prompt_tokens:
+            prompt_arr = np.asarray(prompt_tokens, dtype=float)
+            summary.update(
+                {
+                    "prompt_tokens/max": float(prompt_arr.max()),
+                    "prompt_tokens/mean": float(prompt_arr.mean()),
+                }
+            )
+        if response_tokens:
+            response_arr = np.asarray(response_tokens, dtype=float)
+            summary.update(
+                {
+                    "response_tokens/max": float(response_arr.max()),
+                    "response_tokens/mean": float(response_arr.mean()),
+                }
+            )
+        return summary
 
     async def _run_agent_loop(
         self,
@@ -1061,6 +1166,7 @@ class AgentLoopManager:
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
         )
+        worker_debugs = [output.meta_info.pop("worker_debug", {}) for output in outputs]
         output = DataProto.concat(outputs)
         # Fix for Issue #4147: Always call sleep() to ensure proper cleanup
         self.sleep()
@@ -1070,6 +1176,7 @@ class AgentLoopManager:
         # calculate performance metrics
         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
         timing = self._performance_metrics(metrics, output)
+        timing.update(self._aggregate_worker_debug_metrics(worker_debugs, batch_size=len(prompts)))
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
         return output
@@ -1093,6 +1200,44 @@ class AgentLoopManager:
         timing["agent_loop/slowest/tool_calls"] = t_tool_calls[slowest]
         timing["agent_loop/slowest/prompt_length"] = attention_mask[:prompt_length].sum().item()
         timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
+
+        return timing
+
+    def _aggregate_worker_debug_metrics(self, worker_debugs: list[dict[str, float]], batch_size: int) -> dict[str, float]:
+        timing: dict[str, float] = {
+            "agent_loop/dispatch/batch_size": float(batch_size),
+            "agent_loop/dispatch/num_workers": float(len(worker_debugs)),
+            "agent_loop/dispatch/server_count": float(len(getattr(self, "server_handles", []) or [])),
+        }
+        if not worker_debugs:
+            return timing
+
+        def _collect(key: str) -> np.ndarray:
+            values = [debug[key] for debug in worker_debugs if key in debug]
+            return np.asarray(values, dtype=float)
+
+        for key in [
+            "chunk_size",
+            "request_count",
+            "used_servers",
+            "requests_per_server/max",
+            "requests_per_server/min",
+            "requests_per_server/mean",
+            "request_s/max",
+            "request_s/mean",
+            "server_load_before/max",
+            "server_load_before/mean",
+            "prompt_tokens/mean",
+            "response_tokens/mean",
+        ]:
+            values = _collect(key)
+            if values.size == 0:
+                continue
+            metric_key = f"agent_loop/dispatch/{key}"
+            timing[f"{metric_key}/max"] = float(values.max())
+            timing[f"{metric_key}/min"] = float(values.min())
+            timing[f"{metric_key}/mean"] = float(values.mean())
+            timing[f"{metric_key}/std"] = float(values.std())
 
         return timing
 
