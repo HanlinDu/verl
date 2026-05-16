@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from typing import Any, Iterator
 
@@ -25,6 +26,9 @@ class HostStagingConfig:
     stage_optimizer: bool = True
     optimizer_restore_policy: str = "deferred"
     progressive_swap: bool = True
+    async_optimizer_preload: bool = True
+    preload_queue_depth: int = 2
+    device_preload_threshold: float = 0.9
     cleanup_after_load: bool = True
     preclear_rollout_kv_cache: bool = True
 
@@ -39,6 +43,9 @@ class HostStagingConfig:
             stage_optimizer=bool(cfg.get("stage_optimizer", True)),
             optimizer_restore_policy=_normalize_optimizer_restore_policy(cfg.get("optimizer_restore_policy", "deferred")),
             progressive_swap=bool(cfg.get("progressive_swap", True)),
+            async_optimizer_preload=bool(cfg.get("async_optimizer_preload", True)),
+            preload_queue_depth=max(int(cfg.get("preload_queue_depth", 2)), 1),
+            device_preload_threshold=min(max(float(cfg.get("device_preload_threshold", 0.9)), 0.0), 1.0),
             cleanup_after_load=bool(cfg.get("cleanup_after_load", True)),
             preclear_rollout_kv_cache=bool(cfg.get("preclear_rollout_kv_cache", True)),
         )
@@ -214,6 +221,34 @@ def read_paged_state_manifest(stage_dir: str, prefix: str) -> dict[str, Any]:
         return json.load(f)
 
 
+def probe_local_pin_memory_capability() -> tuple[bool, str]:
+    try:
+        sample = torch.empty(1, dtype=torch.uint8).pin_memory()
+        if not sample.is_pinned():
+            return False, "pin_memory() returned a non-pinned tensor"
+        return True, ""
+    except Exception as exc:  # pragma: no cover - depends on runtime environment
+        return False, repr(exc)
+
+
+def pin_memory_tree(value: Any) -> Any:
+    if torch.is_tensor(value):
+        cpu_tensor = value.detach().cpu()
+        return cpu_tensor if cpu_tensor.is_pinned() else cpu_tensor.pin_memory()
+    if isinstance(value, dict):
+        return {key: pin_memory_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [pin_memory_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(pin_memory_tree(item) for item in value)
+    return value
+
+
+def load_paged_state_page(stage_dir: str, file_name: str, *, pin_memory: bool = False) -> dict[str, Any]:
+    page = torch.load(os.path.join(stage_dir, file_name), weights_only=False)
+    return pin_memory_tree(page) if pin_memory else page
+
+
 def save_paged_state_dict(stage_dir: str, prefix: str, state_dict: dict[str, Any], page_bytes: int) -> dict[str, Any]:
     os.makedirs(stage_dir, exist_ok=True)
     target_bytes = max(int(page_bytes), 1)
@@ -316,10 +351,30 @@ def build_paged_optimizer_state_pages(
     return manifest, pages
 
 
-def iter_paged_state_dict(stage_dir: str, prefix: str) -> Iterator[dict[str, Any]]:
+def iter_paged_state_dict(
+    stage_dir: str,
+    prefix: str,
+    *,
+    pin_memory: bool = False,
+    prefetch: bool = False,
+) -> Iterator[dict[str, Any]]:
     manifest = read_paged_state_manifest(stage_dir, prefix)
-    for file_name in manifest.get("files", []):
-        yield torch.load(os.path.join(stage_dir, file_name), weights_only=False)
+    file_names = list(manifest.get("files", []))
+    if not file_names:
+        return
+
+    if pin_memory and prefetch:
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"{prefix}_page_prefetch") as executor:
+            next_future = executor.submit(load_paged_state_page, stage_dir, file_names[0], pin_memory=True)
+            for idx in range(len(file_names)):
+                page = next_future.result()
+                if idx + 1 < len(file_names):
+                    next_future = executor.submit(load_paged_state_page, stage_dir, file_names[idx + 1], pin_memory=True)
+                yield page
+        return
+
+    for file_name in file_names:
+        yield load_paged_state_page(stage_dir, file_name, pin_memory=pin_memory)
 
 
 def load_paged_optimizer_state_dict(stage_dir: str, prefix: str) -> dict[str, Any]:

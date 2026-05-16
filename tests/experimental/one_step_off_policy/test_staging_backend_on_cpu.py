@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import torch
 
 from verl.experimental.one_step_off_policy.staging_backend import (
@@ -10,6 +11,7 @@ from verl.experimental.one_step_off_policy.staging_backend import (
     has_restore_session_manifest,
     iter_paged_state_dict,
     load_paged_optimizer_state_dict,
+    probe_local_pin_memory_capability,
     read_host_staging_manifest,
     read_paged_state_manifest,
     read_restore_session_manifest,
@@ -31,6 +33,9 @@ def test_host_staging_manifest_roundtrip(tmp_path: Path):
             "stage_optimizer": False,
             "optimizer_restore_policy": "immediate",
             "progressive_swap": True,
+            "async_optimizer_preload": False,
+            "preload_queue_depth": 3,
+            "device_preload_threshold": 0.82,
             "cleanup_after_load": False,
             "preclear_rollout_kv_cache": True,
         }
@@ -45,6 +50,9 @@ def test_host_staging_manifest_roundtrip(tmp_path: Path):
     assert manifest["chunk_mb"] == 512
     assert manifest["stage_optimizer"] is False
     assert manifest["optimizer_restore_policy"] == "immediate"
+    assert manifest["async_optimizer_preload"] is False
+    assert manifest["preload_queue_depth"] == 3
+    assert manifest["device_preload_threshold"] == pytest.approx(0.82)
     assert manifest["cleanup_after_load"] is False
 
 
@@ -87,6 +95,29 @@ def test_paged_state_dict_roundtrip(tmp_path: Path):
 
     restored = {}
     for page in iter_paged_state_dict(str(tmp_path), "model_state"):
+        restored.update(page)
+
+    assert restored.keys() == state_dict.keys()
+    for key, value in restored.items():
+        assert torch.equal(value, state_dict[key])
+
+
+def test_paged_state_dict_can_be_read_back_as_local_pinned_pages(tmp_path: Path):
+    available, error = probe_local_pin_memory_capability()
+    if not available:
+        pytest.skip(f"pin_memory is unavailable in this test environment: {error}")
+
+    state_dict = {
+        "layer0.weight": torch.ones(256, dtype=torch.float32),
+        "layer1.weight": torch.ones(256, dtype=torch.float32) * 2,
+    }
+
+    save_paged_state_dict(str(tmp_path), "model_state", state_dict, page_bytes=1024)
+
+    restored = {}
+    for page in iter_paged_state_dict(str(tmp_path), "model_state", pin_memory=True, prefetch=True):
+        for value in page.values():
+            assert value.is_pinned()
         restored.update(page)
 
     assert restored.keys() == state_dict.keys()

@@ -45,7 +45,6 @@ from verl.experimental.one_step_off_policy.communicator_cache import (
     WeightSyncCommunicatorCache,
     build_topology_key,
 )
-from verl.experimental.one_step_off_policy.pinned_cpu_staging import get_or_create_pinned_cpu_staging_service
 from verl.experimental.one_step_off_policy.resize_budget import (
     ResizeBudgetConfig,
     ResizeBudgetController,
@@ -236,8 +235,6 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self._resize_budget_config = self._build_resize_budget_config()
         self._resize_budget_controller = ResizeBudgetController(self._resize_budget_config)
         self._latest_resize_budget_metrics: dict[str, float | str | int] = self._default_resize_budget_metrics()
-        self._pinned_cpu_staging_service_name = f"one_step_off_pinned_cpu_{uuid.uuid4().hex}"
-        self._pinned_cpu_staging_service = None
 
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
         if lora_rank <= 0:
@@ -486,18 +483,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
     def _make_runtime_handoff_staging_dict(self, *, effective_backend: str) -> dict[str, float | str | bool | int]:
         runtime_cfg = self._handoff_staging_config.to_manifest_dict()
         runtime_cfg["backend"] = effective_backend
-        if effective_backend == "pinned_cpu":
-            self._ensure_pinned_cpu_staging_service()
-            runtime_cfg["service_name"] = self._pinned_cpu_staging_service_name
         return runtime_cfg
-
-    def _ensure_pinned_cpu_staging_service(self):
-        """Create the pinned CPU staging service lazily on the driver."""
-        if self._pinned_cpu_staging_service is None:
-            self._pinned_cpu_staging_service = get_or_create_pinned_cpu_staging_service(
-                self._pinned_cpu_staging_service_name
-            )
-        return self._pinned_cpu_staging_service
 
     def _get_role_group_resource_snapshot(self, role: Role, role_wg: RayWorkerGroup, staging_path: str | None = None) -> ResizeBudgetSnapshot:
         # Query one representative worker before resize so the trainer can make
@@ -989,6 +975,10 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
     def _init_worker_groups(self):
         detached_cfg = self._get_detached_workers_cfg()
+        initial_pool_overrides = {
+            Role.Actor: self._resolve_initial_role_pool_override(Role.Actor),
+            Role.Rollout: self._resolve_initial_role_pool_override(Role.Rollout),
+        }
 
         # initialize WorkerGroup
         # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
@@ -1041,9 +1031,11 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             # That overlap will deadlock weight sync (broadcast) in detached / dynamic resize mode.
             for resource_pool, class_dict in self.resource_pool_to_cls.items():
                 for role_name, role_cls in class_dict.items():
+                    role = Role.from_string(role_name)
+                    role_resource_pool = initial_pool_overrides.get(role) or resource_pool
                     worker_dict_cls = create_colocated_worker_cls(class_dict={role_name: role_cls})
                     wg = self.ray_worker_group_cls(
-                        resource_pool=resource_pool,
+                        resource_pool=role_resource_pool,
                         ray_cls_with_init=worker_dict_cls,
                         **wg_kwargs,
                     )
@@ -1097,24 +1089,14 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
     def _initialize_active_topology_state(self) -> None:
         cfg = OmegaConf.select(self.config.trainer, "dynamic_resize")
-        schedule = []
         if cfg is not None:
             cfg = OmegaConf.to_container(cfg, resolve=True)
             if not cfg.get("enable", False):
                 self._active_role_world_sizes[Role.Actor] = self._pool_world_size_from_spec(Role.Actor, None)
                 self._active_role_world_sizes[Role.Rollout] = self._pool_world_size_from_spec(Role.Rollout, None)
                 return
-            schedule = cfg.get("schedule", []) or []
-            if isinstance(schedule, dict):
-                schedule = list(schedule.values())
 
-        initial_item = None
-        for item in schedule:
-            if not isinstance(item, dict):
-                continue
-            if item.get("step", 0) < 0 and item.get("actor_pool") and item.get("rollout_pool"):
-                initial_item = item
-                break
+        initial_item = self._get_initial_dynamic_resize_schedule_item()
 
         if initial_item is not None:
             actor_spec = initial_item.get("actor_pool")
@@ -1130,6 +1112,38 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self._active_topology_specs[Role.Rollout] = rollout_spec
         self._active_role_world_sizes[Role.Actor] = self._pool_world_size_from_spec(Role.Actor, actor_spec)
         self._active_role_world_sizes[Role.Rollout] = self._pool_world_size_from_spec(Role.Rollout, rollout_spec)
+
+    def _get_initial_dynamic_resize_schedule_item(self) -> dict | None:
+        cfg = OmegaConf.select(self.config.trainer, "dynamic_resize")
+        if cfg is None:
+            return None
+        cfg = OmegaConf.to_container(cfg, resolve=True)
+        if not cfg.get("enable", False):
+            return None
+
+        schedule = cfg.get("schedule", []) or []
+        if isinstance(schedule, dict):
+            schedule = list(schedule.values())
+
+        for item in schedule:
+            if not isinstance(item, dict):
+                continue
+            if item.get("step", 0) < 0 and item.get("actor_pool") and item.get("rollout_pool"):
+                return item
+        return None
+
+    def _resolve_initial_role_pool_override(self, role: Role):
+        if role not in {Role.Actor, Role.Rollout}:
+            return None
+
+        initial_item = self._get_initial_dynamic_resize_schedule_item()
+        if initial_item is None:
+            return None
+
+        pool_spec = initial_item.get("actor_pool") if role == Role.Actor else initial_item.get("rollout_pool")
+        if not pool_spec:
+            return None
+        return self._resolve_role_pool(role, pool_spec)
 
     def _build_role_group(
         self,
