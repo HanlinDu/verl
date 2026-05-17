@@ -23,6 +23,7 @@ import queue
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields
 from typing import Any
 
@@ -38,15 +39,20 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from verl import DataProto
 from verl.experimental.one_step_off_policy.distributed_utils import vllm_stateless_init_process_group
+from verl.experimental.one_step_off_policy.pinned_cpu_staging import get_or_create_pinned_cpu_staging_service
 from verl.experimental.one_step_off_policy.staging_backend import (
     HostStagingConfig,
     _estimate_object_bytes,
+    build_paged_optimizer_state_pages,
+    build_paged_state_pages,
     create_restore_session_manifest,
     finalize_restore_session_manifest,
     has_paged_state_dict,
     has_restore_session_manifest,
     iter_paged_state_dict,
     load_paged_optimizer_state_dict,
+    load_paged_state_page,
+    pin_memory_tree,
     probe_local_pin_memory_capability,
     record_restore_progress,
     read_host_staging_manifest,
@@ -56,6 +62,7 @@ from verl.experimental.one_step_off_policy.staging_backend import (
     read_paged_state_manifest,
     update_restore_session_manifest,
     write_host_staging_manifest,
+    write_paged_state_manifest,
 )
 from verl.experimental.one_step_off_policy.trace_utils import build_resize_trace_config, resize_trace_span
 from verl.experimental.one_step_off_policy.worker_init_plan import WorkerCommInitPlan, build_worker_comm_init_plan
@@ -182,31 +189,53 @@ def _move_tree_to_device(value: Any, *, device: torch.device | int | str, non_bl
     return value
 
 
+class _DevicePreloadStats:
+    def __init__(self, *, prefix: str):
+        self.prefix = prefix
+        self.attempted_pages = 0
+        self.preloaded_pages = 0
+        self.preloaded_bytes = 0
+        self.max_pending_pages = 0
+        self.max_pending_bytes = 0
+
+    def record_pending(self, pending_pages: int, pending_bytes: int) -> None:
+        self.max_pending_pages = max(self.max_pending_pages, int(pending_pages))
+        self.max_pending_bytes = max(self.max_pending_bytes, int(pending_bytes))
+
+    def as_metrics(self, metric_prefix: str) -> dict[str, float]:
+        return {
+            f"{metric_prefix}/{self.prefix}_device_preload_pages": float(self.preloaded_pages),
+            f"{metric_prefix}/{self.prefix}_device_preload_bytes": float(self.preloaded_bytes),
+            f"{metric_prefix}/{self.prefix}_device_preload_max_pending_pages": float(self.max_pending_pages),
+            f"{metric_prefix}/{self.prefix}_device_preload_max_pending_bytes": float(self.max_pending_bytes),
+        }
+
+
 def _try_preload_page_to_device(
     page: dict[str, Any],
     *,
     device_preload_threshold: float,
     preload_stream,
-) -> tuple[dict[str, Any], object | None]:
+) -> tuple[dict[str, Any], object | None, int]:
     if device_preload_threshold <= 0.0 or preload_stream is None:
-        return page, None
+        return page, None, 0
 
     free_bytes, total_bytes = _get_available_device_memory_bytes()
     if total_bytes is None:
-        return page, None
+        return page, None, 0
 
     threshold_bytes = int(total_bytes * device_preload_threshold)
     reserved_bytes = int(get_torch_device().memory_reserved())
     estimated_page_bytes = int(_estimate_object_bytes(page))
     if reserved_bytes + estimated_page_bytes > threshold_bytes:
-        return page, None
+        return page, None, 0
 
     preload_stream.wait_stream(get_torch_device().current_stream())
     with get_torch_device().stream(preload_stream):
         device_page = _move_tree_to_device(page, device=get_torch_device().current_device(), non_blocking=True)
         event = get_torch_device().Event()
         preload_stream.record_event(event)
-    return device_page, event
+    return device_page, event, estimated_page_bytes
 
 
 def _build_streaming_page_iterator(
@@ -215,28 +244,138 @@ def _build_streaming_page_iterator(
     *,
     device_preload_threshold: float,
     preload_queue_depth: int,
+    preload_stats: _DevicePreloadStats | None = None,
 ):
     page_iter = iter_paged_state_dict(local_path, prefix, pin_memory=True, prefetch=True)
-    pending_pages: deque[tuple[dict[str, Any], object | None]] = deque()
+    pending_pages: deque[tuple[dict[str, Any], object | None, int]] = deque()
     preload_stream = get_torch_device().Stream() if device_preload_threshold > 0.0 and torch.cuda.is_available() else None
 
+    def _record_pending() -> None:
+        if preload_stats is None:
+            return
+        preloaded = [item for item in pending_pages if item[2] > 0]
+        preload_stats.record_pending(len(preloaded), sum(item[2] for item in preloaded))
+
     def _fill_pending_pages() -> None:
-        while len(pending_pages) < max(int(preload_queue_depth), 1):
+        if pending_pages:
+            _record_pending()
+            return
+        queued_cpu_fallback = False
+        while True:
             try:
                 next_page = next(page_iter)
             except StopIteration:
+                _record_pending()
                 return
-            pending_pages.append(
-                _try_preload_page_to_device(
-                    next_page,
-                    device_preload_threshold=device_preload_threshold,
-                    preload_stream=preload_stream,
-                )
+            if preload_stats is not None:
+                preload_stats.attempted_pages += 1
+            page, ready_event, preloaded_bytes = _try_preload_page_to_device(
+                next_page,
+                device_preload_threshold=device_preload_threshold,
+                preload_stream=preload_stream,
             )
+            if preloaded_bytes > 0 and preload_stats is not None:
+                preload_stats.preloaded_pages += 1
+                preload_stats.preloaded_bytes += preloaded_bytes
+            pending_pages.append((page, ready_event, preloaded_bytes))
+            _record_pending()
+            if preloaded_bytes <= 0:
+                queued_cpu_fallback = True
+            if queued_cpu_fallback:
+                return
 
     _fill_pending_pages()
     while pending_pages:
-        page, ready_event = pending_pages.popleft()
+        page, ready_event, _ = pending_pages.popleft()
+        if ready_event is not None:
+            get_torch_device().current_stream().wait_event(ready_event)
+        yield page
+        _fill_pending_pages()
+
+
+def _pinned_service_page_prefix(prefix: str) -> str:
+    if prefix == "model_state":
+        return "model_page"
+    if prefix == "optim_state":
+        return "optim_page"
+    return f"{prefix}_page"
+
+
+def _load_hybrid_staged_page(local_path: str, prefix: str, page_meta: dict[str, Any], service, session_id: str | None):
+    storage = str(page_meta.get("storage", "disk"))
+    if storage == "host" and service is not None and session_id:
+        object_key = f"{_pinned_service_page_prefix(prefix)}:{int(page_meta.get('page_id', 0))}"
+        page = ray.get(service.get_object.remote(session_id, object_key))
+        return pin_memory_tree(page)
+    return load_paged_state_page(local_path, str(page_meta["file_name"]), pin_memory=True)
+
+
+def _iter_hybrid_staged_pages(local_path: str, prefix: str, manifest: dict[str, Any], service=None, session_id: str | None = None):
+    pages = list(manifest.get("pages", []))
+    if not pages:
+        return
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"{prefix}_hybrid_prefetch") as executor:
+        next_future = executor.submit(_load_hybrid_staged_page, local_path, prefix, pages[0], service, session_id)
+        for idx in range(len(pages)):
+            page = next_future.result()
+            if idx + 1 < len(pages):
+                next_future = executor.submit(_load_hybrid_staged_page, local_path, prefix, pages[idx + 1], service, session_id)
+            yield page
+
+
+def _build_hybrid_streaming_page_iterator(
+    local_path: str,
+    prefix: str,
+    *,
+    manifest: dict[str, Any],
+    service=None,
+    session_id: str | None = None,
+    device_preload_threshold: float,
+    preload_queue_depth: int,
+    preload_stats: _DevicePreloadStats | None = None,
+):
+    page_iter = _iter_hybrid_staged_pages(local_path, prefix, manifest, service=service, session_id=session_id)
+    pending_pages: deque[tuple[dict[str, Any], object | None, int]] = deque()
+    preload_stream = get_torch_device().Stream() if device_preload_threshold > 0.0 and torch.cuda.is_available() else None
+
+    def _record_pending() -> None:
+        if preload_stats is None:
+            return
+        preloaded = [item for item in pending_pages if item[2] > 0]
+        preload_stats.record_pending(len(preloaded), sum(item[2] for item in preloaded))
+
+    def _fill_pending_pages() -> None:
+        if pending_pages:
+            _record_pending()
+            return
+        queued_cpu_fallback = False
+        while True:
+            try:
+                next_page = next(page_iter)
+            except StopIteration:
+                _record_pending()
+                return
+            if preload_stats is not None:
+                preload_stats.attempted_pages += 1
+            page, ready_event, preloaded_bytes = _try_preload_page_to_device(
+                next_page,
+                device_preload_threshold=device_preload_threshold,
+                preload_stream=preload_stream,
+            )
+            if preloaded_bytes > 0 and preload_stats is not None:
+                preload_stats.preloaded_pages += 1
+                preload_stats.preloaded_bytes += preloaded_bytes
+            pending_pages.append((page, ready_event, preloaded_bytes))
+            _record_pending()
+            if preloaded_bytes <= 0:
+                queued_cpu_fallback = True
+            if queued_cpu_fallback:
+                return
+
+    _fill_pending_pages()
+    while pending_pages:
+        page, ready_event, _ = pending_pages.popleft()
         if ready_event is not None:
             get_torch_device().current_stream().wait_event(ready_event)
         yield page
@@ -936,6 +1075,37 @@ class DetachSync(LocalInitActorRolloutRefWorker, AsyncActorRolloutRefWorker):
             self._weight_sync_group_metadata = metadata
         return metadata
 
+    def _get_pinned_cpu_staging_service(self, service_name: str):
+        cache = getattr(self, "_pinned_cpu_staging_service_cache", None)
+        if cache is None:
+            cache = {}
+            self._pinned_cpu_staging_service_cache = cache
+        handle = cache.get(service_name)
+        if handle is None:
+            handle = get_or_create_pinned_cpu_staging_service(service_name)
+            cache[service_name] = handle
+        return handle
+
+    def _release_pinned_cpu_restore_session(self, local_path: str) -> bool:
+        if self.rank != 0 or not has_restore_session_manifest(local_path):
+            return False
+        session_manifest = read_restore_session_manifest(local_path)
+        service_name = session_manifest.get("service_name")
+        session_id = session_manifest.get("session_id")
+        if not service_name or not session_id:
+            return False
+        service = self._get_pinned_cpu_staging_service(str(service_name))
+        try:
+            return bool(ray.get(service.release_session.remote(str(session_id))))
+        except Exception as exc:  # pragma: no cover - best effort cleanup
+            logger.warning(
+                "[one-step-off][resize][host-stage] failed to release pinned_cpu session: service=%s session_id=%s error=%s",
+                service_name,
+                session_id,
+                exc,
+            )
+            return False
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_resize_resource_snapshot(self, staging_path: str | None = None):
         host_free_bytes = _get_available_host_memory_bytes()
@@ -1359,29 +1529,181 @@ class DetachActorWorker(DetachSync):
             offload_fsdp_optimizer(self.actor_optimizer)
 
     def _export_actor_handoff_state_to_pinned_cpu(self, local_path: str, cfg: HostStagingConfig) -> None:
-        """Stage handoff pages on local storage; pinned memory is applied only in the restore worker."""
+        """Stage handoff pages into pinned host memory first, spilling overflow to local storage."""
+        assert self._is_actor
         if int(cfg.chunk_mb or 0) <= 0:
-            raise ValueError("pinned_cpu staging requires chunk_mb > 0 so pages can be restored through local pinned buffers")
+            raise ValueError("pinned_cpu staging requires chunk_mb > 0 so pages can be restored through bounded buffers")
 
-        self._export_actor_handoff_state(
+        logger.info(
+            "[one-step-off][resize][host-stage] rank=%s export actor state to pinned host staging: path=%s service=%s",
+            self.rank,
             local_path,
-            stage_optimizer=cfg.stage_optimizer,
-            chunk_mb=cfg.chunk_mb,
-            backend="pinned_cpu",
-            optimizer_restore_policy=cfg.optimizer_restore_policy,
+            cfg.service_name,
         )
+
+        os.makedirs(local_path, exist_ok=True) if self.rank == 0 else None
+        torch.distributed.barrier()
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(self.actor_optimizer, device_id=get_torch_device().current_device())
+
+        _sanitize_optimizer_container_values(self.actor_optimizer)
+
+        logger.info("[one-step-off][resize][host-stage] rank=%s collecting full model state", self.rank)
+        model_state_dict = get_fsdp_full_state_dict(self.actor_module_fsdp, offload_to_cpu=True, rank0_only=True)
+
+        optim_state_dict = None
+        if cfg.stage_optimizer:
+            logger.info("[one-step-off][resize][host-stage] rank=%s collecting optimizer state", self.rank)
+            StateDictOptions, get_optimizer_state_dict, _ = _get_reshardable_optimizer_state_dict_api()
+            options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+            optim_state_dict = get_optimizer_state_dict(self.actor_module_fsdp, self.actor_optimizer, options=options)
+
+        export_error: str | None = None
         if self.rank == 0:
-            extra_state_path = os.path.join(local_path, "extra_state.pt")
-            extra_state = torch.load(extra_state_path, weights_only=False)
-            extra_state.update(
-                {
+            service = None
+            session_id: str | None = None
+            page_bytes = max(int(cfg.chunk_mb or 0), 1) * 1024 * 1024
+            host_free_bytes = _get_available_host_memory_bytes()
+            host_budget_bytes = int((host_free_bytes or 0) * cfg.host_preload_threshold)
+            host_used_bytes = 0
+
+            def _spill_page(prefix: str, page_meta: dict[str, Any], page: dict[str, Any]) -> None:
+                page_meta["storage"] = "disk"
+                torch.save(page, os.path.join(local_path, page_meta["file_name"]))
+
+            def _stage_pages(prefix: str, manifest: dict[str, Any], pages: list[dict[str, Any]]) -> dict[str, Any]:
+                nonlocal host_used_bytes
+                object_prefix = _pinned_service_page_prefix(prefix)
+                for page_meta, page in zip(manifest["pages"], pages, strict=True):
+                    page_bytes_est = int(page_meta.get("estimated_bytes") or _estimate_object_bytes(page))
+                    can_stage_host = service is not None and host_used_bytes + page_bytes_est <= host_budget_bytes
+                    if can_stage_host:
+                        try:
+                            ray.get(
+                                service.put_object.remote(
+                                    session_id,
+                                    f"{object_prefix}:{page_meta['page_id']}",
+                                    page,
+                                    pin_tensors=True,
+                                )
+                            )
+                            page_meta["storage"] = "host"
+                            host_used_bytes += page_bytes_est
+                            continue
+                        except Exception as exc:
+                            logger.warning(
+                                "[one-step-off][resize][host-stage] spill page after pinned put failure: "
+                                "prefix=%s page=%s error=%r",
+                                prefix,
+                                page_meta.get("page_id"),
+                                exc,
+                            )
+                    _spill_page(prefix, page_meta, page)
+                manifest["host_staged_bytes"] = sum(
+                    int(page.get("estimated_bytes", 0)) for page in manifest["pages"] if page.get("storage") == "host"
+                )
+                manifest["disk_staged_bytes"] = sum(
+                    int(page.get("estimated_bytes", 0)) for page in manifest["pages"] if page.get("storage") != "host"
+                )
+                write_paged_state_manifest(local_path, prefix, manifest)
+                if service is not None:
+                    ray.get(service.put_object.remote(session_id, f"{_pinned_service_page_prefix(prefix).replace('_page', '')}_manifest", manifest, pin_tensors=False))
+                return manifest
+
+            try:
+                model_manifest, model_pages = build_paged_state_pages(
+                    prefix="model_state",
+                    state_dict=model_state_dict,
+                    page_bytes=page_bytes,
+                )
+                optim_manifest = None
+                optim_pages: list[dict[str, Any]] = []
+                if cfg.stage_optimizer and optim_state_dict is not None:
+                    optim_manifest, optim_pages = build_paged_optimizer_state_pages(
+                        prefix="optim_state",
+                        optim_state_dict=optim_state_dict,
+                        page_bytes=page_bytes,
+                    )
+
+                session_manifest = create_restore_session_manifest(
+                    local_path,
+                    backend="pinned_cpu",
+                    optimizer_restore_policy=cfg.optimizer_restore_policy,
+                    model_manifest=model_manifest,
+                    optimizer_manifest=optim_manifest,
+                )
+                session_id = session_manifest["session_id"]
+                service_name = cfg.service_name or f"pinned_cpu_stage_{session_id}"
+                update_restore_session_manifest(local_path, service_name=service_name)
+
+                service = self._get_pinned_cpu_staging_service(service_name)
+                ray.get(
+                    service.create_session.remote(
+                        session_id,
+                        metadata={
+                            "path": local_path,
+                            "service_name": service_name,
+                            "host_budget_bytes": host_budget_bytes,
+                            "host_preload_threshold": cfg.host_preload_threshold,
+                        },
+                    )
+                )
+
+                model_manifest = _stage_pages("model_state", model_manifest, model_pages)
+                if optim_manifest is not None:
+                    optim_manifest = _stage_pages("optim_state", optim_manifest, optim_pages)
+
+                extra_state = {
+                    "lr_scheduler": self.actor_lr_scheduler.state_dict() if self.actor_lr_scheduler is not None else None,
+                    "rng": self.checkpoint_manager.get_rng_state() if self.checkpoint_manager is not None else None,
+                    "stage_optimizer": cfg.stage_optimizer,
+                    "paged_model_state": True,
+                    "paged_optim_state": bool(cfg.stage_optimizer),
+                    "backend": "pinned_cpu",
+                    "service_name": service_name,
                     "async_optimizer_preload": cfg.async_optimizer_preload,
                     "preload_queue_depth": cfg.preload_queue_depth,
+                    "host_preload_threshold": cfg.host_preload_threshold,
                     "device_preload_threshold": cfg.device_preload_threshold,
                 }
-            )
-            torch.save(extra_state, extra_state_path)
+                torch.save(extra_state, os.path.join(local_path, "extra_state.pt"))
+                ray.get(service.put_object.remote(session_id, "extra_state", extra_state, pin_tensors=False))
+
+                update_restore_session_manifest(
+                    local_path,
+                    staged_model_bytes=int(model_manifest.get("total_bytes", 0)),
+                    staged_optimizer_bytes=int((optim_manifest or {}).get("total_bytes", 0)),
+                )
+            except Exception as exc:
+                export_error = repr(exc)
+                logger.exception(
+                    "[one-step-off][resize][host-stage] rank=%s pinned_cpu export failed: path=%s error=%r",
+                    self.rank,
+                    local_path,
+                    exc,
+                )
+                if has_restore_session_manifest(local_path):
+                    update_restore_session_manifest(local_path, status="failed", last_error=repr(exc))
+                if service is not None and session_id is not None:
+                    try:
+                        ray.get(service.release_session.remote(session_id))
+                    except Exception:  # pragma: no cover - best effort cleanup
+                        pass
+
+        export_error_list = [export_error]
+        torch.distributed.broadcast_object_list(export_error_list, src=0)
+        if export_error_list[0]:
+            raise RuntimeError(f"pinned_cpu handoff export failed: {export_error_list[0]}")
+
         torch.distributed.barrier()
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(self.actor_optimizer)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_actor_handoff_state(self, local_path: str):
@@ -1447,17 +1769,37 @@ class DetachActorWorker(DetachSync):
         self,
         local_path: str,
         *,
+        service_name: str | None,
         cpu_offload,
         progressive_swap: bool,
         device_preload_threshold: float,
         preload_queue_depth: int,
     ) -> None:
-        """Load model pages through rank-local pinned buffers without any RPC hop."""
+        """Load model pages from pinned host service first, falling back to spilled disk pages."""
         StateDictOptions, set_model_state_dict = _get_reshardable_model_state_dict_api()
-        manifest = read_paged_state_manifest(local_path, "model_state") if self.rank == 0 else None
-        manifest_list = [manifest]
-        torch.distributed.broadcast_object_list(manifest_list, src=0)
-        manifest = manifest_list[0] or {}
+        service = None
+        session_id = None
+        if self.rank == 0:
+            session_manifest = read_restore_session_manifest(local_path) if has_restore_session_manifest(local_path) else {}
+            session_id = session_manifest.get("session_id")
+            service_name = service_name or session_manifest.get("service_name")
+            if service_name:
+                service = self._get_pinned_cpu_staging_service(str(service_name))
+                try:
+                    manifest = ray.get(service.get_object.remote(session_id, "model_manifest"))
+                except Exception:
+                    manifest = read_paged_state_manifest(local_path, "model_state")
+            else:
+                manifest = read_paged_state_manifest(local_path, "model_state")
+        else:
+            manifest = None
+        info_list = [{"manifest": manifest, "session_id": session_id, "service_name": service_name}]
+        torch.distributed.broadcast_object_list(info_list, src=0)
+        manifest = info_list[0]["manifest"] or {}
+        session_id = info_list[0]["session_id"]
+        service_name = info_list[0]["service_name"]
+        if self.rank == 0 and service is None and service_name:
+            service = self._get_pinned_cpu_staging_service(str(service_name))
 
         if self.rank == 0:
             _assert_rank0_local_pin_memory_available()
@@ -1472,12 +1814,17 @@ class DetachActorWorker(DetachSync):
             strict=False,
         )
 
+        preload_stats = _DevicePreloadStats(prefix="model") if self.rank == 0 else None
         page_iter = (
-            _build_streaming_page_iterator(
+            _build_hybrid_streaming_page_iterator(
                 local_path,
                 "model_state",
+                manifest=manifest,
+                service=service,
+                session_id=session_id,
                 device_preload_threshold=device_preload_threshold,
                 preload_queue_depth=preload_queue_depth,
+                preload_stats=preload_stats,
             )
             if self.rank == 0
             else None
@@ -1502,6 +1849,9 @@ class DetachActorWorker(DetachSync):
             model.to("cpu", non_blocking=True)
             for buf in model.buffers():
                 buf.data = buf.data.to(get_torch_device().current_device())
+
+        metrics = preload_stats.as_metrics("resize") if preload_stats is not None else {}
+        self._last_model_device_preload_metrics = metrics
 
     def _load_paged_actor_optimizer_state(self, local_path: str, *, progressive_swap: bool) -> tuple[dict, int]:
         manifest = read_paged_state_manifest(local_path, "optim_state") if self.rank == 0 else None
@@ -1529,6 +1879,7 @@ class DetachActorWorker(DetachSync):
         self,
         local_path: str,
         *,
+        service_name: str | None,
         progressive_swap: bool,
         device_preload_threshold: float,
         preload_queue_depth: int,
@@ -1536,23 +1887,42 @@ class DetachActorWorker(DetachSync):
     ) -> tuple[dict, int]:
         if self.rank == 0:
             _assert_rank0_local_pin_memory_available()
-            manifest = read_paged_state_manifest(local_path, "optim_state")
+            session_manifest = read_restore_session_manifest(local_path) if has_restore_session_manifest(local_path) else {}
+            session_id = session_manifest.get("session_id")
+            service_name = service_name or session_manifest.get("service_name")
+            service = self._get_pinned_cpu_staging_service(str(service_name)) if service_name else None
+            if service is not None and session_id:
+                try:
+                    manifest = ray.get(service.get_object.remote(session_id, "optim_manifest"))
+                except Exception:
+                    manifest = read_paged_state_manifest(local_path, "optim_state")
+            else:
+                manifest = read_paged_state_manifest(local_path, "optim_state")
             logger.info(
-                "[one-step-off][resize][host-stage] rank=%s pinned optimizer restore enabled: page_count=%s path=%s",
+                "[one-step-off][resize][host-stage] rank=%s pinned optimizer restore enabled: page_count=%s path=%s service=%s",
                 self.rank,
                 manifest.get("page_count", 0),
                 local_path,
+                service_name,
             )
             merged_state: dict[str, Any] = {}
             merged_param_groups: list[dict[str, Any]] | None = None
+            preload_stats = _DevicePreloadStats(prefix="optimizer")
             if consume_preloaded_pages and self._pending_optimizer_preload_session is not None:
                 page_iter = self._consume_pending_optimizer_preload_pages()
+                pending_stats = self._pending_optimizer_preload_session.get("stats")
+                if pending_stats is not None:
+                    preload_stats = pending_stats
             else:
-                page_iter = _build_streaming_page_iterator(
+                page_iter = _build_hybrid_streaming_page_iterator(
                     local_path,
                     "optim_state",
+                    manifest=manifest,
+                    service=service,
+                    session_id=session_id,
                     device_preload_threshold=device_preload_threshold,
                     preload_queue_depth=preload_queue_depth,
+                    preload_stats=preload_stats,
                 )
             for page in page_iter:
                 merged_state.update(page.get("state", {}))
@@ -1560,9 +1930,11 @@ class DetachActorWorker(DetachSync):
                     merged_param_groups = list(page.get("param_groups", []))
             optim_state_dict = {"state": merged_state, "param_groups": merged_param_groups or []}
             page_count = int(manifest.get("page_count", 0))
+            self._last_optimizer_device_preload_metrics = preload_stats.as_metrics("resize")
         else:
             optim_state_dict = {}
             page_count = 0
+            self._last_optimizer_device_preload_metrics = {}
 
         if progressive_swap:
             get_torch_device().empty_cache()
@@ -1632,15 +2004,31 @@ class DetachActorWorker(DetachSync):
             "error": None,
             "done": threading.Event(),
             "thread": None,
+            "stats": _DevicePreloadStats(prefix="optimizer"),
         }
 
         def _worker() -> None:
             try:
-                for page in _build_streaming_page_iterator(
+                session_manifest = read_restore_session_manifest(local_path) if has_restore_session_manifest(local_path) else {}
+                service_name = session_manifest.get("service_name")
+                session_id = session_manifest.get("session_id")
+                service = self._get_pinned_cpu_staging_service(str(service_name)) if service_name else None
+                if service is not None and session_id:
+                    try:
+                        manifest = ray.get(service.get_object.remote(session_id, "optim_manifest"))
+                    except Exception:
+                        manifest = read_paged_state_manifest(local_path, "optim_state")
+                else:
+                    manifest = read_paged_state_manifest(local_path, "optim_state")
+                for page in _build_hybrid_streaming_page_iterator(
                     local_path,
                     "optim_state",
+                    manifest=manifest,
+                    service=service,
+                    session_id=session_id,
                     device_preload_threshold=self._pending_optimizer_device_preload_threshold,
                     preload_queue_depth=self._pending_optimizer_preload_queue_depth,
+                    preload_stats=session["stats"],
                 ):
                     preload_queue.put(page)
             except Exception as exc:  # pragma: no cover - exercised in runtime
@@ -1738,12 +2126,9 @@ class DetachActorWorker(DetachSync):
         service_name = info_list[0]["service_name"]
 
         if backend == "pinned_cpu":
-            if service_name:
-                raise ValueError(
-                    "legacy pinned_cpu Ray-service manifests are no longer supported; please restage the handoff state"
-                )
             return self._load_pinned_actor_optimizer_state(
                 local_path,
+                service_name=service_name,
                 progressive_swap=progressive_swap,
                 device_preload_threshold=device_preload_threshold,
                 preload_queue_depth=preload_queue_depth,
@@ -1818,6 +2203,7 @@ class DetachActorWorker(DetachSync):
 
             cleanup_applied = 0.0
             if self._pending_optimizer_restore_cleanup_after_load and self.rank == 0:
+                self._release_pinned_cpu_restore_session(local_path)
                 try:
                     shutil.rmtree(local_path)
                     cleanup_applied = 1.0
@@ -1827,12 +2213,14 @@ class DetachActorWorker(DetachSync):
 
             self._pending_optimizer_restore_materialize_count += 1
             duration = time.monotonic() - started_at
+            optimizer_preload_metrics = getattr(self, "_last_optimizer_device_preload_metrics", {}) or {}
             self._clear_pending_optimizer_restore()
             return {
                 "resize/optimizer_materialize_s": duration,
                 "resize/optimizer_materialize_count": float(self._pending_optimizer_restore_materialize_count),
                 "resize/optimizer_pending_pages": float(applied_page_count),
                 "resize/host_stage_cleanup": cleanup_applied,
+                **optimizer_preload_metrics,
             }
         except Exception as exc:
             if self.rank == 0 and has_restore_session_manifest(local_path):
@@ -1872,6 +2260,7 @@ class DetachActorWorker(DetachSync):
         cfg_preload_queue_depth = 1
         cfg_device_preload_threshold = 0.0
         cfg_async_optimizer_preload = False
+        restore_metrics: dict[str, float] = {}
 
         if self.rank == 0 and has_restore_session_manifest(local_path):
             update_restore_session_manifest(
@@ -1895,10 +2284,7 @@ class DetachActorWorker(DetachSync):
                 paged_optim_state = bool(load_optimizer)
                 if self.rank == 0:
                     session_manifest = read_restore_session_manifest(local_path)
-                    if session_manifest.get("service_name"):
-                        raise ValueError(
-                            "legacy pinned_cpu Ray-service manifests are no longer supported; please restage the handoff state"
-                        )
+                    service_name = service_name or session_manifest.get("service_name")
                     extra_state = torch.load(os.path.join(local_path, "extra_state.pt"), weights_only=False)
                     cfg_preload_queue_depth = max(int(extra_state.get("preload_queue_depth", 2)), 1)
                     cfg_device_preload_threshold = min(max(float(extra_state.get("device_preload_threshold", 0.9)), 0.0), 1.0)
@@ -1940,10 +2326,12 @@ class DetachActorWorker(DetachSync):
                 if backend == "pinned_cpu":
                     optim_state_dict, paged_optimizer_page_count = self._load_pinned_actor_optimizer_state(
                         local_path,
+                        service_name=service_name,
                         progressive_swap=progressive_swap,
                         device_preload_threshold=cfg_device_preload_threshold,
                         preload_queue_depth=cfg_preload_queue_depth,
                     )
+                    restore_metrics.update(getattr(self, "_last_optimizer_device_preload_metrics", {}) or {})
                 else:
                     optim_state_dict, paged_optimizer_page_count = self._load_paged_actor_optimizer_state(
                         local_path,
@@ -1963,11 +2351,13 @@ class DetachActorWorker(DetachSync):
                 if backend == "pinned_cpu":
                     self._restore_pinned_actor_model_state(
                         local_path,
+                        service_name=service_name,
                         cpu_offload=cpu_offload,
                         progressive_swap=progressive_swap,
                         device_preload_threshold=cfg_device_preload_threshold,
                         preload_queue_depth=cfg_preload_queue_depth,
                     )
+                    restore_metrics.update(getattr(self, "_last_model_device_preload_metrics", {}) or {})
                 elif paged_model_state:
                     logger.info(
                         "[one-step-off][resize][handoff] rank=%s paged model restore enabled: page_count=%s",
@@ -2044,6 +2434,7 @@ class DetachActorWorker(DetachSync):
                 finalize_restore_session_manifest(local_path, status="completed")
 
             logger.info("[one-step-off][resize][handoff] rank=%s finished loading actor handoff state", self.rank)
+            return restore_metrics
         except Exception as exc:
             if self.rank == 0 and has_restore_session_manifest(local_path):
                 update_restore_session_manifest(
@@ -2102,7 +2493,7 @@ class DetachActorWorker(DetachSync):
             lane=f"{self.role}_rank{getattr(self, 'rank', 'na')}",
             metadata={"role": self.role, "rank": self.rank, "backend": cfg.effective_backend()},
         ):
-            self._restore_actor_handoff_state(
+            return self._restore_actor_handoff_state(
                 local_path,
                 load_optimizer=cfg.stage_optimizer,
                 optimizer_restore_policy=cfg.optimizer_restore_policy,
@@ -2112,6 +2503,11 @@ class DetachActorWorker(DetachSync):
                 backend=cfg.effective_backend(),
                 service_name=cfg.service_name,
             )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def materialize_pending_optimizer_restore(self):
+        assert self._is_actor
+        return self._ensure_optimizer_materialized_before_update()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def release_host_staging_buffer(self, local_path: str, staging_config: dict | None = None):
@@ -2124,11 +2520,13 @@ class DetachActorWorker(DetachSync):
             cfg.cleanup_after_load,
         )
         if cfg.effective_backend() == "pinned_cpu" and cfg.cleanup_after_load and not self._has_pending_optimizer_restore():
+            self._release_pinned_cpu_restore_session(local_path)
             torch.distributed.barrier()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def cleanup_actor_handoff_restore_session(self, local_path: str):
         if self.rank == 0 and has_restore_session_manifest(local_path):
+            self._release_pinned_cpu_restore_session(local_path)
             session_manifest = read_restore_session_manifest(local_path)
             update_restore_session_manifest(local_path, status="cleanup_partial_restore")
         gc.collect()

@@ -28,6 +28,7 @@ class HostStagingConfig:
     progressive_swap: bool = True
     async_optimizer_preload: bool = True
     preload_queue_depth: int = 2
+    host_preload_threshold: float = 0.85
     device_preload_threshold: float = 0.9
     cleanup_after_load: bool = True
     preclear_rollout_kv_cache: bool = True
@@ -45,6 +46,7 @@ class HostStagingConfig:
             progressive_swap=bool(cfg.get("progressive_swap", True)),
             async_optimizer_preload=bool(cfg.get("async_optimizer_preload", True)),
             preload_queue_depth=max(int(cfg.get("preload_queue_depth", 2)), 1),
+            host_preload_threshold=min(max(float(cfg.get("host_preload_threshold", 0.85)), 0.0), 1.0),
             device_preload_threshold=min(max(float(cfg.get("device_preload_threshold", 0.9)), 0.0), 1.0),
             cleanup_after_load=bool(cfg.get("cleanup_after_load", True)),
             preclear_rollout_kv_cache=bool(cfg.get("preclear_rollout_kv_cache", True)),
@@ -219,6 +221,13 @@ def has_paged_state_dict(stage_dir: str, prefix: str) -> bool:
 def read_paged_state_manifest(stage_dir: str, prefix: str) -> dict[str, Any]:
     with open(paged_state_manifest_path(stage_dir, prefix), encoding="utf-8") as f:
         return json.load(f)
+
+
+def write_paged_state_manifest(stage_dir: str, prefix: str, manifest: dict[str, Any]) -> dict[str, Any]:
+    os.makedirs(stage_dir, exist_ok=True)
+    with open(paged_state_manifest_path(stage_dir, prefix), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    return manifest
 
 
 def probe_local_pin_memory_capability() -> tuple[bool, str]:

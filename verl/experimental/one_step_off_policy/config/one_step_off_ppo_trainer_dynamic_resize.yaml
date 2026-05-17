@@ -57,6 +57,7 @@ trainer:
       progressive_swap: true
       async_optimizer_preload: true
       preload_queue_depth: 2
+      host_preload_threshold: 0.85
       device_preload_threshold: 0.9
       cleanup_after_load: true
       preclear_rollout_kv_cache: true

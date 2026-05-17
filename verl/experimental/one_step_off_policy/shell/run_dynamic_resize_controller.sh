@@ -38,6 +38,7 @@ HOST_STAGING_CHUNK_MB=${HOST_STAGING_CHUNK_MB:-256}
 HOST_STAGING_STAGE_OPTIMIZER=${HOST_STAGING_STAGE_OPTIMIZER:-true}
 HOST_STAGING_OPTIMIZER_RESTORE_POLICY=${HOST_STAGING_OPTIMIZER_RESTORE_POLICY:-deferred}
 HOST_STAGING_PROGRESSIVE_SWAP=${HOST_STAGING_PROGRESSIVE_SWAP:-true}
+HOST_STAGING_HOST_PRELOAD_THRESHOLD=${HOST_STAGING_HOST_PRELOAD_THRESHOLD:-0.85}
 HOST_STAGING_CLEANUP=${HOST_STAGING_CLEANUP:-true}
 HOST_STAGING_PRECLEAR_KV=${HOST_STAGING_PRECLEAR_KV:-true}
 COMM_CACHE_ENABLE=${COMM_CACHE_ENABLE:-false}
@@ -82,6 +83,7 @@ python3 -m verl.experimental.one_step_off_policy.main_ppo \
   trainer.dynamic_resize.handoff.stage_optimizer=${HOST_STAGING_STAGE_OPTIMIZER} \
   trainer.dynamic_resize.handoff.optimizer_restore_policy=${HOST_STAGING_OPTIMIZER_RESTORE_POLICY} \
   trainer.dynamic_resize.handoff.progressive_swap=${HOST_STAGING_PROGRESSIVE_SWAP} \
+  trainer.dynamic_resize.handoff.host_preload_threshold=${HOST_STAGING_HOST_PRELOAD_THRESHOLD} \
   trainer.dynamic_resize.handoff.cleanup_after_load=${HOST_STAGING_CLEANUP} \
   trainer.dynamic_resize.handoff.preclear_rollout_kv_cache=${HOST_STAGING_PRECLEAR_KV} \
   trainer.dynamic_resize.budget_protection.enable=${BUDGET_PROTECTION_ENABLE} \

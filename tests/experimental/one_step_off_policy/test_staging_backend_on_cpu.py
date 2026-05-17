@@ -35,6 +35,7 @@ def test_host_staging_manifest_roundtrip(tmp_path: Path):
             "progressive_swap": True,
             "async_optimizer_preload": False,
             "preload_queue_depth": 3,
+            "host_preload_threshold": 0.73,
             "device_preload_threshold": 0.82,
             "cleanup_after_load": False,
             "preclear_rollout_kv_cache": True,
@@ -52,6 +53,7 @@ def test_host_staging_manifest_roundtrip(tmp_path: Path):
     assert manifest["optimizer_restore_policy"] == "immediate"
     assert manifest["async_optimizer_preload"] is False
     assert manifest["preload_queue_depth"] == 3
+    assert manifest["host_preload_threshold"] == pytest.approx(0.73)
     assert manifest["device_preload_threshold"] == pytest.approx(0.82)
     assert manifest["cleanup_after_load"] is False
 

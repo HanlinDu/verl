@@ -15,6 +15,9 @@ import ray
 import torch
 
 
+PINNED_CPU_STAGING_NAMESPACE = "verl_pinned_cpu_staging"
+
+
 def _pin_object(value: Any) -> Any:
     if torch.is_tensor(value):
         cpu_tensor = value.detach().cpu()
@@ -157,9 +160,11 @@ def get_or_create_pinned_cpu_staging_service(service_name: str):
     """Return a named staging service actor, creating it on first use."""
 
     try:
-        return ray.get_actor(service_name)
+        return ray.get_actor(service_name, namespace=PINNED_CPU_STAGING_NAMESPACE)
     except ValueError:
         return PinnedCPUStagingService.options(
             name=service_name,
+            namespace=PINNED_CPU_STAGING_NAMESPACE,
+            lifetime="detached",
             runtime_env=_build_pinned_cpu_service_runtime_env(),
         ).remote()

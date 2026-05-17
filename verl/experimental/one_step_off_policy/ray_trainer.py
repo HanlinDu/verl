@@ -363,6 +363,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             "resize/host_stage_requested_backend": self._handoff_staging_config.backend,
             "resize/host_stage_export_s": 0.0,
             "resize/host_stage_import_s": 0.0,
+            "resize/host_stage_import_wait_s": 0.0,
             "resize/progressive_swap_s": 0.0,
             "resize/kv_cache_preclear_s": 0.0,
             "resize/host_stage_cleanup": 0.0,
@@ -370,6 +371,14 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             "resize/optimizer_pending_pages": 0.0,
             "resize/optimizer_materialize_s": 0.0,
             "resize/optimizer_materialize_count": 0.0,
+            "resize/model_device_preload_pages": 0.0,
+            "resize/model_device_preload_bytes": 0.0,
+            "resize/model_device_preload_max_pending_pages": 0.0,
+            "resize/model_device_preload_max_pending_bytes": 0.0,
+            "resize/optimizer_device_preload_pages": 0.0,
+            "resize/optimizer_device_preload_bytes": 0.0,
+            "resize/optimizer_device_preload_max_pending_pages": 0.0,
+            "resize/optimizer_device_preload_max_pending_bytes": 0.0,
             "resize/actor_prepare_worker_init_s": 0.0,
             "resize/actor_commit_worker_init_s": 0.0,
             "resize/actor_prepare_model_init_s": 0.0,
@@ -431,6 +440,96 @@ class OneStepOffRayTrainer(RayPPOTrainer):
     def _update_resize_budget_metrics(self, **kwargs) -> dict[str, float | str | int]:
         self._latest_resize_budget_metrics.update(kwargs)
         return dict(self._latest_resize_budget_metrics)
+
+    def _start_deferred_optimizer_materialize(self, actor_wg: RayWorkerGroup) -> None:
+        if getattr(self, "_pending_optimizer_materialize_refs", None):
+            return
+        try:
+            self._pending_optimizer_materialize_refs = actor_wg.execute_all_async(f"{str(Role.Actor)}_materialize_pending_optimizer_restore")
+            logger.info("[one-step-off][resize][host-stage] started async optimizer materialize on new actor group")
+        except Exception as exc:  # pragma: no cover - runtime safety
+            self._pending_optimizer_materialize_refs = None
+            logger.warning("[one-step-off][resize][host-stage] failed to start async optimizer materialize: %r", exc)
+
+    def _collect_deferred_optimizer_materialize_metrics(self, *, block: bool = False) -> dict[str, float | int]:
+        refs = getattr(self, "_pending_optimizer_materialize_refs", None)
+        if not refs:
+            return {}
+        timeout = None if block else 0
+        ready, remaining = ray.wait(refs, num_returns=len(refs), timeout=timeout)
+        if remaining:
+            return {}
+        self._pending_optimizer_materialize_refs = None
+        results = ray.get(ready)
+        merged: dict[str, float | int] = {}
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            for key, value in item.items():
+                if isinstance(value, (int, float)):
+                    merged[key] = max(float(merged.get(key, 0.0)), float(value))
+        return merged
+
+    @staticmethod
+    def _merge_resize_numeric_metrics(results) -> dict[str, float]:
+        merged: dict[str, float] = {}
+        for item in results or []:
+            if not isinstance(item, dict):
+                continue
+            for key, value in item.items():
+                if key.startswith("resize/") and isinstance(value, (int, float)):
+                    merged[key] = max(float(merged.get(key, 0.0)), float(value))
+        return merged
+
+    def _start_async_actor_host_restore(self, actor_wg: RayWorkerGroup, actor_resume_path: str, runtime_staging_cfg: dict):
+        refs = actor_wg.execute_all_async(
+            f"{str(Role.Actor)}_load_actor_handoff_state_from_host",
+            actor_resume_path,
+            staging_config=runtime_staging_cfg,
+        )
+        return {"refs": refs, "started_at": time.monotonic()}
+
+    def _finish_async_actor_host_restore(
+        self,
+        restore_task,
+        *,
+        actor_wg: RayWorkerGroup,
+        actor_resume_path: str,
+        runtime_staging_cfg: dict,
+    ) -> dict[str, float]:
+        if restore_task is None:
+            return {}
+        wait_started_at = time.monotonic()
+        try:
+            restore_results = ray.get(restore_task["refs"])
+        except Exception as exc:
+            self._update_resize_execution_metrics(
+                **{
+                    "resize/restore_failed": 1.0,
+                    "resize/partial_restore_cleanup_count": 1.0,
+                }
+            )
+            logger.exception(
+                "[one-step-off][resize][host-stage] async restore failed: path=%s "
+                "resize/restore_failed=1.0 resize/partial_restore_cleanup_count=1.0 error=%r",
+                actor_resume_path,
+                exc,
+            )
+            try:
+                actor_wg.cleanup_actor_handoff_restore_session(actor_resume_path)
+            finally:
+                raise
+        wait_duration = time.monotonic() - wait_started_at
+        import_duration = time.monotonic() - float(restore_task["started_at"])
+        restore_preload_metrics = self._merge_resize_numeric_metrics(restore_results)
+        metrics = {
+            "resize/host_stage_import_s": import_duration,
+            "resize/host_stage_import_wait_s": wait_duration,
+            "resize/progressive_swap_s": import_duration if runtime_staging_cfg.get("progressive_swap", False) else 0.0,
+            **restore_preload_metrics,
+        }
+        self._update_resize_execution_metrics(**metrics)
+        return metrics
 
     @staticmethod
     def _extract_max_metric_value(results, key: str) -> float:
@@ -2262,73 +2361,24 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             and str(runtime_staging_cfg.get("optimizer_restore_policy", "deferred")) == "deferred"
         )
 
-        # Phase B: restore actor state only after the new actor has finished its
-        # minimal worker/model initialization. This keeps the resize window short
-        # and makes the host-staging timing visible in metrics.
+        # Phase B: start actor state restore as soon as the new actor exists, but
+        # do not block the driver here. Rollout construction can overlap the H2D
+        # stream; the driver waits only before it needs restored actor weights.
+        actor_restore_task = None
         if actor_resume_kind == "host_staging" and actor_resume_path is not None:
-            logger.info("[one-step-off][resize][host-stage] importing actor state into new actor")
+            logger.info("[one-step-off][resize][host-stage] starting async actor state import into new actor")
             with resize_trace_span(
                 self._resize_trace_config,
-                "resize_import",
+                "resize_import_launch",
                 step=self._trace_step(),
                 lane="trainer_main",
                 metadata={"backend": runtime_staging_cfg.get("backend", "disk_fallback")},
             ):
-                import_started_at = time.monotonic()
-                try:
-                    new_actor_wg.load_actor_handoff_state_from_host(
-                        actor_resume_path,
-                        staging_config=runtime_staging_cfg,
-                    )
-                except Exception as exc:
-                    self._update_resize_execution_metrics(
-                        **{
-                            "resize/restore_failed": 1.0,
-                            "resize/partial_restore_cleanup_count": 1.0,
-                        }
-                    )
-                    logger.exception(
-                        "[one-step-off][resize][host-stage] restore failed: path=%s "
-                        "resize/restore_failed=1.0 resize/partial_restore_cleanup_count=1.0 error=%r",
-                        actor_resume_path,
-                        exc,
-                    )
-                    try:
-                        new_actor_wg.cleanup_actor_handoff_restore_session(actor_resume_path)
-                    finally:
-                        raise
-                import_duration = time.monotonic() - import_started_at
-            self._update_resize_execution_metrics(
-                **{
-                    "resize/host_stage_import_s": import_duration,
-                    "resize/progressive_swap_s": import_duration if runtime_staging_cfg.get("progressive_swap", False) else 0.0,
-                }
-            )
-            if defer_optimizer_restore and has_restore_session_manifest(actor_resume_path):
-                session_manifest = read_restore_session_manifest(actor_resume_path)
-                self._update_resize_execution_metrics(
-                    **{
-                        "resize/optimizer_deferred_restore": 1.0,
-                        "resize/optimizer_pending_pages": float(session_manifest.get("optimizer_page_count", 0)),
-                    }
+                actor_restore_task = self._start_async_actor_host_restore(
+                    new_actor_wg,
+                    actor_resume_path,
+                    runtime_staging_cfg,
                 )
-            new_actor_wg.release_host_staging_buffer(
-                actor_resume_path,
-                staging_config=runtime_staging_cfg,
-            )
-            if should_cleanup_actor_resume and not defer_optimizer_restore:
-                try:
-                    shutil.rmtree(actor_resume_path)
-                    self._update_resize_execution_metrics(**{"resize/host_stage_cleanup": 1.0})
-                    logger.info("[one-step-off][resize][host-stage] cleaned temporary actor handoff dir: %s", actor_resume_path)
-                except FileNotFoundError:
-                    pass
-                except Exception as exc:  # pragma: no cover - best effort cleanup
-                    logger.warning(
-                        "[one-step-off][resize][host-stage] failed to remove temporary handoff %s: %s",
-                        actor_resume_path,
-                        exc,
-                    )
         elif actor_resume_kind == "handoff" and actor_resume_path is not None:
             logger.info("[one-step-off][resize][handoff] importing actor state into new actor")
             with resize_trace_span(
@@ -2415,6 +2465,47 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         )
         await self._commit_role_group_init_async(new_rollout_wg, role=Role.Rollout)
 
+        if actor_restore_task is not None:
+            logger.info("[one-step-off][resize][host-stage] waiting for async actor import before reading weights")
+            with resize_trace_span(
+                self._resize_trace_config,
+                "resize_import_wait",
+                step=self._trace_step(),
+                lane="trainer_main",
+                metadata={"backend": runtime_staging_cfg.get("backend", "disk_fallback")},
+            ):
+                self._finish_async_actor_host_restore(
+                    actor_restore_task,
+                    actor_wg=new_actor_wg,
+                    actor_resume_path=actor_resume_path,
+                    runtime_staging_cfg=runtime_staging_cfg,
+                )
+            if defer_optimizer_restore and has_restore_session_manifest(actor_resume_path):
+                session_manifest = read_restore_session_manifest(actor_resume_path)
+                self._update_resize_execution_metrics(
+                    **{
+                        "resize/optimizer_deferred_restore": 1.0,
+                        "resize/optimizer_pending_pages": float(session_manifest.get("optimizer_page_count", 0)),
+                    }
+                )
+            new_actor_wg.release_host_staging_buffer(
+                actor_resume_path,
+                staging_config=runtime_staging_cfg,
+            )
+            if should_cleanup_actor_resume and not defer_optimizer_restore:
+                try:
+                    shutil.rmtree(actor_resume_path)
+                    self._update_resize_execution_metrics(**{"resize/host_stage_cleanup": 1.0})
+                    logger.info("[one-step-off][resize][host-stage] cleaned temporary actor handoff dir: %s", actor_resume_path)
+                except FileNotFoundError:
+                    pass
+                except Exception as exc:  # pragma: no cover - best effort cleanup
+                    logger.warning(
+                        "[one-step-off][resize][host-stage] failed to remove temporary handoff %s: %s",
+                        actor_resume_path,
+                        exc,
+                    )
+
         weights_info = self._get_actor_weights_info(new_actor_wg)[0]
         self._set_actor_weights_info(new_rollout_wg, weights_info)
 
@@ -2439,6 +2530,8 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             rollout_spec=rollout_spec,
         )
         self._publish_active_topology_state(actor_spec=actor_spec, rollout_spec=rollout_spec)
+        if defer_optimizer_restore:
+            self._start_deferred_optimizer_materialize(new_actor_wg)
 
         await self._shutdown_async_rollout_manager_async()
         await self._init_async_rollout_manager_async()
@@ -3089,6 +3182,10 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                     }
                     if resize_execution_actor_metrics:
                         self._update_resize_execution_metrics(**resize_execution_actor_metrics)
+                    async_optimizer_metrics = self._collect_deferred_optimizer_materialize_metrics(block=False)
+                    if async_optimizer_metrics:
+                        self._update_resize_execution_metrics(**async_optimizer_metrics)
+                        metrics.update(async_optimizer_metrics)
                     metrics.update(actor_output_metrics)
                 await asyncio.sleep(0)
 
