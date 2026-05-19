@@ -27,6 +27,7 @@ class HostStagingConfig:
     optimizer_restore_policy: str = "deferred"
     progressive_swap: bool = True
     async_optimizer_preload: bool = True
+    optimizer_full_state_restore: bool = True
     preload_queue_depth: int = 2
     host_preload_threshold: float = 0.85
     device_preload_threshold: float = 0.9
@@ -45,6 +46,7 @@ class HostStagingConfig:
             optimizer_restore_policy=_normalize_optimizer_restore_policy(cfg.get("optimizer_restore_policy", "deferred")),
             progressive_swap=bool(cfg.get("progressive_swap", True)),
             async_optimizer_preload=bool(cfg.get("async_optimizer_preload", True)),
+            optimizer_full_state_restore=bool(cfg.get("optimizer_full_state_restore", True)),
             preload_queue_depth=max(int(cfg.get("preload_queue_depth", 2)), 1),
             host_preload_threshold=min(max(float(cfg.get("host_preload_threshold", 0.85)), 0.0), 1.0),
             device_preload_threshold=min(max(float(cfg.get("device_preload_threshold", 0.9)), 0.0), 1.0),

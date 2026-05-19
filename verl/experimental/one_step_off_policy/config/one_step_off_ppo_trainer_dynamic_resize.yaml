@@ -56,6 +56,7 @@ trainer:
       optimizer_restore_policy: deferred
       progressive_swap: true
       async_optimizer_preload: true
+      optimizer_full_state_restore: true
       preload_queue_depth: 2
       host_preload_threshold: 0.85
       device_preload_threshold: 0.9

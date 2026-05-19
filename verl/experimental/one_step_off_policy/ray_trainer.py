@@ -362,15 +362,51 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             "resize/host_stage_backend": self._handoff_staging_config.effective_backend(),
             "resize/host_stage_requested_backend": self._handoff_staging_config.backend,
             "resize/host_stage_export_s": 0.0,
+            "resize/host_stage_export_initial_barrier_s": 0.0,
+            "resize/host_stage_export_load_model_to_gpu_s": 0.0,
+            "resize/host_stage_export_load_optimizer_to_gpu_s": 0.0,
+            "resize/host_stage_export_sanitize_optimizer_s": 0.0,
+            "resize/host_stage_export_model_state_dict_s": 0.0,
+            "resize/host_stage_export_optimizer_state_dict_s": 0.0,
+            "resize/host_stage_export_build_model_pages_s": 0.0,
+            "resize/host_stage_export_build_optimizer_pages_s": 0.0,
+            "resize/host_stage_export_create_session_s": 0.0,
+            "resize/host_stage_export_stage_model_pages_s": 0.0,
+            "resize/host_stage_export_stage_optimizer_pages_s": 0.0,
+            "resize/host_stage_export_host_put_s": 0.0,
+            "resize/host_stage_export_host_file_write_s": 0.0,
+            "resize/host_stage_export_disk_spill_s": 0.0,
+            "resize/host_stage_export_extra_state_s": 0.0,
+            "resize/host_stage_export_manifest_update_s": 0.0,
+            "resize/host_stage_export_final_barrier_s": 0.0,
+            "resize/host_stage_export_offload_s": 0.0,
+            "resize/host_stage_export_model_page_count": 0.0,
+            "resize/host_stage_export_optimizer_page_count": 0.0,
+            "resize/host_stage_export_model_state_host_pages": 0.0,
+            "resize/host_stage_export_model_state_disk_pages": 0.0,
+            "resize/host_stage_export_model_state_host_bytes": 0.0,
+            "resize/host_stage_export_model_state_disk_bytes": 0.0,
+            "resize/host_stage_export_optim_state_host_pages": 0.0,
+            "resize/host_stage_export_optim_state_disk_pages": 0.0,
+            "resize/host_stage_export_optim_state_host_bytes": 0.0,
+            "resize/host_stage_export_optim_state_disk_bytes": 0.0,
             "resize/host_stage_import_s": 0.0,
             "resize/host_stage_import_wait_s": 0.0,
+            "resize/post_switch_weight_sync_s": 0.0,
+            "resize/post_switch_kv_clear_s": 0.0,
             "resize/progressive_swap_s": 0.0,
             "resize/kv_cache_preclear_s": 0.0,
             "resize/host_stage_cleanup": 0.0,
             "resize/optimizer_deferred_restore": 0.0,
             "resize/optimizer_pending_pages": 0.0,
             "resize/optimizer_materialize_s": 0.0,
+            "resize/optimizer_load_pages_s": 0.0,
+            "resize/optimizer_set_state_dict_s": 0.0,
+            "resize/optimizer_streaming_restore": 0.0,
+            "resize/optimizer_streamed_pages": 0.0,
+            "resize/optimizer_full_state_restore": 0.0,
             "resize/optimizer_materialize_count": 0.0,
+            "resize/model_restore_device_sync_s": 0.0,
             "resize/model_device_preload_pages": 0.0,
             "resize/model_device_preload_bytes": 0.0,
             "resize/model_device_preload_max_pending_pages": 0.0,
@@ -402,6 +438,11 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             "resize/comm_registry_miss": 0.0,
             "resize/comm_prewarm_ready": 0.0,
             "resize/comm_prewarm_create_s": 0.0,
+            "resize/comm_prewarm_warmup_s": 0.0,
+            "resize/comm_prewarm_warmup_broadcast_s_max": 0.0,
+            "resize/comm_prewarm_warmup_broadcast_s_mean": 0.0,
+            "resize/comm_prewarm_warmup_total_s_max": 0.0,
+            "resize/comm_prewarm_warmup_total_s_mean": 0.0,
             "resize/comm_activate_s": 0.0,
             "resize/comm_full_build_s": 0.0,
             "resize/comm_prepare_path": "",
@@ -488,6 +529,28 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             staging_config=runtime_staging_cfg,
         )
         return {"refs": refs, "started_at": time.monotonic()}
+
+    def _start_async_actor_optimizer_host_export(
+        self, actor_wg: RayWorkerGroup, actor_resume_path: str, runtime_staging_cfg: dict
+    ):
+        refs = actor_wg.execute_all_async(
+            f"{str(Role.Actor)}_stage_actor_optimizer_state_to_host",
+            actor_resume_path,
+            staging_config=runtime_staging_cfg,
+        )
+        return {"refs": refs, "started_at": time.monotonic()}
+
+    def _finish_async_actor_optimizer_host_export(self, export_task) -> dict[str, float]:
+        if export_task is None:
+            return {}
+        wait_started_at = time.monotonic()
+        results = ray.get(export_task["refs"])
+        wait_duration = time.monotonic() - wait_started_at
+        total_duration = time.monotonic() - float(export_task["started_at"])
+        metrics = self._merge_resize_numeric_metrics(results)
+        metrics["resize/host_stage_async_optimizer_export_wait_s"] = float(wait_duration)
+        metrics["resize/host_stage_async_optimizer_export_total_s"] = float(total_duration)
+        return metrics
 
     def _finish_async_actor_host_restore(
         self,
@@ -1442,6 +1505,49 @@ class OneStepOffRayTrainer(RayPPOTrainer):
     def _destroy_rollout_weight_sync_group(self, rollout_wg: RayWorkerGroup, group_name: str):
         return rollout_wg.execute_all_sync(f"{str(Role.Rollout)}_destroy_weight_sync_group", group_name)
 
+    def _set_weight_sync_src_rank(self, actor_wg: RayWorkerGroup, rollout_wg: RayWorkerGroup, group_name: str, src_rank: int) -> None:
+        actor_wg.execute_all_sync(f"{str(Role.Actor)}_set_weight_sync_src_rank", group_name, int(src_rank))
+        rollout_wg.execute_all_sync(f"{str(Role.Rollout)}_set_weight_sync_src_rank", group_name, int(src_rank))
+
+    def _clear_weight_sync_src_rank(self, actor_wg: RayWorkerGroup, rollout_wg: RayWorkerGroup, group_name: str) -> None:
+        actor_wg.execute_all_sync(f"{str(Role.Actor)}_clear_weight_sync_src_rank", group_name)
+        rollout_wg.execute_all_sync(f"{str(Role.Rollout)}_clear_weight_sync_src_rank", group_name)
+
+    def _warmup_weight_sync_group(self, actor_wg: RayWorkerGroup, rollout_wg: RayWorkerGroup, group_name: str):
+        # The first NCCL collective on a freshly prepared Ray collective group can
+        # pay a large lazy-initialization cost. Exercise the exact group with a
+        # one-element broadcast before it becomes the full weight-sync path.
+        rollout_refs = rollout_wg.execute_all_async(f"{str(Role.Rollout)}_warmup_weight_sync_group", group_name)
+        actor_refs = actor_wg.execute_all_async(f"{str(Role.Actor)}_warmup_weight_sync_group", group_name)
+        return ray.get(rollout_refs + actor_refs)
+
+    @staticmethod
+    def _collect_weight_sync_group_warmup_metrics(results) -> dict[str, float | str]:
+        metrics: dict[str, float | str] = {}
+        if not results:
+            return metrics
+        for field in ("broadcast_s", "total_s"):
+            values = [float(item[field]) for item in results if isinstance(item, dict) and isinstance(item.get(field), (int, float))]
+            if values:
+                metrics[f"resize/comm_prewarm_warmup_{field}_max"] = max(values)
+                metrics[f"resize/comm_prewarm_warmup_{field}_mean"] = sum(values) / len(values)
+        role_counts: dict[str, int] = {}
+        for item in results:
+            if isinstance(item, dict):
+                role = str(item.get("role", "unknown"))
+                role_counts[role] = role_counts.get(role, 0) + 1
+        for role, count in role_counts.items():
+            metrics[f"resize/comm_prewarm_warmup_{role}_workers"] = float(count)
+        first = next((item for item in results if isinstance(item, dict)), None)
+        if first is not None:
+            for field in ("group_name", "collective_world_size", "collective_initialized"):
+                value = first.get(field)
+                if isinstance(value, (int, float, bool)):
+                    metrics[f"resize/comm_prewarm_warmup_{field}"] = float(value)
+                elif value is not None:
+                    metrics[f"resize/comm_prewarm_warmup_{field}"] = str(value)
+        return metrics
+
     def add_role_group(
         self,
         role: Role,
@@ -1726,6 +1832,10 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                     n_workers,
                     group_name,
                 )
+            warmup_started_at = time.monotonic()
+            warmup_results = self._warmup_weight_sync_group(actor_wg, rollout_wg, group_name)
+            warmup_duration = time.monotonic() - warmup_started_at
+            warmup_metrics = self._collect_weight_sync_group_warmup_metrics(warmup_results)
             prewarm_duration = time.monotonic() - started_at
 
         self._weight_sync_communicator_cache.put(
@@ -1746,8 +1856,10 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 "resize/comm_registry_miss": 0.0 if had_registry_entry else 1.0,
                 "resize/comm_prewarm_ready": 1.0,
                 "resize/comm_prewarm_create_s": prewarm_duration,
+                "resize/comm_prewarm_warmup_s": warmup_duration,
                 "resize/comm_prepare_path": "registry_prewarm" if had_registry_entry else "full_build",
                 "resize/comm_cache_reused_group": group_name,
+                **warmup_metrics,
             }
         )
         return group_name
@@ -2262,24 +2374,47 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 runtime_staging_cfg = self._make_runtime_handoff_staging_dict(effective_backend=export_decision.effective_backend)
 
         # Phase 0: export the train-side state into the host staging backend
-        # before shared-pool slots are reclaimed. This avoids claiming that the
-        # new role has already been preloaded into free VRAM.
+        # before shared-pool slots are reclaimed. For pinned + deferred full
+        # optimizer restore, only model pages are on the critical path; optimizer
+        # pages are appended asynchronously while new worker groups reinit.
+        optimizer_export_task = None
+        split_optimizer_export = (
+            actor_resume_kind == "host_staging"
+            and runtime_staging_cfg.get("backend") == "pinned_cpu"
+            and bool(runtime_staging_cfg.get("stage_optimizer", False))
+            and str(runtime_staging_cfg.get("optimizer_restore_policy", "deferred")) == "deferred"
+            and bool(runtime_staging_cfg.get("optimizer_full_state_restore", True))
+            and shrinking_role == Role.Rollout
+        )
         if actor_resume_kind == "host_staging":
-            logger.info("[one-step-off][resize][host-stage] exporting actor state before staged switch")
+            logger.info("[one-step-off][resize][host-stage] exporting actor model state before staged switch")
+            critical_staging_cfg = dict(runtime_staging_cfg)
+            if split_optimizer_export:
+                critical_staging_cfg["stage_optimizer"] = False
             with resize_trace_span(
                 self._resize_trace_config,
                 "resize_export",
                 step=self._trace_step(),
                 lane="trainer_main",
-                metadata={"backend": runtime_staging_cfg.get("backend", "disk_fallback")},
+                metadata={
+                    "backend": runtime_staging_cfg.get("backend", "disk_fallback"),
+                    "split_optimizer_export": bool(split_optimizer_export),
+                },
             ):
                 export_started_at = time.monotonic()
-                old_actor_wg.stage_actor_handoff_state_to_host(
+                export_results = old_actor_wg.stage_actor_handoff_state_to_host(
                     actor_resume_path,
-                    staging_config=runtime_staging_cfg,
+                    staging_config=critical_staging_cfg,
                 )
                 export_duration = time.monotonic() - export_started_at
-            self._update_resize_execution_metrics(**{"resize/host_stage_export_s": export_duration})
+            export_metrics = {"resize/host_stage_export_s": export_duration}
+            export_metrics.update(self._merge_resize_numeric_metrics(export_results))
+            export_metrics["resize/host_stage_split_optimizer_export"] = 1.0 if split_optimizer_export else 0.0
+            self._update_resize_execution_metrics(**export_metrics)
+            if split_optimizer_export:
+                logger.info(
+                    "[one-step-off][resize][host-stage] deferring async optimizer export until after new worker reinit starts"
+                )
             if self._handoff_staging_config.preclear_rollout_kv_cache:
                 # Reclaim rollout-side transient memory before the switch window.
                 kv_cache_preclear_s = await self._clear_rollout_kv_cache_before_resize_async()
@@ -2343,127 +2478,170 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         else:
             self.remove_role_group(Role.Rollout, old_rollout_wg)
 
-        # Phase B: rebuild actor first so rollout can attach to the final actor weights.
         actor_pool = self._resolve_role_pool(Role.Actor, actor_spec)
-        new_actor_wg = await self.add_role_group_async(
-            Role.Actor,
-            name=item.get("actor_group_name"),
-            resource_pool=actor_pool,
-            detached=detached,
-            name_prefix=name_prefix,
-            prepare_only=True,
-        )
-        await self._commit_role_group_init_async(new_actor_wg, role=Role.Actor)
+        rollout_pool = self._resolve_role_pool(Role.Rollout, rollout_spec)
 
         actor_resume_load_path = self._normalize_actor_resume_load_path(actor_resume_path)
         defer_optimizer_restore = bool(
             runtime_staging_cfg.get("stage_optimizer", False)
             and str(runtime_staging_cfg.get("optimizer_restore_policy", "deferred")) == "deferred"
         )
-
-        # Phase B: start actor state restore as soon as the new actor exists, but
-        # do not block the driver here. Rollout construction can overlap the H2D
-        # stream; the driver waits only before it needs restored actor weights.
         actor_restore_task = None
-        if actor_resume_kind == "host_staging" and actor_resume_path is not None:
-            logger.info("[one-step-off][resize][host-stage] starting async actor state import into new actor")
-            with resize_trace_span(
-                self._resize_trace_config,
-                "resize_import_launch",
-                step=self._trace_step(),
-                lane="trainer_main",
-                metadata={"backend": runtime_staging_cfg.get("backend", "disk_fallback")},
-            ):
-                actor_restore_task = self._start_async_actor_host_restore(
-                    new_actor_wg,
-                    actor_resume_path,
-                    runtime_staging_cfg,
-                )
-        elif actor_resume_kind == "handoff" and actor_resume_path is not None:
-            logger.info("[one-step-off][resize][handoff] importing actor state into new actor")
-            with resize_trace_span(
-                self._resize_trace_config,
-                "resize_import",
-                step=self._trace_step(),
-                lane="trainer_main",
-                metadata={"backend": "handoff"},
-            ):
-                import_started_at = time.monotonic()
-                try:
-                    new_actor_wg.load_actor_handoff_state(actor_resume_path)
-                except Exception as exc:
-                    self._update_resize_execution_metrics(
-                        **{
-                            "resize/restore_failed": 1.0,
-                            "resize/partial_restore_cleanup_count": 1.0,
-                        }
-                    )
-                    logger.exception(
-                        "[one-step-off][resize][handoff] restore failed: path=%s "
-                        "resize/restore_failed=1.0 resize/partial_restore_cleanup_count=1.0 error=%r",
+
+        async def _start_actor_restore_after_commit(actor_wg: RayWorkerGroup):
+            restore_task = None
+            if actor_resume_kind == "host_staging" and actor_resume_path is not None:
+                logger.info("[one-step-off][resize][host-stage] starting async actor state import into new actor")
+                with resize_trace_span(
+                    self._resize_trace_config,
+                    "resize_import_launch",
+                    step=self._trace_step(),
+                    lane="trainer_main",
+                    metadata={"backend": runtime_staging_cfg.get("backend", "disk_fallback")},
+                ):
+                    restore_task = self._start_async_actor_host_restore(
+                        actor_wg,
                         actor_resume_path,
-                        exc,
+                        runtime_staging_cfg,
                     )
+            elif actor_resume_kind == "handoff" and actor_resume_path is not None:
+                logger.info("[one-step-off][resize][handoff] importing actor state into new actor")
+                with resize_trace_span(
+                    self._resize_trace_config,
+                    "resize_import",
+                    step=self._trace_step(),
+                    lane="trainer_main",
+                    metadata={"backend": "handoff"},
+                ):
+                    import_started_at = time.monotonic()
                     try:
-                        new_actor_wg.cleanup_actor_handoff_restore_session(actor_resume_path)
-                    finally:
-                        raise
-                import_duration = time.monotonic() - import_started_at
-            self._update_resize_execution_metrics(**{"resize/host_stage_import_s": import_duration})
-            if should_cleanup_actor_resume:
-                try:
-                    shutil.rmtree(actor_resume_path)
-                    self._update_resize_execution_metrics(**{"resize/host_stage_cleanup": 1.0})
-                    logger.info("[one-step-off][resize][handoff] cleaned temporary actor handoff dir: %s", actor_resume_path)
-                except FileNotFoundError:
-                    pass
-                except Exception as exc:  # pragma: no cover - best effort cleanup
-                    logger.warning(
-                        "[one-step-off][resize][handoff] failed to remove temporary handoff %s: %s",
-                        actor_resume_path,
-                        exc,
-                    )
-        elif actor_resume_load_path is not None:
-            logger.info("[one-step-off][resize][resume] loading actor checkpoint into new actor: %s", actor_resume_load_path)
-            new_actor_wg.load_checkpoint(
-                actor_resume_load_path,
-                del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
-            )
-            if should_cleanup_actor_resume:
-                try:
-                    shutil.rmtree(actor_resume_path)
-                    logger.info("[one-step-off][resize][resume] cleaned temporary checkpoint dir: %s", actor_resume_path)
-                except FileNotFoundError:
-                    pass
-                except Exception as exc:  # pragma: no cover - best effort cleanup
-                    logger.warning(
-                        "[one-step-off][resize][resume] failed to remove temporary checkpoint %s: %s",
-                        actor_resume_path,
-                        exc,
-                    )
+                        actor_wg.load_actor_handoff_state(actor_resume_path)
+                    except Exception as exc:
+                        self._update_resize_execution_metrics(
+                            **{
+                                "resize/restore_failed": 1.0,
+                                "resize/partial_restore_cleanup_count": 1.0,
+                            }
+                        )
+                        logger.exception(
+                            "[one-step-off][resize][handoff] restore failed: path=%s "
+                            "resize/restore_failed=1.0 resize/partial_restore_cleanup_count=1.0 error=%r",
+                            actor_resume_path,
+                            exc,
+                        )
+                        try:
+                            actor_wg.cleanup_actor_handoff_restore_session(actor_resume_path)
+                        finally:
+                            raise
+                    import_duration = time.monotonic() - import_started_at
+                self._update_resize_execution_metrics(**{"resize/host_stage_import_s": import_duration})
+                if should_cleanup_actor_resume:
+                    try:
+                        shutil.rmtree(actor_resume_path)
+                        self._update_resize_execution_metrics(**{"resize/host_stage_cleanup": 1.0})
+                        logger.info("[one-step-off][resize][handoff] cleaned temporary actor handoff dir: %s", actor_resume_path)
+                    except FileNotFoundError:
+                        pass
+                    except Exception as exc:  # pragma: no cover - best effort cleanup
+                        logger.warning(
+                            "[one-step-off][resize][handoff] failed to remove temporary handoff %s: %s",
+                            actor_resume_path,
+                            exc,
+                        )
+            elif actor_resume_load_path is not None:
+                logger.info("[one-step-off][resize][resume] loading actor checkpoint into new actor: %s", actor_resume_load_path)
+                actor_wg.load_checkpoint(
+                    actor_resume_load_path,
+                    del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
+                )
+                if should_cleanup_actor_resume:
+                    try:
+                        shutil.rmtree(actor_resume_path)
+                        logger.info("[one-step-off][resize][resume] cleaned temporary checkpoint dir: %s", actor_resume_path)
+                    except FileNotFoundError:
+                        pass
+                    except Exception as exc:  # pragma: no cover - best effort cleanup
+                        logger.warning(
+                            "[one-step-off][resize][resume] failed to remove temporary checkpoint %s: %s",
+                            actor_resume_path,
+                            exc,
+                        )
+            else:
+                logger.info(
+                    "[one-step-off][resize][staged] new actor keeps its freshly initialized weights; "
+                    "rollout weight metadata will be attached after rollout group commit"
+                )
+            return restore_task
+
+        if shrinking_role == Role.Rollout:
+            # Once the shrinking rollout has been released, the target actor and
+            # rollout groups fit in the shared pool together. Build/commit them
+            # concurrently; actor restore starts as soon as actor commit returns.
+            async def _build_commit_actor():
+                actor_wg = await asyncio.to_thread(
+                    self.add_role_group,
+                    Role.Actor,
+                    name=item.get("actor_group_name"),
+                    resource_pool=actor_pool,
+                    detached=detached,
+                    name_prefix=name_prefix,
+                    prepare_only=True,
+                )
+                await asyncio.to_thread(self._commit_role_group_init, actor_wg, role=Role.Actor)
+                return actor_wg
+
+            async def _build_commit_rollout():
+                rollout_wg = await asyncio.to_thread(
+                    self.add_role_group,
+                    Role.Rollout,
+                    name=item.get("rollout_group_name"),
+                    resource_pool=rollout_pool,
+                    detached=detached,
+                    name_prefix=name_prefix,
+                    prepare_only=True,
+                )
+                await asyncio.to_thread(self._commit_role_group_init, rollout_wg, role=Role.Rollout)
+                return rollout_wg
+
+            actor_group_task = asyncio.create_task(_build_commit_actor())
+            rollout_group_task = asyncio.create_task(_build_commit_rollout())
+            new_actor_wg = await actor_group_task
+            actor_restore_task = await _start_actor_restore_after_commit(new_actor_wg)
+            new_rollout_wg = await rollout_group_task
+            self._update_resize_execution_metrics(**{"resize/parallel_actor_rollout_reinit": 1.0})
         else:
-            logger.info(
-                "[one-step-off][resize][staged] new actor keeps its freshly initialized weights; "
-                "rollout weight metadata will be attached after rollout group commit"
+            # Actor shrink needs old rollout lifetime/resource ordering preserved;
+            # keep the original actor-first sequence for that direction.
+            new_actor_wg = await self.add_role_group_async(
+                Role.Actor,
+                name=item.get("actor_group_name"),
+                resource_pool=actor_pool,
+                detached=detached,
+                name_prefix=name_prefix,
+                prepare_only=True,
             )
+            await self._commit_role_group_init_async(new_actor_wg, role=Role.Actor)
+            actor_restore_task = await _start_actor_restore_after_commit(new_actor_wg)
 
-        # Phase C: if rollout is the expanding side, release the old rollout after
-        # the new actor is already available. This keeps both resize directions on
-        # the same actor-first handoff flow while avoiding shared-pool over-allocation.
-        if shrinking_role == Role.Actor:
             self.remove_role_group(Role.Rollout, old_rollout_wg)
+            new_rollout_wg = await self.add_role_group_async(
+                Role.Rollout,
+                name=item.get("rollout_group_name"),
+                resource_pool=rollout_pool,
+                detached=detached,
+                name_prefix=name_prefix,
+                prepare_only=True,
+            )
+            await self._commit_role_group_init_async(new_rollout_wg, role=Role.Rollout)
+            self._update_resize_execution_metrics(**{"resize/parallel_actor_rollout_reinit": 0.0})
 
-        # Phase D: create the final rollout group after actor is ready.
-        rollout_pool = self._resolve_role_pool(Role.Rollout, rollout_spec)
-        new_rollout_wg = await self.add_role_group_async(
-            Role.Rollout,
-            name=item.get("rollout_group_name"),
-            resource_pool=rollout_pool,
-            detached=detached,
-            name_prefix=name_prefix,
-            prepare_only=True,
-        )
-        await self._commit_role_group_init_async(new_rollout_wg, role=Role.Rollout)
+        if split_optimizer_export and optimizer_export_task is None:
+            logger.info("[one-step-off][resize][host-stage] starting async optimizer export after worker reinit")
+            optimizer_export_task = self._start_async_actor_optimizer_host_export(
+                old_actor_wg,
+                actor_resume_path,
+                runtime_staging_cfg,
+            )
 
         if actor_restore_task is not None:
             logger.info("[one-step-off][resize][host-stage] waiting for async actor import before reading weights")
@@ -2531,15 +2709,175 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         )
         self._publish_active_topology_state(actor_spec=actor_spec, rollout_spec=rollout_spec)
         if defer_optimizer_restore:
-            self._start_deferred_optimizer_materialize(new_actor_wg)
+            if optimizer_export_task is not None:
+                with resize_trace_span(
+                    self._resize_trace_config,
+                    "resize_optimizer_export_wait",
+                    step=self._trace_step(),
+                    lane="trainer_main",
+                    metadata={"backend": runtime_staging_cfg.get("backend", "disk_fallback")},
+                ):
+                    optimizer_export_metrics = self._finish_async_actor_optimizer_host_export(optimizer_export_task)
+                self._update_resize_execution_metrics(**optimizer_export_metrics)
+                if has_restore_session_manifest(actor_resume_path):
+                    session_manifest = read_restore_session_manifest(actor_resume_path)
+                    self._update_resize_execution_metrics(
+                        **{"resize/optimizer_pending_pages": float(session_manifest.get("optimizer_page_count", 0))}
+                    )
+            # Default pinned optimizer restore uses the original full-state
+            # distribution path. Start it asynchronously right after publishing
+            # the new topology so it can overlap with post-switch rollout work.
+            # The experimental chunked optimizer path remains available behind
+            # optimizer_full_state_restore=false.
+            use_lazy_pinned_optimizer = (
+                runtime_staging_cfg.get("backend") == "pinned_cpu"
+                and bool(runtime_staging_cfg.get("async_optimizer_preload", True))
+                and not bool(runtime_staging_cfg.get("optimizer_full_state_restore", True))
+            )
+            if not use_lazy_pinned_optimizer:
+                self._start_deferred_optimizer_materialize(new_actor_wg)
 
         await self._shutdown_async_rollout_manager_async()
         await self._init_async_rollout_manager_async()
+        await self._sync_rollout_weights_after_resize_async(handoff_path=actor_resume_path)
 
         if shrinking_role == Role.Rollout:
             self.remove_role_group(Role.Actor, old_actor_wg)
         self._cleanup_pending_weight_sync_groups()
         logger.info("[one-step-off][resize][staged] done")
+        return True
+
+    async def _hard_resize_actor_rollout_from_checkpoint(self, item: dict, *, actor_resume_path: str | None = None) -> bool:
+        """Baseline resize: destroy old actor/rollout workers, then rebuild from checkpoint.
+
+        This path intentionally avoids the staged shared-pool handoff, pinned
+        pages, direct rollout page load, phased prewarm, and communicator cache
+        optimizations used by the main resize path. It keeps critic untouched so
+        the experiment isolates actor/rollout topology rebuild cost.
+        """
+        actor_spec = item.get("actor_pool")
+        rollout_spec = item.get("rollout_pool")
+        detached = item.get("detached", False)
+        name_prefix = item.get("name_prefix")
+        old_actor_wg = self.actor_wg
+        old_rollout_wg = self.rollout_wg
+
+        handoff_path = actor_resume_path or os.path.join(
+            self.config.trainer.default_local_dir,
+            f"hard_resize_actor_handoff_step_{self.global_steps}",
+        )
+        if actor_resume_path is None:
+            shutil.rmtree(handoff_path, ignore_errors=True)
+        hard_staging_cfg = self._make_runtime_handoff_staging_dict(effective_backend="disk_fallback")
+        hard_staging_cfg.update(
+            {
+                "backend": "disk_fallback",
+                "stage_optimizer": True,
+                "optimizer_restore_policy": "immediate",
+                "progressive_swap": False,
+                "async_optimizer_preload": False,
+                "cleanup_after_load": False,
+                "preclear_rollout_kv_cache": False,
+            }
+        )
+        with resize_trace_span(
+            self._resize_trace_config,
+            "hard_resize_export_handoff",
+            step=self._trace_step(),
+            lane="trainer_main",
+            metadata={"backend": "disk_fallback"},
+        ):
+            export_started_at = time.monotonic()
+            export_results = old_actor_wg.stage_actor_handoff_state_to_host(
+                handoff_path,
+                staging_config=hard_staging_cfg,
+            )
+            export_duration = time.monotonic() - export_started_at
+        export_metrics = {"resize/hard_resize_export_handoff_s": export_duration}
+        export_metrics.update(self._merge_resize_numeric_metrics(export_results))
+        self._update_resize_execution_metrics(**export_metrics)
+
+        with resize_trace_span(
+            self._resize_trace_config,
+            "hard_resize_shutdown_rollout_manager",
+            step=self._trace_step(),
+            lane="trainer_main",
+            metadata={},
+        ):
+            await self._shutdown_async_rollout_manager_async()
+
+        with resize_trace_span(
+            self._resize_trace_config,
+            "hard_resize_kill_old_workers",
+            step=self._trace_step(),
+            lane="trainer_main",
+            metadata={},
+        ):
+            self.remove_role_group(Role.Actor, old_actor_wg)
+            self.remove_role_group(Role.Rollout, old_rollout_wg)
+
+        actor_pool = self._resolve_role_pool(Role.Actor, actor_spec)
+        rollout_pool = self._resolve_role_pool(Role.Rollout, rollout_spec)
+
+        new_actor_wg = await self.add_role_group_async(
+            Role.Actor,
+            name=item.get("actor_group_name"),
+            resource_pool=actor_pool,
+            detached=detached,
+            name_prefix=name_prefix,
+            prepare_only=False,
+        )
+        new_rollout_wg = await self.add_role_group_async(
+            Role.Rollout,
+            name=item.get("rollout_group_name"),
+            resource_pool=rollout_pool,
+            detached=detached,
+            name_prefix=name_prefix,
+            prepare_only=False,
+        )
+
+        with resize_trace_span(
+            self._resize_trace_config,
+            "hard_resize_actor_load_handoff",
+            step=self._trace_step(),
+            lane="trainer_main",
+            metadata={"path": handoff_path, "backend": "disk_fallback"},
+        ):
+            new_actor_wg.load_actor_handoff_state_from_host(
+                handoff_path,
+                staging_config=hard_staging_cfg,
+            )
+
+        self.actor_wg = new_actor_wg
+        self.actor_rollout_wg = new_actor_wg
+        self.rollout_wg = new_rollout_wg
+        weights_info = self._get_actor_weights_info(new_actor_wg)[0]
+        self._set_actor_weights_info(new_rollout_wg, weights_info)
+
+        self._switch_weight_sync_group(
+            new_actor_wg,
+            new_rollout_wg,
+            actor_spec=actor_spec,
+            rollout_spec=rollout_spec,
+        )
+        self._publish_active_topology_state(actor_spec=actor_spec, rollout_spec=rollout_spec)
+
+        with resize_trace_span(
+            self._resize_trace_config,
+            "hard_resize_init_rollout_manager",
+            step=self._trace_step(),
+            lane="trainer_main",
+            metadata={},
+        ):
+            await self._init_async_rollout_manager_async()
+        await self._sync_rollout_weights_after_resize_async(handoff_path=None)
+        self._cleanup_pending_weight_sync_groups()
+        self._update_resize_execution_metrics(
+            **{
+                "resize/hard_resize_destroy_all": 1.0,
+                "resize/parallel_actor_rollout_reinit": 0.0,
+            }
+        )
         return True
 
     async def _maybe_dynamic_resize(self):
@@ -2597,6 +2935,16 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             release_old = item.get("release_old", True)
             detached = item.get("detached", False)
             actor_resume_path = item.get("actor_resume_from_path")
+
+            if bool(item.get("hard_resize_destroy_all", False)):
+                logger.info("[one-step-off][resize][hard] using destroy-all hard resize baseline path")
+                resize_applied = await self._hard_resize_actor_rollout_from_checkpoint(item, actor_resume_path=actor_resume_path)
+                if resize_applied:
+                    if self._resize_controller is not None:
+                        snapshot = self._resize_controller.mark_resize_applied(step=self.global_steps, action=required_action)
+                        self._latest_resize_control_metrics = self._build_resize_control_metrics(snapshot)
+                    logger.info("[one-step-off][resize][hard] switch complete")
+                continue
 
             staged_enabled = self._should_use_staged_shared_pool_resize(item)
             if staged_enabled:
@@ -2724,6 +3072,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         # publish 之后统一重建。
         await self._shutdown_async_rollout_manager_async()
         await self._init_async_rollout_manager_async()
+        await self._sync_rollout_weights_after_resize_async(handoff_path=resume_from_path)
 
         # Phase 6: 兼容旧策略的延后清理。
         # 当 release_old=False 时，保留旧语义：新拓扑发布完后再释放旧 group。
@@ -2731,6 +3080,161 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             self.remove_role_group(Role.Actor, old_actor_wg)
             self.remove_role_group(Role.Rollout, old_rollout_wg)
             self._cleanup_pending_weight_sync_groups()
+
+
+
+    @staticmethod
+    def _collect_rollout_direct_weight_load_metrics(results):
+        metrics = {}
+        if not results:
+            return metrics
+        numeric_fields = (
+            "total_s",
+            "prepare_inference_model_s",
+            "load_pages_s",
+            "h2d_s",
+            "rollout_load_weights_s",
+            "empty_cache_s",
+            "page_count",
+            "manifest_page_count",
+            "empty_page_count",
+            "loaded_weight_count",
+            "loaded_bytes",
+            "host_file_page_count",
+            "disk_page_count",
+            "host_page_count",
+            "device_free_before_bytes",
+            "device_total_before_bytes",
+            "device_free_after_bytes",
+            "device_total_after_bytes",
+        )
+        rollout_results = [item for item in results if isinstance(item, dict) and item.get("role") == "rollout"]
+        if not rollout_results:
+            return metrics
+        metrics["rollout_direct_weight_load_worker_count"] = float(len(rollout_results))
+        for field in numeric_fields:
+            values = []
+            for item in rollout_results:
+                value = item.get(field)
+                if isinstance(value, bool):
+                    value = float(value)
+                if isinstance(value, (int, float)):
+                    values.append(float(value))
+            if values:
+                metrics[f"rollout_direct_weight_load_{field}_max"] = max(values)
+                metrics[f"rollout_direct_weight_load_{field}_mean"] = sum(values) / len(values)
+        first = rollout_results[0]
+        source = first.get("source")
+        if source is not None:
+            metrics["rollout_direct_weight_load_source"] = str(source)
+        return metrics
+
+    def _load_rollout_weights_from_handoff_model_pages(self, handoff_path: str):
+        launch_started_at = time.monotonic()
+        refs = self.rollout_wg.execute_all_async(
+            f"{str(Role.Rollout)}_load_rollout_weights_from_handoff_model_pages",
+            handoff_path,
+            staging_config=self._make_runtime_handoff_staging_dict(
+                effective_backend=self._handoff_staging_config.effective_backend()
+            ),
+        )
+        wait_started_at = time.monotonic()
+        results = ray.get(refs) if refs else []
+        diagnostics = {
+            "rollout_direct_weight_load_launch_s": float(wait_started_at - launch_started_at),
+            "rollout_direct_weight_load_wait_s": float(time.monotonic() - wait_started_at),
+        }
+        diagnostics.update(self._collect_rollout_direct_weight_load_metrics(results))
+        self._last_sync_rollout_weight_diagnostics = diagnostics
+        self._update_resize_execution_metrics(**diagnostics)
+        return results
+
+    async def _sync_rollout_weights_after_resize_async(
+        self,
+        *,
+        clear_kv_cache: bool = True,
+        handoff_path: str | None = None,
+    ) -> None:
+        group_name = getattr(self, "_active_weight_sync_group_name", "actor_rollout")
+        use_direct_staged_rollout_load = (
+            handoff_path is not None
+            and self._handoff_staging_config.effective_backend() == "pinned_cpu"
+            and bool(getattr(self._handoff_staging_config, "stage_optimizer", False))
+        )
+        use_alt_src = (
+            not use_direct_staged_rollout_load
+            and self._handoff_staging_config.effective_backend() == "pinned_cpu"
+            and not bool(getattr(self._handoff_staging_config, "stage_optimizer", False))
+            and len(getattr(self.actor_wg, "workers", [])) > 1
+        )
+        src_rank = 1 if use_alt_src else 0
+        sync_started_at = time.monotonic()
+        if use_direct_staged_rollout_load:
+            self._load_rollout_weights_from_handoff_model_pages(handoff_path)
+        else:
+            self.sync_rollout_weights(src_rank=src_rank if use_alt_src else None)
+        sync_duration = time.monotonic() - sync_started_at
+        if not bool(getattr(self._handoff_staging_config, "optimizer_full_state_restore", True)):
+            self._start_optimizer_preload_after_weight_sync()
+        kv_clear_duration = 0.0
+        if clear_kv_cache and self.async_rollout_manager is not None:
+            kv_started_at = time.monotonic()
+            await self.async_rollout_manager.clear_kv_cache_async()
+            kv_clear_duration = time.monotonic() - kv_started_at
+        metrics = {
+            "resize/post_switch_weight_sync_s": sync_duration,
+            "resize/post_switch_kv_clear_s": kv_clear_duration,
+            "resize/post_switch_weight_sync_src_rank": float(src_rank),
+            "resize/post_switch_weight_sync_alt_src": 1.0 if use_alt_src else 0.0,
+            "resize/post_switch_weight_sync_direct_staged_load": 1.0 if use_direct_staged_rollout_load else 0.0,
+            "resize/post_switch_weight_sync_path": "handoff_model_pages" if use_direct_staged_rollout_load else "collective_broadcast",
+        }
+        for key, value in getattr(self, "_last_sync_rollout_weight_diagnostics", {}).items():
+            metrics[f"resize/post_switch_{key}"] = value
+        self._update_resize_execution_metrics(**metrics)
+    @staticmethod
+    def _collect_optimizer_preload_start_metrics(results):
+        metrics = {}
+        if not results:
+            return metrics
+        numeric_fields = ("started", "full_state_restore", "page_count", "queue_depth", "total_s")
+        for field in numeric_fields:
+            values = []
+            for item in results:
+                if isinstance(item, dict) and isinstance(item.get(field), (int, float)):
+                    values.append(float(item[field]))
+            if values:
+                metrics[f"resize/optimizer_preload_start_{field}_max"] = max(values)
+                metrics[f"resize/optimizer_preload_start_{field}_mean"] = sum(values) / len(values)
+        return metrics
+
+    def _start_optimizer_preload_after_weight_sync(self) -> None:
+        if self._handoff_staging_config.effective_backend() != "pinned_cpu":
+            return
+        started_at = time.monotonic()
+        try:
+            with resize_trace_span(
+                self._resize_trace_config,
+                "optimizer_preload_start",
+                step=self._trace_step(),
+                lane="trainer_main",
+                metadata={},
+            ):
+                refs = self.actor_wg.execute_all_async(f"{str(Role.Actor)}_start_pending_optimizer_preload")
+                results = ray.get(refs) if refs else []
+        except Exception as exc:
+            self._update_resize_execution_metrics(
+                **{
+                    "resize/optimizer_preload_start_s": float(time.monotonic() - started_at),
+                    "resize/optimizer_preload_start_failed": 1.0,
+                    "resize/optimizer_preload_start_error": repr(exc),
+                }
+            )
+            raise
+        metrics = self._collect_optimizer_preload_start_metrics(results)
+        metrics["resize/optimizer_preload_start_s"] = float(time.monotonic() - started_at)
+        metrics["resize/optimizer_preload_start_failed"] = 0.0
+        self._update_resize_execution_metrics(**metrics)
 
 
     def _post_load_checkpoint_for_switch(self) -> None:
@@ -2743,7 +3247,59 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         if self.async_rollout_manager is not None:
             await self.async_rollout_manager.clear_kv_cache_async()
 
-    def sync_rollout_weights(self):
+
+    @staticmethod
+    def _collect_sync_rollout_weight_metrics(results):
+        metrics = {}
+        if not results:
+            return metrics
+        numeric_fields = (
+            "total_s",
+            "load_actor_gpu_s",
+            "get_params_s",
+            "prepare_inference_model_s",
+            "init_collective_s",
+            "alloc_s",
+            "actor_copy_s",
+            "actor_source_direct_count",
+            "actor_source_direct_bytes",
+            "broadcast_s",
+            "rollout_load_weights_s",
+            "empty_cache_s",
+            "src_rank",
+            "weight_bytes",
+            "weight_count",
+            "device_free_before_bytes",
+            "device_total_before_bytes",
+            "device_free_after_bytes",
+            "device_total_after_bytes",
+        )
+        for role in ("actor", "rollout"):
+            role_results = [item for item in results if isinstance(item, dict) and item.get("role") == role]
+            if not role_results:
+                continue
+            metrics[f"sync_rollout_weights_{role}_worker_count"] = float(len(role_results))
+            for field in numeric_fields:
+                values = []
+                for item in role_results:
+                    value = item.get(field)
+                    if isinstance(value, bool):
+                        value = float(value)
+                    if isinstance(value, (int, float)):
+                        values.append(float(value))
+                if values:
+                    metrics[f"sync_rollout_weights_{role}_{field}_max"] = max(values)
+                    metrics[f"sync_rollout_weights_{role}_{field}_mean"] = sum(values) / len(values)
+            first = role_results[0]
+            for field in ("group_name", "collective_world_size", "collective_initialized", "torch_world_size"):
+                value = first.get(field)
+                if isinstance(value, (int, float, bool)):
+                    metrics[f"sync_rollout_weights_{role}_{field}"] = float(value)
+                elif value is not None:
+                    metrics[f"sync_rollout_weights_{role}_{field}"] = str(value)
+        return metrics
+
+    def sync_rollout_weights(self, src_rank: int | None = None, *, actor_first: bool = False):
         actor_workers = getattr(self.actor_wg, "workers", [])
         rollout_workers = getattr(self.rollout_wg, "workers", [])
 
@@ -2766,6 +3322,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 "Please create actor/rollout as separate Ray Actors (no shared spawn/from_detached)."
             )
 
+        launch_started_at = time.monotonic()
         with resize_trace_span(
             self._resize_trace_config,
             "sync_rollout_weights",
@@ -2773,17 +3330,69 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             lane="trainer_main",
             metadata={"actor_workers": len(actor_workers), "rollout_workers": len(rollout_workers)},
         ):
-            rollout_refs = self.rollout_wg.sync_rollout_weights()
-            actor_refs = self.actor_wg.sync_rollout_weights()
+            rollout_refs = None
+            actor_refs = None
+            rollout_launch_s = 0.0
+            actor_launch_s = 0.0
+
+            def _launch_actor_sync():
+                if src_rank is None:
+                    return self.actor_wg.sync_rollout_weights()
+                return self.actor_wg.sync_rollout_weights(int(src_rank))
+
+            def _launch_rollout_sync():
+                if src_rank is None:
+                    return self.rollout_wg.sync_rollout_weights()
+                return self.rollout_wg.sync_rollout_weights(int(src_rank))
+
+            if actor_first:
+                actor_launch_started_at = time.monotonic()
+                actor_refs = _launch_actor_sync()
+                actor_launch_s = time.monotonic() - actor_launch_started_at
+                rollout_launch_started_at = time.monotonic()
+                rollout_refs = _launch_rollout_sync()
+                rollout_launch_s = time.monotonic() - rollout_launch_started_at
+            else:
+                rollout_launch_started_at = time.monotonic()
+                rollout_refs = _launch_rollout_sync()
+                rollout_launch_s = time.monotonic() - rollout_launch_started_at
+                actor_launch_started_at = time.monotonic()
+                actor_refs = _launch_actor_sync()
+                actor_launch_s = time.monotonic() - actor_launch_started_at
         if rollout_refs is None and actor_refs is None:
-            return
-        refs = []
+            self._last_sync_rollout_weight_diagnostics = {
+                "sync_rollout_weights_launch_s": time.monotonic() - launch_started_at,
+                "sync_rollout_weights_rollout_launch_s": rollout_launch_s,
+                "sync_rollout_weights_actor_launch_s": actor_launch_s,
+                "sync_rollout_weights_wait_s": 0.0,
+            }
+            self._update_resize_execution_metrics(**self._last_sync_rollout_weight_diagnostics)
+            return []
+        rollout_ref_list = []
+        actor_ref_list = []
         if rollout_refs is not None:
-            refs.extend(rollout_refs if isinstance(rollout_refs, list) else [rollout_refs])
+            rollout_ref_list.extend(rollout_refs if isinstance(rollout_refs, list) else [rollout_refs])
         if actor_refs is not None:
-            refs.extend(actor_refs if isinstance(actor_refs, list) else [actor_refs])
-        if refs:
-            ray.get(refs)
+            actor_ref_list.extend(actor_refs if isinstance(actor_refs, list) else [actor_refs])
+
+        rollout_wait_started_at = time.monotonic()
+        rollout_results = ray.get(rollout_ref_list) if rollout_ref_list else []
+        rollout_wait_s = time.monotonic() - rollout_wait_started_at
+        actor_wait_started_at = time.monotonic()
+        actor_results = ray.get(actor_ref_list) if actor_ref_list else []
+        actor_wait_s = time.monotonic() - actor_wait_started_at
+        diagnostics = {
+            "sync_rollout_weights_launch_s": time.monotonic() - launch_started_at - rollout_wait_s - actor_wait_s,
+            "sync_rollout_weights_rollout_launch_s": rollout_launch_s,
+            "sync_rollout_weights_actor_launch_s": actor_launch_s,
+            "sync_rollout_weights_rollout_wait_s": rollout_wait_s,
+            "sync_rollout_weights_actor_wait_s": actor_wait_s,
+            "sync_rollout_weights_wait_s": rollout_wait_s + actor_wait_s,
+        }
+        diagnostics.update(self._collect_sync_rollout_weight_metrics(rollout_results + actor_results))
+        self._last_sync_rollout_weight_diagnostics = diagnostics
+        self._update_resize_execution_metrics(**diagnostics)
+        return rollout_results + actor_results
 
     def _create_continuous_iterator(self):
         """
@@ -3010,10 +3619,17 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                         metrics.update(_metrics)
                         batch.meta_info.pop("timing", None)
 
-                # sync weights from actor to rollout
-                with marked_timer("sync_rollout_weights", timing_raw, color="purple"):
-                    self.sync_rollout_weights()
-                    await self.async_rollout_manager.clear_kv_cache_async()
+                # sync weights from actor to rollout only when we are about to
+                # launch generation on the current rollout group. On a scheduled
+                # resize step the old rollout group will be replaced before the
+                # next generation, so this pre-train sync is pure overhead and
+                # can also contend with resize staging/preload work.
+                if not resize_scheduled_this_step:
+                    with marked_timer("sync_rollout_weights", timing_raw, color="purple"):
+                        self.sync_rollout_weights()
+                        await self.async_rollout_manager.clear_kv_cache_async()
+                else:
+                    timing_raw["sync_rollout_weights"] = 0.0
 
                 # async next generation
                 if not is_last_step and not resize_scheduled_this_step:
@@ -3160,7 +3776,14 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 # update critic
                 if self.use_critic:
                     with marked_timer("update_critic", timing_raw, color="pink"):
-                        critic_output = self.critic_wg.update_critic(batch)
+                        with resize_trace_span(
+                            self._resize_trace_config,
+                            "train_update_critic",
+                            step=self.global_steps,
+                            lane="trainer_train",
+                            metadata={},
+                        ):
+                            critic_output = self.critic_wg.update_critic(batch)
                     critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                     metrics.update(critic_output_metrics)
                 await asyncio.sleep(0)
@@ -3169,11 +3792,18 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 if self.config.trainer.critic_warmup <= self.global_steps:
                     # update actor
                     with marked_timer("update_actor", timing_raw, color="red"):
-                        rollout_config = self.config.actor_rollout_ref.rollout
-                        batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
-                        # TODO: Make "temperature" single source of truth from generation.
-                        batch.meta_info["temperature"] = rollout_config.temperature
-                        actor_output = self.actor_rollout_wg.update_actor(batch)
+                        with resize_trace_span(
+                            self._resize_trace_config,
+                            "train_update_actor",
+                            step=self.global_steps,
+                            lane="trainer_train",
+                            metadata={},
+                        ):
+                            rollout_config = self.config.actor_rollout_ref.rollout
+                            batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
+                            # TODO: Make "temperature" single source of truth from generation.
+                            batch.meta_info["temperature"] = rollout_config.temperature
+                            actor_output = self.actor_rollout_wg.update_actor(batch)
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     resize_execution_actor_metrics = {
                         key: value
