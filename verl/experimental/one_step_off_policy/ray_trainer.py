@@ -530,28 +530,6 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         )
         return {"refs": refs, "started_at": time.monotonic()}
 
-    def _start_async_actor_optimizer_host_export(
-        self, actor_wg: RayWorkerGroup, actor_resume_path: str, runtime_staging_cfg: dict
-    ):
-        refs = actor_wg.execute_all_async(
-            f"{str(Role.Actor)}_stage_actor_optimizer_state_to_host",
-            actor_resume_path,
-            staging_config=runtime_staging_cfg,
-        )
-        return {"refs": refs, "started_at": time.monotonic()}
-
-    def _finish_async_actor_optimizer_host_export(self, export_task) -> dict[str, float]:
-        if export_task is None:
-            return {}
-        wait_started_at = time.monotonic()
-        results = ray.get(export_task["refs"])
-        wait_duration = time.monotonic() - wait_started_at
-        total_duration = time.monotonic() - float(export_task["started_at"])
-        metrics = self._merge_resize_numeric_metrics(results)
-        metrics["resize/host_stage_async_optimizer_export_wait_s"] = float(wait_duration)
-        metrics["resize/host_stage_async_optimizer_export_total_s"] = float(total_duration)
-        return metrics
-
     def _finish_async_actor_host_restore(
         self,
         restore_task,
@@ -2374,47 +2352,26 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 runtime_staging_cfg = self._make_runtime_handoff_staging_dict(effective_backend=export_decision.effective_backend)
 
         # Phase 0: export the train-side state into the host staging backend
-        # before shared-pool slots are reclaimed. For pinned + deferred full
-        # optimizer restore, only model pages are on the critical path; optimizer
-        # pages are appended asynchronously while new worker groups reinit.
-        optimizer_export_task = None
-        split_optimizer_export = (
-            actor_resume_kind == "host_staging"
-            and runtime_staging_cfg.get("backend") == "pinned_cpu"
-            and bool(runtime_staging_cfg.get("stage_optimizer", False))
-            and str(runtime_staging_cfg.get("optimizer_restore_policy", "deferred")) == "deferred"
-            and bool(runtime_staging_cfg.get("optimizer_full_state_restore", True))
-            and shrinking_role == Role.Rollout
-        )
+        # before shared-pool slots are reclaimed.
         if actor_resume_kind == "host_staging":
-            logger.info("[one-step-off][resize][host-stage] exporting actor model state before staged switch")
-            critical_staging_cfg = dict(runtime_staging_cfg)
-            if split_optimizer_export:
-                critical_staging_cfg["stage_optimizer"] = False
+            logger.info("[one-step-off][resize][host-stage] exporting actor state before staged switch")
             with resize_trace_span(
                 self._resize_trace_config,
                 "resize_export",
                 step=self._trace_step(),
                 lane="trainer_main",
-                metadata={
-                    "backend": runtime_staging_cfg.get("backend", "disk_fallback"),
-                    "split_optimizer_export": bool(split_optimizer_export),
-                },
+                metadata={"backend": runtime_staging_cfg.get("backend", "disk_fallback")},
             ):
                 export_started_at = time.monotonic()
                 export_results = old_actor_wg.stage_actor_handoff_state_to_host(
                     actor_resume_path,
-                    staging_config=critical_staging_cfg,
+                    staging_config=runtime_staging_cfg,
                 )
                 export_duration = time.monotonic() - export_started_at
             export_metrics = {"resize/host_stage_export_s": export_duration}
             export_metrics.update(self._merge_resize_numeric_metrics(export_results))
-            export_metrics["resize/host_stage_split_optimizer_export"] = 1.0 if split_optimizer_export else 0.0
+            export_metrics["resize/host_stage_split_optimizer_export"] = 0.0
             self._update_resize_execution_metrics(**export_metrics)
-            if split_optimizer_export:
-                logger.info(
-                    "[one-step-off][resize][host-stage] deferring async optimizer export until after new worker reinit starts"
-                )
             if self._handoff_staging_config.preclear_rollout_kv_cache:
                 # Reclaim rollout-side transient memory before the switch window.
                 kv_cache_preclear_s = await self._clear_rollout_kv_cache_before_resize_async()
@@ -2472,11 +2429,11 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             f"shrinking_role={shrinking_role}"
         )
 
-        # Phase A: release whichever side is shrinking to free shared-pool slots.
-        if shrinking_role == Role.Actor:
-            self.remove_role_group(Role.Actor, old_actor_wg)
-        else:
-            self.remove_role_group(Role.Rollout, old_rollout_wg)
+        # Phase 1: release the old pair, then build the new actor and rollout
+        # groups concurrently. The resize handoff already preserves the actor
+        # model state.
+        self.remove_role_group(Role.Actor, old_actor_wg)
+        self.remove_role_group(Role.Rollout, old_rollout_wg)
 
         actor_pool = self._resolve_role_pool(Role.Actor, actor_spec)
         rollout_pool = self._resolve_role_pool(Role.Rollout, rollout_spec)
@@ -2487,6 +2444,8 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             and str(runtime_staging_cfg.get("optimizer_restore_policy", "deferred")) == "deferred"
         )
         actor_restore_task = None
+        actor_restore_wait_task = None
+        comm_prewarm_task = None
 
         async def _start_actor_restore_after_commit(actor_wg: RayWorkerGroup):
             restore_task = None
@@ -2573,46 +2532,9 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 )
             return restore_task
 
-        if shrinking_role == Role.Rollout:
-            # Once the shrinking rollout has been released, the target actor and
-            # rollout groups fit in the shared pool together. Build/commit them
-            # concurrently; actor restore starts as soon as actor commit returns.
-            async def _build_commit_actor():
-                actor_wg = await asyncio.to_thread(
-                    self.add_role_group,
-                    Role.Actor,
-                    name=item.get("actor_group_name"),
-                    resource_pool=actor_pool,
-                    detached=detached,
-                    name_prefix=name_prefix,
-                    prepare_only=True,
-                )
-                await asyncio.to_thread(self._commit_role_group_init, actor_wg, role=Role.Actor)
-                return actor_wg
-
-            async def _build_commit_rollout():
-                rollout_wg = await asyncio.to_thread(
-                    self.add_role_group,
-                    Role.Rollout,
-                    name=item.get("rollout_group_name"),
-                    resource_pool=rollout_pool,
-                    detached=detached,
-                    name_prefix=name_prefix,
-                    prepare_only=True,
-                )
-                await asyncio.to_thread(self._commit_role_group_init, rollout_wg, role=Role.Rollout)
-                return rollout_wg
-
-            actor_group_task = asyncio.create_task(_build_commit_actor())
-            rollout_group_task = asyncio.create_task(_build_commit_rollout())
-            new_actor_wg = await actor_group_task
-            actor_restore_task = await _start_actor_restore_after_commit(new_actor_wg)
-            new_rollout_wg = await rollout_group_task
-            self._update_resize_execution_metrics(**{"resize/parallel_actor_rollout_reinit": 1.0})
-        else:
-            # Actor shrink needs old rollout lifetime/resource ordering preserved;
-            # keep the original actor-first sequence for that direction.
-            new_actor_wg = await self.add_role_group_async(
+        async def _build_commit_actor():
+            actor_wg = await asyncio.to_thread(
+                self.add_role_group,
                 Role.Actor,
                 name=item.get("actor_group_name"),
                 resource_pool=actor_pool,
@@ -2620,11 +2542,12 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 name_prefix=name_prefix,
                 prepare_only=True,
             )
-            await self._commit_role_group_init_async(new_actor_wg, role=Role.Actor)
-            actor_restore_task = await _start_actor_restore_after_commit(new_actor_wg)
+            await asyncio.to_thread(self._commit_role_group_init, actor_wg, role=Role.Actor)
+            return actor_wg
 
-            self.remove_role_group(Role.Rollout, old_rollout_wg)
-            new_rollout_wg = await self.add_role_group_async(
+        async def _build_commit_rollout():
+            rollout_wg = await asyncio.to_thread(
+                self.add_role_group,
                 Role.Rollout,
                 name=item.get("rollout_group_name"),
                 resource_pool=rollout_pool,
@@ -2632,32 +2555,52 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 name_prefix=name_prefix,
                 prepare_only=True,
             )
-            await self._commit_role_group_init_async(new_rollout_wg, role=Role.Rollout)
-            self._update_resize_execution_metrics(**{"resize/parallel_actor_rollout_reinit": 0.0})
+            await asyncio.to_thread(self._commit_role_group_init, rollout_wg, role=Role.Rollout)
+            return rollout_wg
 
-        if split_optimizer_export and optimizer_export_task is None:
-            logger.info("[one-step-off][resize][host-stage] starting async optimizer export after worker reinit")
-            optimizer_export_task = self._start_async_actor_optimizer_host_export(
-                old_actor_wg,
-                actor_resume_path,
-                runtime_staging_cfg,
+        async def _wait_for_actor_restore_async(actor_wg: RayWorkerGroup):
+            logger.info("[one-step-off][resize][host-stage] waiting for async actor import before reading weights")
+
+            def _wait_restore():
+                with resize_trace_span(
+                    self._resize_trace_config,
+                    "resize_import_wait",
+                    step=self._trace_step(),
+                    lane="trainer_main",
+                    metadata={"backend": runtime_staging_cfg.get("backend", "disk_fallback")},
+                ):
+                    return self._finish_async_actor_host_restore(
+                        actor_restore_task,
+                        actor_wg=actor_wg,
+                        actor_resume_path=actor_resume_path,
+                        runtime_staging_cfg=runtime_staging_cfg,
+                    )
+
+            return await asyncio.to_thread(_wait_restore)
+
+        actor_group_task = asyncio.create_task(_build_commit_actor())
+        rollout_group_task = asyncio.create_task(_build_commit_rollout())
+        new_actor_wg = await actor_group_task
+        actor_restore_task = await _start_actor_restore_after_commit(new_actor_wg)
+        if actor_restore_task is not None:
+            actor_restore_wait_task = asyncio.create_task(_wait_for_actor_restore_async(new_actor_wg))
+        new_rollout_wg = await rollout_group_task
+        self._update_resize_execution_metrics(**{"resize/parallel_actor_rollout_reinit": 1.0})
+
+        if self._dynamic_resize_async_comm_prewarm_enabled:
+            comm_prewarm_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self._prepare_weight_sync_group,
+                    new_actor_wg,
+                    new_rollout_wg,
+                    topology_key=self._candidate_topology_key(actor_spec=actor_spec, rollout_spec=rollout_spec),
+                    actor_spec=actor_spec,
+                    rollout_spec=rollout_spec,
+                )
             )
 
-        if actor_restore_task is not None:
-            logger.info("[one-step-off][resize][host-stage] waiting for async actor import before reading weights")
-            with resize_trace_span(
-                self._resize_trace_config,
-                "resize_import_wait",
-                step=self._trace_step(),
-                lane="trainer_main",
-                metadata={"backend": runtime_staging_cfg.get("backend", "disk_fallback")},
-            ):
-                self._finish_async_actor_host_restore(
-                    actor_restore_task,
-                    actor_wg=new_actor_wg,
-                    actor_resume_path=actor_resume_path,
-                    runtime_staging_cfg=runtime_staging_cfg,
-                )
+        if actor_restore_wait_task is not None:
+            await actor_restore_wait_task
             if defer_optimizer_restore and has_restore_session_manifest(actor_resume_path):
                 session_manifest = read_restore_session_manifest(actor_resume_path)
                 self._update_resize_execution_metrics(
@@ -2684,65 +2627,45 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                         exc,
                     )
 
-        weights_info = self._get_actor_weights_info(new_actor_wg)[0]
-        self._set_actor_weights_info(new_rollout_wg, weights_info)
+        with resize_trace_span(
+            self._resize_trace_config,
+            "resize_postprocess",
+            step=self._trace_step(),
+            lane="trainer_main",
+            metadata={"backend": runtime_staging_cfg.get("backend", "disk_fallback")},
+        ):
+            weights_info = self._get_actor_weights_info(new_actor_wg)[0]
+            self._set_actor_weights_info(new_rollout_wg, weights_info)
 
-        # Keep the staged shared-pool path aligned with the non-staged switch
-        # flow: prewarm the inter-role communicator on the new worker lifecycle
-        # before publishing the topology, so the final switch can use activate
-        # instead of rebuilding the communicator in the critical window.
-        if self._dynamic_resize_async_comm_prewarm_enabled:
-            self._prepare_weight_sync_group(
+            if comm_prewarm_task is not None:
+                await comm_prewarm_task
+
+            # Publish the new pair together.
+            self._switch_weight_sync_group(
                 new_actor_wg,
                 new_rollout_wg,
-                topology_key=self._candidate_topology_key(actor_spec=actor_spec, rollout_spec=rollout_spec),
                 actor_spec=actor_spec,
                 rollout_spec=rollout_spec,
             )
+            self._publish_active_topology_state(actor_spec=actor_spec, rollout_spec=rollout_spec)
+            if defer_optimizer_restore:
+                # Default pinned optimizer restore uses the original full-state
+                # distribution path. Start it asynchronously right after publishing
+                # the new topology so it can overlap with post-switch rollout work.
+                # The experimental chunked optimizer path remains available behind
+                # optimizer_full_state_restore=false.
+                use_lazy_pinned_optimizer = (
+                    runtime_staging_cfg.get("backend") == "pinned_cpu"
+                    and bool(runtime_staging_cfg.get("async_optimizer_preload", True))
+                    and not bool(runtime_staging_cfg.get("optimizer_full_state_restore", True))
+                )
+                if not use_lazy_pinned_optimizer:
+                    self._start_deferred_optimizer_materialize(new_actor_wg)
 
-        # Publish the new pair together.
-        self._switch_weight_sync_group(
-            new_actor_wg,
-            new_rollout_wg,
-            actor_spec=actor_spec,
-            rollout_spec=rollout_spec,
-        )
-        self._publish_active_topology_state(actor_spec=actor_spec, rollout_spec=rollout_spec)
-        if defer_optimizer_restore:
-            if optimizer_export_task is not None:
-                with resize_trace_span(
-                    self._resize_trace_config,
-                    "resize_optimizer_export_wait",
-                    step=self._trace_step(),
-                    lane="trainer_main",
-                    metadata={"backend": runtime_staging_cfg.get("backend", "disk_fallback")},
-                ):
-                    optimizer_export_metrics = self._finish_async_actor_optimizer_host_export(optimizer_export_task)
-                self._update_resize_execution_metrics(**optimizer_export_metrics)
-                if has_restore_session_manifest(actor_resume_path):
-                    session_manifest = read_restore_session_manifest(actor_resume_path)
-                    self._update_resize_execution_metrics(
-                        **{"resize/optimizer_pending_pages": float(session_manifest.get("optimizer_page_count", 0))}
-                    )
-            # Default pinned optimizer restore uses the original full-state
-            # distribution path. Start it asynchronously right after publishing
-            # the new topology so it can overlap with post-switch rollout work.
-            # The experimental chunked optimizer path remains available behind
-            # optimizer_full_state_restore=false.
-            use_lazy_pinned_optimizer = (
-                runtime_staging_cfg.get("backend") == "pinned_cpu"
-                and bool(runtime_staging_cfg.get("async_optimizer_preload", True))
-                and not bool(runtime_staging_cfg.get("optimizer_full_state_restore", True))
-            )
-            if not use_lazy_pinned_optimizer:
-                self._start_deferred_optimizer_materialize(new_actor_wg)
+            await self._shutdown_async_rollout_manager_async()
+            await self._init_async_rollout_manager_async()
+            await self._sync_rollout_weights_after_resize_async(handoff_path=actor_resume_path)
 
-        await self._shutdown_async_rollout_manager_async()
-        await self._init_async_rollout_manager_async()
-        await self._sync_rollout_weights_after_resize_async(handoff_path=actor_resume_path)
-
-        if shrinking_role == Role.Rollout:
-            self.remove_role_group(Role.Actor, old_actor_wg)
         self._cleanup_pending_weight_sync_groups()
         logger.info("[one-step-off][resize][staged] done")
         return True

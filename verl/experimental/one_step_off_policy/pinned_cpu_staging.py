@@ -8,11 +8,20 @@ local disk files.
 from __future__ import annotations
 
 import os
+import time
 from copy import deepcopy
 from typing import Any
 
 import ray
 import torch
+
+from verl.experimental.one_step_off_policy.staging_backend import (
+    build_paged_optimizer_state_pages,
+    has_paged_state_dict,
+    read_paged_state_manifest,
+    update_restore_session_manifest,
+    write_paged_state_manifest,
+)
 
 
 PINNED_CPU_STAGING_NAMESPACE = "verl_pinned_cpu_staging"
@@ -154,6 +163,107 @@ class PinnedCPUStagingService:
 
     def release_session(self, session_id: str) -> bool:
         return self._sessions.pop(session_id, None) is not None
+
+    def export_optimizer_state_to_stage(
+        self,
+        *,
+        local_path: str,
+        optim_state_dict: dict[str, Any],
+        chunk_mb: int,
+        host_preload_threshold: float,
+    ) -> dict[str, float]:
+        """Build and write optimizer pages after the old actor has handed off state."""
+
+        started_at_total = time.monotonic()
+        page_bytes = max(int(chunk_mb or 0), 1) * 1024 * 1024
+        metrics: dict[str, float] = {}
+
+        started_at = time.monotonic()
+        optim_manifest, optim_pages = build_paged_optimizer_state_pages(
+            prefix="optim_state",
+            optim_state_dict=optim_state_dict,
+            page_bytes=page_bytes,
+        )
+        metrics["resize/host_stage_optimizer_service_build_pages_s"] = float(time.monotonic() - started_at)
+        metrics["resize/host_stage_optimizer_service_page_count"] = float(optim_manifest.get("page_count", 0) or 0)
+
+        host_free_bytes = psutil_available_memory_bytes()
+        host_budget_bytes = int((host_free_bytes or 0) * min(max(float(host_preload_threshold), 0.0), 1.0))
+        host_used_bytes = 0
+        if has_paged_state_dict(local_path, "model_state"):
+            model_manifest = read_paged_state_manifest(local_path, "model_state")
+            host_used_bytes += sum(
+                int(page.get("estimated_bytes", 0))
+                for page in model_manifest.get("pages", [])
+                if page.get("storage") in {"host", "host_file"}
+            )
+
+        host_file_count = 0
+        disk_spill_count = 0
+        host_file_write_s = 0.0
+        disk_spill_s = 0.0
+        for page_meta, page in zip(optim_manifest["pages"], optim_pages, strict=True):
+            page_bytes_est = int(page_meta.get("estimated_bytes") or _estimate_bytes(page))
+            can_stage_host = host_used_bytes + page_bytes_est <= host_budget_bytes
+            page_started_at = time.monotonic()
+            if can_stage_host:
+                page_meta["storage"] = "host_file"
+                host_used_bytes += page_bytes_est
+                host_file_count += 1
+                torch.save(page, os.path.join(local_path, page_meta["file_name"]))
+                host_file_write_s += float(time.monotonic() - page_started_at)
+            else:
+                page_meta["storage"] = "disk"
+                disk_spill_count += 1
+                torch.save(page, os.path.join(local_path, page_meta["file_name"]))
+                disk_spill_s += float(time.monotonic() - page_started_at)
+
+        optim_manifest["host_staged_bytes"] = sum(
+            int(page.get("estimated_bytes", 0))
+            for page in optim_manifest["pages"]
+            if page.get("storage") in {"host", "host_file"}
+        )
+        optim_manifest["disk_staged_bytes"] = sum(
+            int(page.get("estimated_bytes", 0))
+            for page in optim_manifest["pages"]
+            if page.get("storage") not in {"host", "host_file"}
+        )
+
+        started_at = time.monotonic()
+        write_paged_state_manifest(local_path, "optim_state", optim_manifest)
+        metrics["resize/host_stage_optimizer_service_manifest_put_s"] = float(time.monotonic() - started_at)
+        update_restore_session_manifest(
+            local_path,
+            optimizer_page_count=int(optim_manifest.get("page_count", 0)),
+            staged_optimizer_bytes=int(optim_manifest.get("total_bytes", 0)),
+            status="optimizer_staged",
+            last_error="",
+        )
+
+        extra_state_path = os.path.join(local_path, "extra_state.pt")
+        if os.path.exists(extra_state_path):
+            extra_state = torch.load(extra_state_path, weights_only=False)
+            extra_state["stage_optimizer"] = True
+            extra_state["paged_optim_state"] = True
+            torch.save(extra_state, extra_state_path)
+
+        metrics["resize/host_stage_optimizer_service_host_file_write_s"] = host_file_write_s
+        metrics["resize/host_stage_optimizer_service_disk_spill_s"] = disk_spill_s
+        metrics["resize/host_stage_optimizer_service_host_pages"] = float(host_file_count)
+        metrics["resize/host_stage_optimizer_service_disk_pages"] = float(disk_spill_count)
+        metrics["resize/host_stage_optimizer_service_host_bytes"] = float(optim_manifest["host_staged_bytes"])
+        metrics["resize/host_stage_optimizer_service_disk_bytes"] = float(optim_manifest["disk_staged_bytes"])
+        metrics["resize/host_stage_optimizer_service_total_s"] = float(time.monotonic() - started_at_total)
+        return metrics
+
+
+def psutil_available_memory_bytes() -> int | None:
+    try:
+        import psutil
+
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        return None
 
 
 def get_or_create_pinned_cpu_staging_service(service_name: str):
