@@ -228,11 +228,12 @@ class LLMServerClient:
                 multimodal_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
             # priority is only supported by vLLM rollout server.
             priority = kwargs.pop("priority", 0)
+            backend_request_id = kwargs.pop("backend_request_id", uuid4().hex)
             priority_kwargs = (
                 {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
             )
             output: TokenOutput = await server.generate.remote(
-                request_id=uuid4().hex,  # use new request_id for each turn
+                request_id=backend_request_id,  # use new request_id for each turn unless caller tags it
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 image_data=image_data,
@@ -299,6 +300,11 @@ class FullyAsyncLLMServerClient(LLMServerClient):
 
         while True:
             # 1. generate tokens
+            turn_kwargs = dict(kwargs)
+            if "backend_request_id" in turn_kwargs and final_output.token_ids:
+                turn_kwargs["backend_request_id"] = (
+                    f"{turn_kwargs['backend_request_id']}__resume{len(final_output.token_ids)}"
+                )
             output = await super().generate(
                 request_id=request_id,
                 prompt_ids=prompt_ids + final_output.token_ids,
@@ -307,7 +313,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 video_data=video_data,
                 audio_data=audio_data,
                 mm_processor_kwargs=mm_processor_kwargs,
-                **kwargs,
+                **turn_kwargs,
             )
 
             # 2. merge output into final_output
