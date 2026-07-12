@@ -42,6 +42,7 @@ from verl.experimental.one_step_off_policy.resize_controller import (
     ResizeControllerConfig,
 )
 from verl.experimental.one_step_off_policy.resize_metrics import build_resize_observation
+from verl.experimental.one_step_off_policy.staging_backend import HostStagingConfig
 from verl.experimental.one_step_off_policy.trace_utils import append_resize_trace, build_resize_trace_config
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.experimental.separation.utils import dynamic_resize_shared_pool_enabled
@@ -161,9 +162,13 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         self._resize_controller = self._build_resize_controller()
         self._resize_budget_config = ResizeBudgetConfig.from_dict(self._dynamic_resize_cfg.get("budget_protection", {}))
         self._resize_budget_controller = ResizeBudgetController(self._resize_budget_config)
+        self._host_staging_config = HostStagingConfig.from_dict(
+            self._dynamic_resize_cfg.get("handoff", {"enable": False})
+        )
         self._resize_trace_config = build_resize_trace_config(self.config)
         self._latest_resize_control_metrics: dict[str, float | str | int] = self._default_resize_control_metrics()
         self._latest_resize_budget_metrics: dict[str, float | str | int] = self._default_resize_budget_metrics()
+        self._latest_resize_handoff_metrics: dict[str, float | str | int] = self._default_resize_handoff_metrics()
 
     @staticmethod
     def _cfg_to_plain_dict(cfg) -> dict[str, Any]:
@@ -224,6 +229,17 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/budget_ratio": self._resize_budget_config.memory_budget_ratio,
             "resize/budget_blocked": 0.0,
             "resize/budget_reason": "",
+        }
+
+    def _default_resize_handoff_metrics(self) -> dict[str, float | str | int]:
+        return {
+            "resize/handoff_enabled": 1.0 if self._host_staging_config.enable else 0.0,
+            "resize/handoff_backend": self._host_staging_config.effective_backend(),
+            "resize/handoff_stage_optimizer": 1.0 if self._host_staging_config.stage_optimizer else 0.0,
+            "resize/handoff_optimizer_restore_policy": self._host_staging_config.optimizer_restore_policy,
+            "resize/handoff_preclear_rollout_kv_cache": 1.0
+            if self._host_staging_config.preclear_rollout_kv_cache
+            else 0.0,
         }
 
     def _build_resize_control_metrics(self, snapshot: dict[str, float | str | int]) -> dict[str, float | str | int]:
@@ -589,7 +605,11 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         if not self._dynamic_resize_enabled:
             return {}
 
-        metrics = dict(self._latest_resize_control_metrics)
+        metrics = {
+            **getattr(self, "_latest_resize_control_metrics", {}),
+            **getattr(self, "_latest_resize_budget_metrics", {}),
+            **getattr(self, "_latest_resize_handoff_metrics", {}),
+        }
         schedule_seen = False
         for item in self._normalize_dynamic_resize_schedule():
             if int(item.get("step", -1)) != self.global_steps:

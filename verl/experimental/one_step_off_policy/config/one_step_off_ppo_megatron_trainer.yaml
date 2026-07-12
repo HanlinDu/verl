@@ -38,6 +38,21 @@ trainer:
     mode: schedule
     hard_switch:
       enable: false
+    handoff:
+      enable: false
+      backend: disk_fallback
+      service_name: null
+      chunk_mb: 256
+      stage_optimizer: false
+      optimizer_restore_policy: deferred
+      progressive_swap: false
+      async_optimizer_preload: false
+      optimizer_full_state_restore: false
+      preload_queue_depth: 2
+      host_preload_threshold: 0.85
+      device_preload_threshold: 0.9
+      cleanup_after_load: true
+      preclear_rollout_kv_cache: true
     trace:
       enable: false
       path: ""

@@ -17,6 +17,7 @@ from verl.experimental.one_step_off_policy.resize_controller import (
 )
 from verl.experimental.one_step_off_policy.resize_metrics import build_resize_observation
 from verl.experimental.one_step_off_policy.ray_trainer import OneStepOffRayTrainer
+from verl.experimental.one_step_off_policy.staging_backend import HostStagingConfig
 from verl.experimental.one_step_off_policy.trace_utils import ResizeTraceConfig
 from verl.experimental.separation.utils import build_dynamic_resize_pool_topology, create_resource_pool_manager
 from verl.trainer.ppo.utils import Role
@@ -86,7 +87,23 @@ def test_one_step_off_configs_define_disabled_dynamic_resize_by_default():
     assert megatron_cfg.trainer.dynamic_resize.enable is False
     assert fsdp_cfg.trainer.dynamic_resize.hard_switch.enable is False
     assert megatron_cfg.trainer.dynamic_resize.hard_switch.enable is False
+    assert fsdp_cfg.trainer.dynamic_resize.handoff.enable is False
+    assert megatron_cfg.trainer.dynamic_resize.handoff.enable is False
+    assert fsdp_cfg.trainer.dynamic_resize.handoff.backend == "disk_fallback"
+    assert fsdp_cfg.trainer.dynamic_resize.handoff.stage_optimizer is False
     assert fsdp_cfg.trainer.dynamic_resize.schedule == []
+
+
+def test_dynamic_resize_handoff_metrics_reflect_disabled_default_and_pinned_backend():
+    trainer = object.__new__(OneStepOffRayTrainer)
+    trainer._dynamic_resize_cfg = {"handoff": {"enable": True, "backend": "pinned_cpu", "stage_optimizer": True}}
+    trainer._host_staging_config = HostStagingConfig.from_dict(trainer._dynamic_resize_cfg["handoff"])
+    metrics = trainer._default_resize_handoff_metrics()
+
+    assert metrics["resize/handoff_enabled"] == 1.0
+    assert metrics["resize/handoff_backend"] == "pinned_cpu"
+    assert metrics["resize/handoff_stage_optimizer"] == 1.0
+    assert metrics["resize/handoff_optimizer_restore_policy"] == "deferred"
 
 
 def test_dynamic_resize_defer_next_rollout_requires_hard_switch_schedule_match():
