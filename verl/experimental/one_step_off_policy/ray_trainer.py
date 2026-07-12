@@ -46,7 +46,14 @@ from verl.experimental.one_step_off_policy.resize_controller import (
     ResizeControllerConfig,
 )
 from verl.experimental.one_step_off_policy.resize_metrics import build_resize_observation
-from verl.experimental.one_step_off_policy.staging_backend import HostStagingConfig
+from verl.experimental.one_step_off_policy.staging_backend import (
+    HostStagingConfig,
+    create_restore_session_manifest,
+    finalize_restore_session_manifest,
+    has_restore_session_manifest,
+    read_restore_session_manifest,
+    write_host_staging_manifest,
+)
 from verl.experimental.one_step_off_policy.trace_utils import append_resize_trace, build_resize_trace_config
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.experimental.separation.utils import dynamic_resize_shared_pool_enabled
@@ -248,6 +255,11 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/handoff_preclear_rollout_kv_cache": 1.0
             if self._host_staging_config.preclear_rollout_kv_cache
             else 0.0,
+            "resize/handoff_manifest_written": 0.0,
+            "resize/handoff_restore_session_status": "",
+            "resize/handoff_stage_dir": "",
+            "resize/handoff_session_id": "",
+            "resize/handoff_error": "",
         }
 
     def _build_resize_control_metrics(self, snapshot: dict[str, float | str | int]) -> dict[str, float | str | int]:
@@ -551,6 +563,94 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             checkpoint_folder = os.path.join(os.getcwd(), checkpoint_folder)
         return os.path.join(checkpoint_folder, f"global_step_{self.global_steps}")
 
+    @staticmethod
+    def _dynamic_resize_handoff_stage_dir(global_step_folder: str) -> str:
+        return os.path.join(global_step_folder, "dynamic_resize_handoff")
+
+    def _prepare_dynamic_resize_handoff_session(self, global_step_folder: str) -> dict[str, float | str | int]:
+        metrics = self._default_resize_handoff_metrics()
+        if not self._host_staging_config.enable:
+            return metrics
+
+        stage_dir = self._dynamic_resize_handoff_stage_dir(global_step_folder)
+        session_id = f"dynamic_resize_step_{self.global_steps}_{uuid.uuid4().hex}"
+        try:
+            write_host_staging_manifest(stage_dir, self._host_staging_config)
+            manifest = create_restore_session_manifest(
+                stage_dir,
+                backend=self._host_staging_config.effective_backend(),
+                service_name=self._host_staging_config.service_name,
+                session_id=session_id,
+                optimizer_restore_policy=self._host_staging_config.optimizer_restore_policy,
+            )
+        except Exception as exc:
+            logger.warning("[one-step-off][resize][handoff] failed to write handoff manifest: %s", exc)
+            metrics.update(
+                {
+                    "resize/handoff_manifest_written": 0.0,
+                    "resize/handoff_stage_dir": stage_dir,
+                    "resize/handoff_session_id": session_id,
+                    "resize/handoff_error": str(exc),
+                }
+            )
+            return metrics
+
+        metrics.update(
+            {
+                "resize/handoff_manifest_written": 1.0,
+                "resize/handoff_restore_session_status": manifest.get("status", ""),
+                "resize/handoff_stage_dir": stage_dir,
+                "resize/handoff_session_id": manifest.get("session_id", session_id),
+                "resize/handoff_error": "",
+            }
+        )
+        return metrics
+
+    def _complete_dynamic_resize_handoff_session(self, global_step_folder: str) -> dict[str, float | str | int]:
+        metrics = self._default_resize_handoff_metrics()
+        if not self._host_staging_config.enable:
+            return metrics
+
+        stage_dir = self._dynamic_resize_handoff_stage_dir(global_step_folder)
+        if not has_restore_session_manifest(stage_dir):
+            metrics.update(
+                {
+                    "resize/handoff_stage_dir": stage_dir,
+                    "resize/handoff_error": "restore_session_manifest_missing",
+                }
+            )
+            return metrics
+
+        try:
+            manifest = finalize_restore_session_manifest(stage_dir)
+        except Exception as exc:
+            logger.warning("[one-step-off][resize][handoff] failed to finalize handoff manifest: %s", exc)
+            try:
+                manifest = read_restore_session_manifest(stage_dir)
+            except Exception:
+                manifest = {}
+            metrics.update(
+                {
+                    "resize/handoff_manifest_written": 1.0,
+                    "resize/handoff_restore_session_status": manifest.get("status", ""),
+                    "resize/handoff_stage_dir": stage_dir,
+                    "resize/handoff_session_id": manifest.get("session_id", ""),
+                    "resize/handoff_error": str(exc),
+                }
+            )
+            return metrics
+
+        metrics.update(
+            {
+                "resize/handoff_manifest_written": 1.0,
+                "resize/handoff_restore_session_status": manifest.get("status", ""),
+                "resize/handoff_stage_dir": stage_dir,
+                "resize/handoff_session_id": manifest.get("session_id", ""),
+                "resize/handoff_error": "",
+            }
+        )
+        return metrics
+
     def _load_dynamic_resize_checkpoint(self, global_step_folder: str) -> None:
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, str(Role.Critic))
@@ -675,11 +775,13 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         checkpoint_step_folder = self._dynamic_resize_checkpoint_step_folder()
         with marked_timer("dynamic_resize_save_checkpoint", self.timing_raw, color="green"):
             self._save_checkpoint(save_full_model_for_dynamic_resize=True)
+            metrics.update(self._prepare_dynamic_resize_handoff_session(checkpoint_step_folder))
 
         await self._destroy_dynamic_resize_runtime()
         with marked_timer("dynamic_resize_rebuild_runtime", self.timing_raw, color="green"):
             self._rebuild_dynamic_resize_runtime(actor_size=actor_target, rollout_size=rollout_target)
             self._load_dynamic_resize_checkpoint(checkpoint_step_folder)
+            metrics.update(self._complete_dynamic_resize_handoff_session(checkpoint_step_folder))
 
         with marked_timer("dynamic_resize_update_weights", self.timing_raw, color="green"):
             await self.checkpoint_manager.update_weights(self.global_steps)

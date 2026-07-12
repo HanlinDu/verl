@@ -18,7 +18,11 @@ from verl.experimental.one_step_off_policy.resize_controller import (
 )
 from verl.experimental.one_step_off_policy.resize_metrics import build_resize_observation
 from verl.experimental.one_step_off_policy.ray_trainer import OneStepOffRayTrainer
-from verl.experimental.one_step_off_policy.staging_backend import HostStagingConfig
+from verl.experimental.one_step_off_policy.staging_backend import (
+    HostStagingConfig,
+    read_host_staging_manifest,
+    read_restore_session_manifest,
+)
 from verl.experimental.one_step_off_policy.trace_utils import ResizeTraceConfig
 from verl.experimental.separation.utils import build_dynamic_resize_pool_topology, create_resource_pool_manager
 from verl.trainer.ppo.utils import Role
@@ -105,6 +109,44 @@ def test_dynamic_resize_handoff_metrics_reflect_disabled_default_and_pinned_back
     assert metrics["resize/handoff_backend"] == "pinned_cpu"
     assert metrics["resize/handoff_stage_optimizer"] == 1.0
     assert metrics["resize/handoff_optimizer_restore_policy"] == "deferred"
+    assert metrics["resize/handoff_manifest_written"] == 0.0
+
+
+def test_dynamic_resize_handoff_session_manifest_is_written_and_completed(tmp_path):
+    trainer = object.__new__(OneStepOffRayTrainer)
+    trainer.global_steps = 7
+    trainer._host_staging_config = HostStagingConfig.from_dict(
+        {
+            "enable": True,
+            "backend": "pinned_cpu",
+            "service_name": "resize-service",
+            "stage_optimizer": False,
+            "optimizer_restore_policy": "immediate",
+        }
+    )
+    global_step_folder = str(tmp_path / "global_step_7")
+
+    prepare_metrics = trainer._prepare_dynamic_resize_handoff_session(global_step_folder)
+
+    stage_dir = tmp_path / "global_step_7" / "dynamic_resize_handoff"
+    host_manifest = read_host_staging_manifest(str(stage_dir))
+    restore_manifest = read_restore_session_manifest(str(stage_dir))
+
+    assert prepare_metrics["resize/handoff_manifest_written"] == 1.0
+    assert prepare_metrics["resize/handoff_restore_session_status"] == "staged"
+    assert prepare_metrics["resize/handoff_stage_dir"] == str(stage_dir)
+    assert host_manifest["backend"] == "pinned_cpu"
+    assert host_manifest["service_name"] == "resize-service"
+    assert restore_manifest["backend"] == "pinned_cpu"
+    assert restore_manifest["service_name"] == "resize-service"
+    assert restore_manifest["optimizer_restore_policy"] == "immediate"
+
+    complete_metrics = trainer._complete_dynamic_resize_handoff_session(global_step_folder)
+    completed_manifest = read_restore_session_manifest(str(stage_dir))
+
+    assert complete_metrics["resize/handoff_manifest_written"] == 1.0
+    assert complete_metrics["resize/handoff_restore_session_status"] == "completed"
+    assert completed_manifest["status"] == "completed"
 
 
 def test_dynamic_resize_defer_next_rollout_requires_hard_switch_schedule_match():

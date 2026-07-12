@@ -157,6 +157,7 @@ def create_restore_session_manifest(
     *,
     backend: str,
     session_id: str | None = None,
+    service_name: str | None = None,
     optimizer_restore_policy: str = "deferred",
     model_manifest: dict[str, Any] | None = None,
     optimizer_manifest: dict[str, Any] | None = None,
@@ -164,6 +165,7 @@ def create_restore_session_manifest(
     manifest = RestoreSessionManifest(
         session_id=session_id or uuid.uuid4().hex,
         backend=backend,
+        service_name=_normalize_optional_string(service_name),
         optimizer_restore_policy=_normalize_optimizer_restore_policy(optimizer_restore_policy),
         model_page_count=_manifest_page_count(model_manifest),
         optimizer_page_count=_manifest_page_count(optimizer_manifest),
