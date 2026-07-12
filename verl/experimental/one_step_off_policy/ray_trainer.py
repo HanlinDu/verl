@@ -34,7 +34,11 @@ from torch.utils.data import Dataset, Sampler
 from tqdm import tqdm
 
 from verl import DataProto
-from verl.experimental.one_step_off_policy.resize_budget import ResizeBudgetConfig, ResizeBudgetController
+from verl.experimental.one_step_off_policy.resize_budget import (
+    ResizeBudgetConfig,
+    ResizeBudgetController,
+    ResizeBudgetSnapshot,
+)
 from verl.experimental.one_step_off_policy.resize_controller import (
     ACTION_HOLD,
     ACTION_TO_CODE,
@@ -229,6 +233,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/budget_ratio": self._resize_budget_config.memory_budget_ratio,
             "resize/budget_blocked": 0.0,
             "resize/budget_reason": "",
+            "resize/budget_effective_backend": self._host_staging_config.effective_backend(),
+            "resize/budget_estimated_stage_bytes": 0.0,
+            "resize/budget_estimated_host_peak_bytes": 0.0,
+            "resize/budget_estimated_gpu_peak_bytes": 0.0,
         }
 
     def _default_resize_handoff_metrics(self) -> dict[str, float | str | int]:
@@ -378,6 +386,92 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/target_rollout_size": active_rollout,
         }
 
+    def _dynamic_resize_budget_enabled(self) -> bool:
+        return bool(getattr(getattr(self, "_resize_budget_config", None), "enable", False))
+
+    def _estimate_dynamic_resize_model_bytes(self, item: dict[str, Any]) -> int:
+        for key in ("estimated_stage_bytes", "estimated_model_bytes"):
+            value = item.get(key)
+            if value is not None:
+                try:
+                    return max(int(value), 0)
+                except (TypeError, ValueError):
+                    pass
+
+        model_path = OmegaConf.select(self.config, "actor_rollout_ref.model.path")
+        if not model_path or not os.path.exists(str(model_path)):
+            return 0
+        if os.path.isfile(str(model_path)):
+            return os.path.getsize(str(model_path))
+
+        total = 0
+        for root, _, files in os.walk(str(model_path)):
+            for file_name in files:
+                if file_name.endswith((".safetensors", ".bin", ".pt", ".pth")):
+                    try:
+                        total += os.path.getsize(os.path.join(root, file_name))
+                    except OSError:
+                        pass
+        return int(total)
+
+    def _get_dynamic_resize_resource_snapshot(self, worker_group, staging_path: str | None = None) -> ResizeBudgetSnapshot:
+        if worker_group is None:
+            return ResizeBudgetSnapshot()
+        try:
+            snapshot = worker_group.execute_rank_zero_sync("get_resize_resource_snapshot", staging_path)
+        except Exception as exc:
+            logger.warning("[one-step-off][resize][budget] failed to collect resource snapshot: %s", exc)
+            return ResizeBudgetSnapshot()
+        return ResizeBudgetSnapshot.from_dict(snapshot)
+
+    def _gate_dynamic_resize_budget(self, item: dict[str, Any]) -> tuple[bool, dict[str, float | str | int]]:
+        metrics = self._default_resize_budget_metrics()
+        if not self._dynamic_resize_budget_enabled():
+            return True, metrics
+
+        model_bytes = self._estimate_dynamic_resize_model_bytes(item)
+        stage_bytes = model_bytes
+        stage_optimizer = bool(getattr(self._host_staging_config, "stage_optimizer", False))
+        estimated_host_peak_bytes = int(item.get("estimated_host_peak_bytes") or model_bytes * (3.0 if stage_optimizer else 1.25))
+        estimated_gpu_peak_bytes = int(item.get("estimated_gpu_peak_bytes") or model_bytes)
+        metrics.update(
+            {
+                "resize/budget_estimated_stage_bytes": float(stage_bytes),
+                "resize/budget_estimated_host_peak_bytes": float(estimated_host_peak_bytes),
+                "resize/budget_estimated_gpu_peak_bytes": float(estimated_gpu_peak_bytes),
+            }
+        )
+
+        actor_wg = getattr(self, "actor_wg", None) or getattr(self, "actor_rollout_wg", None)
+        snapshot = self._get_dynamic_resize_resource_snapshot(actor_wg, self._dynamic_resize_checkpoint_step_folder())
+        export_decision = self._resize_budget_controller.evaluate_export(
+            requested_backend=self._host_staging_config.effective_backend(),
+            snapshot=snapshot,
+            estimated_host_peak_bytes=estimated_host_peak_bytes,
+            estimated_stage_bytes=stage_bytes,
+        )
+        metrics.update(
+            {
+                "resize/budget_blocked": 1.0 if export_decision.blocked else 0.0,
+                "resize/budget_reason": export_decision.reason,
+                "resize/budget_effective_backend": export_decision.effective_backend,
+            }
+        )
+        if not export_decision.allow_resize:
+            return False, metrics
+
+        restore_decision = self._resize_budget_controller.evaluate_restore(
+            snapshot=snapshot,
+            estimated_gpu_peak_bytes=estimated_gpu_peak_bytes,
+        )
+        metrics.update(
+            {
+                "resize/budget_blocked": 1.0 if restore_decision.blocked else 0.0,
+                "resize/budget_reason": restore_decision.reason,
+            }
+        )
+        return restore_decision.allow_resize, metrics
+
     def _gate_dynamic_resize_schedule_item(
         self, item: dict[str, Any]
     ) -> tuple[bool, str, dict[str, float | str | int]]:
@@ -423,6 +517,12 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 "resize/target_rollout_size": float(rollout_target),
             }
         )
+        if gate_pass and required_action != ACTION_HOLD:
+            budget_pass, budget_metrics = self._gate_dynamic_resize_budget(item)
+            metrics.update(budget_metrics)
+            if not budget_pass:
+                gate_pass = False
+                metrics["resize/gate_pass"] = 0.0
         return gate_pass, required_action, metrics
 
     def _dynamic_resize_target_sizes(

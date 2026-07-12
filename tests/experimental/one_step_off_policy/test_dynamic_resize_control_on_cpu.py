@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 from omegaconf import OmegaConf
 
@@ -216,6 +217,53 @@ def test_dynamic_resize_schedule_uses_hard_switch_for_release_old_metadata():
     assert metrics["resize/schedule_triggered"] == 1.0
     assert metrics["resize/schedule_applied"] == 1.0
     assert metrics["resize/hard_switch_success"] == 1.0
+
+
+def test_dynamic_resize_budget_gate_blocks_schedule_before_hard_switch(tmp_path):
+    class _FakeWorkerGroup:
+        world_size = 2
+
+        def execute_rank_zero_sync(self, method_name, staging_path):
+            assert method_name == "get_resize_resource_snapshot"
+            assert staging_path.endswith("global_step_3")
+            return {"host_free_bytes": 100, "disk_free_bytes": 100, "gpu_free_bytes": 10_000}
+
+    trainer = object.__new__(OneStepOffRayTrainer)
+    trainer.global_steps = 3
+    trainer.config = OmegaConf.create(
+        {
+            "trainer": {"default_local_dir": str(tmp_path)},
+            "actor_rollout_ref": {"model": {"path": str(tmp_path / "missing-model")}},
+        }
+    )
+    trainer.actor_wg = _FakeWorkerGroup()
+    trainer.resource_pool_manager = SimpleNamespace(dynamic_resize_topology=None)
+    trainer._active_dynamic_resize_topology = {"actor_size": 2, "rollout_size": 2}
+    trainer._resize_controller = None
+    trainer._latest_resize_control_metrics = {}
+    trainer._resize_budget_config = ResizeBudgetConfig(enable=True, memory_budget_ratio=0.5)
+    trainer._resize_budget_controller = ResizeBudgetController(trainer._resize_budget_config)
+    trainer._host_staging_config = HostStagingConfig.from_dict(
+        {"enable": True, "backend": "pinned_cpu", "stage_optimizer": False}
+    )
+
+    gate_pass, required_action, metrics = trainer._gate_dynamic_resize_schedule_item(
+        {
+            "step": 3,
+            "actor_pool": {"world_size": 1},
+            "rollout_pool": {"world_size": 3},
+            "estimated_stage_bytes": 80,
+            "estimated_host_peak_bytes": 40,
+            "estimated_gpu_peak_bytes": 40,
+        }
+    )
+
+    assert required_action == ACTION_EXPAND_ROLLOUT
+    assert gate_pass is False
+    assert metrics["resize/gate_pass"] == 0.0
+    assert metrics["resize/budget_blocked"] == 1.0
+    assert metrics["resize/budget_effective_backend"] == "disk_fallback"
+    assert metrics["resize/budget_reason"] == "disk_budget"
 
 
 def _make_shared_pool_config(schedule=None):

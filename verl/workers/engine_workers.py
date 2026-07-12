@@ -14,6 +14,7 @@
 import functools
 import logging
 import os
+import shutil
 from contextlib import nullcontext
 from copy import deepcopy
 from functools import partial
@@ -56,6 +57,40 @@ from verl.workers.utils.losses import ppo_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _available_host_memory_bytes() -> int | None:
+    try:
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        return None
+
+
+def _available_disk_bytes(path: str | None = None) -> int | None:
+    try:
+        target = os.path.abspath(path or "/tmp")
+        while not os.path.exists(target):
+            parent = os.path.dirname(target)
+            if parent == target:
+                target = "/"
+                break
+            target = parent
+        return int(shutil.disk_usage(target).free)
+    except Exception:
+        return None
+
+
+def _available_device_memory_bytes() -> int | None:
+    try:
+        device_module = get_torch_device()
+        if not getattr(device_module, "is_available", lambda: False)():
+            return None
+        if not hasattr(device_module, "mem_get_info"):
+            return None
+        free_bytes, _ = device_module.mem_get_info()
+        return int(free_bytes)
+    except Exception:
+        return None
 
 
 def _with_routing_replay_flag(enabled: bool):
@@ -156,6 +191,15 @@ class TrainingWorker(Worker, DistProfilerExtension):
             device = get_device_name()
 
         self.engine.to(device=device, model=model, optimizer=optimizer, grad=grad)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_resize_resource_snapshot(self, staging_path: str | None = None) -> dict[str, int | None]:
+        """Return local free-memory counters used by dynamic resize budget gates."""
+        return {
+            "host_free_bytes": _available_host_memory_bytes(),
+            "disk_free_bytes": _available_disk_bytes(staging_path),
+            "gpu_free_bytes": _available_device_memory_bytes(),
+        }
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_loss_fn(self, loss_fn):
