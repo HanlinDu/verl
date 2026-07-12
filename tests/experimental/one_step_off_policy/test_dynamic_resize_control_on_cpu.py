@@ -1,3 +1,5 @@
+import asyncio
+
 from omegaconf import OmegaConf
 
 from verl.experimental.one_step_off_policy.resize_budget import (
@@ -6,12 +8,15 @@ from verl.experimental.one_step_off_policy.resize_budget import (
     ResizeBudgetSnapshot,
 )
 from verl.experimental.one_step_off_policy.resize_controller import (
+    ACTION_HOLD,
+    ACTION_TO_CODE,
     ACTION_EXPAND_ROLLOUT,
     ResizeController,
     ResizeControllerConfig,
 )
 from verl.experimental.one_step_off_policy.resize_metrics import build_resize_observation
 from verl.experimental.one_step_off_policy.ray_trainer import OneStepOffRayTrainer
+from verl.experimental.one_step_off_policy.trace_utils import ResizeTraceConfig
 from verl.experimental.separation.utils import build_dynamic_resize_pool_topology, create_resource_pool_manager
 from verl.trainer.ppo.utils import Role
 
@@ -100,6 +105,49 @@ def test_dynamic_resize_defer_next_rollout_requires_hard_switch_schedule_match()
     trainer._dynamic_resize_cfg["hard_switch"]["enable"] = False
     assert not trainer._dynamic_resize_hard_switch_enabled()
     assert not trainer._should_defer_next_rollout_for_resize()
+
+
+def test_dynamic_resize_metrics_keep_active_topology_without_schedule_match():
+    trainer = object.__new__(OneStepOffRayTrainer)
+    trainer.global_steps = 2
+    trainer._dynamic_resize_enabled = True
+    trainer._dynamic_resize_mode = "schedule"
+    trainer._dynamic_resize_cfg = {
+        "enable": True,
+        "shared_pool": True,
+        "hard_switch": {"enable": True},
+        "schedule": [{"step": 1, "actor_pool": {"world_size": 1}, "rollout_pool": {"world_size": 3}}],
+    }
+    trainer._resize_controller = None
+    trainer._resize_trace_config = ResizeTraceConfig()
+    trainer._active_dynamic_resize_topology = {"actor_size": 1, "rollout_size": 3}
+    trainer._latest_resize_control_metrics = {
+        "resize/enabled": 1.0,
+        "resize/mode": "schedule",
+        "resize/controller_enabled": 0.0,
+        "resize/hysteresis_signal": ACTION_HOLD,
+        "resize/hysteresis_signal_code": ACTION_TO_CODE[ACTION_HOLD],
+        "resize/hysteresis_decision": ACTION_HOLD,
+        "resize/hysteresis_decision_code": ACTION_TO_CODE[ACTION_HOLD],
+        "resize/required_action": ACTION_HOLD,
+        "resize/required_action_code": ACTION_TO_CODE[ACTION_HOLD],
+        "resize/schedule_triggered": 0.0,
+        "resize/schedule_applied": 0.0,
+        "resize/pending_resource_switch": 0.0,
+        "resize/hard_switch_enabled": 1.0,
+        "resize/active_actor_size": 0.0,
+        "resize/active_rollout_size": 0.0,
+        "resize/target_actor_size": 0.0,
+        "resize/target_rollout_size": 0.0,
+    }
+
+    metrics = asyncio.run(trainer._maybe_dynamic_resize())
+
+    assert metrics["resize/schedule_triggered"] == 0.0
+    assert metrics["resize/active_actor_size"] == 1.0
+    assert metrics["resize/active_rollout_size"] == 3.0
+    assert metrics["resize/target_actor_size"] == 1.0
+    assert metrics["resize/target_rollout_size"] == 3.0
 
 
 def _make_shared_pool_config(schedule=None):

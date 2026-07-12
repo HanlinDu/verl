@@ -330,6 +330,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
     def _active_actor_size(self) -> int:
         actor_wg = getattr(self, "actor_wg", None) or getattr(self, "actor_rollout_wg", None)
         if actor_wg is None:
+            topology = getattr(self, "_active_dynamic_resize_topology", None) or {}
+            if "actor_size" in topology:
+                return int(topology["actor_size"])
             return 0
         world_size = getattr(actor_wg, "world_size", None)
         if world_size is not None:
@@ -339,12 +342,25 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
     def _active_rollout_size(self) -> int:
         manager = getattr(self, "llm_server_manager", None)
         if manager is None:
+            topology = getattr(self, "_active_dynamic_resize_topology", None) or {}
+            if "rollout_size" in topology:
+                return int(topology["rollout_size"])
             return 0
         replicas = getattr(manager, "rollout_replicas", []) or []
         worker_count = sum(len(getattr(replica, "workers", []) or []) for replica in replicas)
         if worker_count > 0:
             return worker_count
         return len(getattr(manager, "server_handles", []) or [])
+
+    def _dynamic_resize_active_topology_metrics(self) -> dict[str, float]:
+        active_actor = float(self._active_actor_size())
+        active_rollout = float(self._active_rollout_size())
+        return {
+            "resize/active_actor_size": active_actor,
+            "resize/active_rollout_size": active_rollout,
+            "resize/target_actor_size": active_actor,
+            "resize/target_rollout_size": active_rollout,
+        }
 
     def _gate_dynamic_resize_schedule_item(
         self, item: dict[str, Any]
@@ -574,9 +590,11 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             return {}
 
         metrics = dict(self._latest_resize_control_metrics)
+        schedule_seen = False
         for item in self._normalize_dynamic_resize_schedule():
             if int(item.get("step", -1)) != self.global_steps:
                 continue
+            schedule_seen = True
 
             gate_pass, required_action, gate_metrics = self._gate_dynamic_resize_schedule_item(item)
             metrics.update(gate_metrics)
@@ -617,6 +635,8 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 reason,
             )
 
+        if not schedule_seen:
+            metrics.update(self._dynamic_resize_active_topology_metrics())
         self._latest_resize_control_metrics = metrics
         append_resize_trace(
             self._resize_trace_config,
