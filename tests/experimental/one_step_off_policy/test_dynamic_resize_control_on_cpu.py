@@ -11,6 +11,7 @@ from verl.experimental.one_step_off_policy.resize_controller import (
     ACTION_HOLD,
     ACTION_TO_CODE,
     ACTION_EXPAND_ROLLOUT,
+    ACTION_EXPAND_TRAIN,
     ResizeController,
     ResizeControllerConfig,
 )
@@ -148,6 +149,56 @@ def test_dynamic_resize_metrics_keep_active_topology_without_schedule_match():
     assert metrics["resize/active_rollout_size"] == 3.0
     assert metrics["resize/target_actor_size"] == 1.0
     assert metrics["resize/target_rollout_size"] == 3.0
+
+
+def test_dynamic_resize_schedule_uses_hard_switch_for_release_old_metadata():
+    trainer = object.__new__(OneStepOffRayTrainer)
+    trainer.global_steps = 2
+    trainer._dynamic_resize_enabled = True
+    trainer._dynamic_resize_mode = "schedule"
+    trainer._dynamic_resize_cfg = {
+        "enable": True,
+        "shared_pool": True,
+        "hard_switch": {"enable": True},
+        "schedule": [
+            {
+                "step": 2,
+                "release_old": True,
+                "actor_pool": {"world_size": 1},
+                "rollout_pool": {"world_size": 3},
+            }
+        ],
+    }
+    trainer._resize_controller = None
+    trainer._resize_trace_config = ResizeTraceConfig()
+    trainer._latest_resize_control_metrics = {}
+
+    applied = []
+
+    def _gate(item):
+        assert item["release_old"] is True
+        return True, ACTION_EXPAND_TRAIN, {"resize/schedule_triggered": 1.0}
+
+    async def _hard_switch(*, item, required_action):
+        applied.append((item, required_action))
+        return {
+            "resize/schedule_applied": 1.0,
+            "resize/pending_resource_switch": 0.0,
+            "resize/hard_switch_success": 1.0,
+        }
+
+    trainer._gate_dynamic_resize_schedule_item = _gate
+    trainer._apply_dynamic_resize_hard_switch = _hard_switch
+
+    metrics = asyncio.run(trainer._maybe_dynamic_resize())
+
+    assert len(applied) == 1
+    item, required_action = applied[0]
+    assert item["release_old"] is True
+    assert required_action == ACTION_EXPAND_TRAIN
+    assert metrics["resize/schedule_triggered"] == 1.0
+    assert metrics["resize/schedule_applied"] == 1.0
+    assert metrics["resize/hard_switch_success"] == 1.0
 
 
 def _make_shared_pool_config(schedule=None):
