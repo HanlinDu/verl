@@ -1,0 +1,172 @@
+from omegaconf import OmegaConf
+
+from verl.experimental.one_step_off_policy.resize_budget import (
+    ResizeBudgetConfig,
+    ResizeBudgetController,
+    ResizeBudgetSnapshot,
+)
+from verl.experimental.one_step_off_policy.resize_controller import (
+    ACTION_EXPAND_ROLLOUT,
+    ResizeController,
+    ResizeControllerConfig,
+)
+from verl.experimental.one_step_off_policy.resize_metrics import build_resize_observation
+from verl.experimental.one_step_off_policy.ray_trainer import OneStepOffRayTrainer
+from verl.experimental.separation.utils import build_dynamic_resize_pool_topology, create_resource_pool_manager
+from verl.trainer.ppo.utils import Role
+
+
+def test_resize_controller_allows_matching_stable_signal():
+    controller = ResizeController(
+        ResizeControllerConfig(
+            enable=True,
+            window_size=2,
+            up_threshold=1.1,
+            consecutive_signal_steps=1,
+            min_observation_count=1,
+            min_dwell_steps=0,
+        )
+    )
+
+    controller.observe(step=1, observation={"rollout_time_s": 2.0, "train_time_s": 1.0})
+    required = controller.infer_required_action(
+        active_actor=4,
+        active_rollout=4,
+        actor_target=2,
+        rollout_target=6,
+    )
+    allowed, snapshot = controller.gate(step=1, required_action=required)
+
+    assert required == ACTION_EXPAND_ROLLOUT
+    assert allowed
+    assert snapshot["gate_pass"] == 1.0
+
+
+def test_resize_budget_falls_back_and_blocks_when_disk_is_too_small():
+    controller = ResizeBudgetController(ResizeBudgetConfig(enable=True, memory_budget_ratio=0.5))
+    decision = controller.evaluate_export(
+        requested_backend="pinned_cpu",
+        snapshot=ResizeBudgetSnapshot(host_free_bytes=100, disk_free_bytes=100, gpu_free_bytes=100),
+        estimated_host_peak_bytes=40,
+        estimated_stage_bytes=80,
+    )
+
+    assert not decision.allow_resize
+    assert decision.effective_backend == "disk_fallback"
+    assert decision.reason == "disk_budget"
+
+
+def test_resize_observation_uses_rollout_and_train_timing_sections():
+    observation = build_resize_observation(
+        timing_raw={
+            "gen": 1.5,
+            "sync_rollout_weights": 0.5,
+            "update_actor": 0.75,
+            "update_critic": 0.25,
+        }
+    )
+
+    assert observation["rollout_time_s"] == 2.0
+    assert observation["train_time_s"] == 1.0
+
+
+def test_one_step_off_configs_define_disabled_dynamic_resize_by_default():
+    fsdp_cfg = OmegaConf.load("verl/experimental/one_step_off_policy/config/one_step_off_ppo_trainer.yaml")
+    megatron_cfg = OmegaConf.load(
+        "verl/experimental/one_step_off_policy/config/one_step_off_ppo_megatron_trainer.yaml"
+    )
+
+    assert fsdp_cfg.trainer.dynamic_resize.enable is False
+    assert megatron_cfg.trainer.dynamic_resize.enable is False
+    assert fsdp_cfg.trainer.dynamic_resize.hard_switch.enable is False
+    assert megatron_cfg.trainer.dynamic_resize.hard_switch.enable is False
+    assert fsdp_cfg.trainer.dynamic_resize.schedule == []
+
+
+def test_dynamic_resize_defer_next_rollout_requires_hard_switch_schedule_match():
+    trainer = object.__new__(OneStepOffRayTrainer)
+    trainer.global_steps = 4
+    trainer._dynamic_resize_enabled = True
+    trainer._dynamic_resize_cfg = {
+        "enable": True,
+        "shared_pool": True,
+        "hard_switch": {"enable": True},
+        "schedule": [{"step": 4, "actor_pool": {"world_size": 2}, "rollout_pool": {"world_size": 4}}],
+    }
+
+    assert trainer._dynamic_resize_hard_switch_enabled()
+    assert trainer._should_defer_next_rollout_for_resize()
+
+    trainer._dynamic_resize_cfg["hard_switch"]["enable"] = False
+    assert not trainer._dynamic_resize_hard_switch_enabled()
+    assert not trainer._should_defer_next_rollout_for_resize()
+
+
+def _make_shared_pool_config(schedule=None):
+    return OmegaConf.create(
+        {
+            "trainer": {
+                "nnodes": 2,
+                "n_gpus_per_node": 2,
+                "dynamic_resize": {
+                    "enable": True,
+                    "shared_pool": True,
+                    "schedule": schedule or [],
+                },
+            },
+            "rollout": {
+                "nnodes": 2,
+                "n_gpus_per_node": 1,
+            },
+            "reward": {
+                "reward_model": {
+                    "n_gpus_per_node": 1,
+                    "nnodes": 1,
+                }
+            },
+        }
+    )
+
+
+def test_dynamic_resize_shared_pool_topology_records_initial_and_scheduled_splits():
+    cfg = _make_shared_pool_config(
+        schedule=[
+            {
+                "step": 3,
+                "actor_pool": {"world_size": 2},
+                "rollout_pool": {"world_size": 4},
+            }
+        ]
+    )
+
+    topology = build_dynamic_resize_pool_topology(cfg)
+    manager = create_resource_pool_manager(cfg, [Role.Actor, Role.Critic])
+
+    assert topology.shared_pool_name == "dynamic_resize_shared_pool"
+    assert topology.shared_pool_spec == [3, 3]
+    assert topology.initial_actor_size == 4
+    assert topology.initial_rollout_size == 2
+    assert topology.schedule_splits == [{"step": 3, "actor_size": 2, "rollout_size": 4}]
+    assert manager.resource_pool_spec == {"dynamic_resize_shared_pool": [3, 3]}
+    assert manager.mapping[Role.Actor] == "dynamic_resize_shared_pool"
+    assert manager.mapping[Role.Critic] == "dynamic_resize_shared_pool"
+    assert manager.dynamic_resize_topology == topology
+
+
+def test_dynamic_resize_shared_pool_rejects_schedule_that_changes_total_size():
+    cfg = _make_shared_pool_config(
+        schedule=[
+            {
+                "step": 3,
+                "actor_pool": {"world_size": 2},
+                "rollout_pool": {"world_size": 3},
+            }
+        ]
+    )
+
+    try:
+        build_dynamic_resize_pool_topology(cfg)
+    except ValueError as exc:
+        assert "shared pool size 6" in str(exc)
+    else:
+        raise AssertionError("expected invalid shared_pool schedule to raise ValueError")

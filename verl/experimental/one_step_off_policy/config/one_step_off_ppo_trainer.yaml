@@ -29,3 +29,30 @@ actor_rollout_ref:
 algorithm:
   rollout_correction:
     bypass_mode: True
+trainer:
+  # Dynamic resize migration entrypoint. Keep disabled by default so current
+  # one-step-off behavior is unchanged unless explicitly enabled.
+  dynamic_resize:
+    enable: false
+    shared_pool: false
+    mode: schedule
+    hard_switch:
+      enable: false
+    trace:
+      enable: false
+      path: ""
+      run_name: ""
+      flush: false
+    budget_protection:
+      enable: false
+      memory_budget_ratio: 0.85
+    hysteresis:
+      enable: false
+      window_size: 2
+      up_threshold: 1.15
+      down_threshold: 0.9
+      min_dwell_steps: 1
+      cooldown_steps: 0
+      consecutive_signal_steps: 1
+      min_observation_count: 1
+    schedule: []

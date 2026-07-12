@@ -17,6 +17,7 @@ import logging
 import os
 import warnings
 from dataclasses import asdict, dataclass
+from glob import glob
 from typing import Optional
 
 import torch
@@ -30,7 +31,7 @@ from transformers.dynamic_module_utils import custom_object_save
 
 from verl.utils.device import is_cuda_available
 from verl.utils.fs import copy_to_local, is_non_local, local_mkdir_safe
-from verl.utils.fsdp_utils import fsdp_version, get_fsdp_full_state_dict, get_fsdp_state_ctx
+from verl.utils.fsdp_utils import fsdp2_load_full_state_dict, fsdp_version, get_fsdp_full_state_dict, get_fsdp_state_ctx
 from verl.utils.logger import log_with_rank
 from verl.utils.transformers_compat import drop_tied_target_keys, get_auto_model_for_vision2seq
 
@@ -39,6 +40,8 @@ from .checkpoint_manager import BaseCheckpointManager
 # Setup logging
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+_DYNAMIC_RESIZE_FULL_MODEL = "dynamic_resize_full_model.pt"
 
 
 @dataclass
@@ -171,24 +174,70 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             else None
         )
         with get_fsdp_state_ctx(self.model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
+            loaded_model_from_dynamic_full = False
             if self.should_load_model:
                 remote_model_path = os.path.join(local_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
-                local_model_path = copy_to_local(remote_model_path)
-                model_state_dict = torch.load(local_model_path, weights_only=False)
-                self.model.load_state_dict(model_state_dict)
-                log_with_rank(f"Loaded model from {remote_model_path}", rank=self.rank, logger=logger)
+                dynamic_full_model_path = os.path.join(local_path, _DYNAMIC_RESIZE_FULL_MODEL)
+                if os.path.exists(remote_model_path):
+                    local_model_path = copy_to_local(remote_model_path)
+                    model_state_dict = torch.load(local_model_path, weights_only=False)
+                    self.model.load_state_dict(model_state_dict)
+                    log_with_rank(f"Loaded model from {remote_model_path}", rank=self.rank, logger=logger)
+                elif os.path.exists(dynamic_full_model_path):
+                    full_state_dict = (
+                        torch.load(copy_to_local(dynamic_full_model_path), map_location="cpu", weights_only=False)
+                        if self.rank == 0
+                        else {}
+                    )
+                    if fsdp_version(self.model) == 2:
+                        fsdp2_load_full_state_dict(self.model, full_state_dict)
+                    elif fsdp_version(self.model) == 1 and self.world_size == 1:
+                        self.model.load_state_dict(full_state_dict)
+                    else:
+                        raise RuntimeError(
+                            "Dynamic resize full-model checkpoint fallback currently supports FSDP2, "
+                            "or FSDP1 only when target world size is 1."
+                        )
+                    loaded_model_from_dynamic_full = True
+                    log_with_rank(
+                        f"Loaded dynamic resize full model from {dynamic_full_model_path}",
+                        rank=self.rank,
+                        logger=logger,
+                    )
+                else:
+                    local_model_path = copy_to_local(remote_model_path)
+                    model_state_dict = torch.load(local_model_path, weights_only=False)
+                    self.model.load_state_dict(model_state_dict)
+                    log_with_rank(f"Loaded model from {remote_model_path}", rank=self.rank, logger=logger)
 
             if self.should_load_optimizer:
                 remote_optim_path = os.path.join(local_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
-                local_optim_path = copy_to_local(remote_optim_path)
-                optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
-                self.optimizer.load_state_dict(optimizer_state_dict)
-                log_with_rank(f"Loaded optimizer from {remote_optim_path}", rank=self.rank, logger=logger)
+                if os.path.exists(remote_optim_path):
+                    local_optim_path = copy_to_local(remote_optim_path)
+                    optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
+                    self.optimizer.load_state_dict(optimizer_state_dict)
+                    log_with_rank(f"Loaded optimizer from {remote_optim_path}", rank=self.rank, logger=logger)
+                elif loaded_model_from_dynamic_full:
+                    log_with_rank(
+                        f"Skipped optimizer load for dynamic resize world-size change; "
+                        f"missing {remote_optim_path}, keeping the freshly initialized optimizer",
+                        rank=self.rank,
+                        logger=logger,
+                    )
+                else:
+                    local_optim_path = copy_to_local(remote_optim_path)
+                    optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
+                    self.optimizer.load_state_dict(optimizer_state_dict)
+                    log_with_rank(f"Loaded optimizer from {remote_optim_path}", rank=self.rank, logger=logger)
 
         if self.should_load_extra:
             remote_extra_state_path = os.path.join(
                 local_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt"
             )
+            if not os.path.exists(remote_extra_state_path):
+                extra_candidates = sorted(glob(os.path.join(local_path, "extra_state_world_size_*_rank_0.pt")))
+                if extra_candidates:
+                    remote_extra_state_path = extra_candidates[0]
             local_extra_state_path = copy_to_local(remote_extra_state_path)
             extra_state_dict = torch.load(local_extra_state_path, weights_only=False)
             # recover random state
@@ -217,7 +266,14 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # wait for everyone to load checkpoints
         torch.distributed.barrier()
 
-    def save_checkpoint(self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None):
+    def save_checkpoint(
+        self,
+        local_path: str,
+        hdfs_path: str = None,
+        global_step: int = 0,
+        max_ckpt_to_keep=None,
+        save_full_model_for_dynamic_resize: bool = False,
+    ):
         """
         Save an FSDP checkpoint for this rank.
 
@@ -334,6 +390,20 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             with open(fsdp_config_path, "w") as f:
                 json.dump(asdict(fsdp_config), f, indent=4)
             self._save_lora_train_meta(local_path, unwrap_model)
+
+        if save_full_model_for_dynamic_resize:
+            full_state_dict = get_fsdp_full_state_dict(self.model, offload_to_cpu=True, rank0_only=True)
+            if self.rank == 0:
+                dynamic_full_model_path = os.path.join(local_path, _DYNAMIC_RESIZE_FULL_MODEL)
+                torch.save(full_state_dict, dynamic_full_model_path)
+                log_with_rank(
+                    f"Saved dynamic resize full model to {os.path.abspath(dynamic_full_model_path)}",
+                    rank=self.rank,
+                    logger=logger,
+                    log_only_rank_0=True,
+                )
+                del full_state_dict
+            torch.distributed.barrier()
 
         # wait for everyone to dump to local
         torch.distributed.barrier()

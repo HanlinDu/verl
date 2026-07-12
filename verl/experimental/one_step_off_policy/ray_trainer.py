@@ -19,20 +19,34 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import asyncio
+import logging
+import os
 import uuid
+from contextlib import nullcontext
 from pprint import pprint
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import ray
 import torch
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
 from tqdm import tqdm
 
 from verl import DataProto
+from verl.experimental.one_step_off_policy.resize_budget import ResizeBudgetConfig, ResizeBudgetController
+from verl.experimental.one_step_off_policy.resize_controller import (
+    ACTION_HOLD,
+    ACTION_TO_CODE,
+    ResizeController,
+    ResizeControllerConfig,
+)
+from verl.experimental.one_step_off_policy.resize_metrics import build_resize_observation
+from verl.experimental.one_step_off_policy.trace_utils import append_resize_trace, build_resize_trace_config
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
+from verl.experimental.separation.utils import dynamic_resize_shared_pool_enabled
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
+from verl.single_controller.ray.base import split_resource_pool
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import (
     ResourcePoolManager,
@@ -41,9 +55,13 @@ from verl.trainer.ppo.ray_trainer import (
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.debug import marked_timer
+from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import LLMServerManager
+
+
+logger = logging.getLogger(__name__)
 
 
 class OneStepOffRayTrainer(SeparateRayPPOTrainer):
@@ -137,6 +155,504 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         self.future_reward = None
         self.reward_tensor = None
         self.reward_extra_infos_dict = {}
+        self._dynamic_resize_cfg = self._get_dynamic_resize_cfg()
+        self._dynamic_resize_enabled = bool(self._dynamic_resize_cfg.get("enable", False))
+        self._dynamic_resize_mode = str(self._dynamic_resize_cfg.get("mode", "schedule"))
+        self._resize_controller = self._build_resize_controller()
+        self._resize_budget_config = ResizeBudgetConfig.from_dict(self._dynamic_resize_cfg.get("budget_protection", {}))
+        self._resize_budget_controller = ResizeBudgetController(self._resize_budget_config)
+        self._resize_trace_config = build_resize_trace_config(self.config)
+        self._latest_resize_control_metrics: dict[str, float | str | int] = self._default_resize_control_metrics()
+        self._latest_resize_budget_metrics: dict[str, float | str | int] = self._default_resize_budget_metrics()
+
+    @staticmethod
+    def _cfg_to_plain_dict(cfg) -> dict[str, Any]:
+        if cfg is None:
+            return {}
+        if isinstance(cfg, dict):
+            return dict(cfg)
+        try:
+            return OmegaConf.to_container(cfg, resolve=True) or {}
+        except Exception:
+            return dict(cfg) if hasattr(cfg, "items") else {}
+
+    def _get_dynamic_resize_cfg(self) -> dict[str, Any]:
+        return self._cfg_to_plain_dict(OmegaConf.select(self.config, "trainer.dynamic_resize"))
+
+    def _build_resize_controller(self) -> ResizeController | None:
+        if not self._dynamic_resize_enabled:
+            return None
+        if self._dynamic_resize_mode != "schedule_with_hysteresis":
+            return None
+        controller_cfg = ResizeControllerConfig.from_dict(self._dynamic_resize_cfg.get("hysteresis", {}))
+        if not controller_cfg.enable:
+            return None
+        return ResizeController(controller_cfg)
+
+    def _default_resize_control_metrics(self) -> dict[str, float | str | int]:
+        return {
+            "resize/enabled": 1.0 if self._dynamic_resize_enabled else 0.0,
+            "resize/mode": self._dynamic_resize_mode,
+            "resize/controller_enabled": 1.0 if self._resize_controller is not None else 0.0,
+            "resize/rollout_train_ratio": 0.0,
+            "resize/avg_rollout_time_s": 0.0,
+            "resize/avg_train_time_s": 0.0,
+            "resize/hysteresis_signal": ACTION_HOLD,
+            "resize/hysteresis_signal_code": ACTION_TO_CODE[ACTION_HOLD],
+            "resize/hysteresis_decision": ACTION_HOLD,
+            "resize/hysteresis_decision_code": ACTION_TO_CODE[ACTION_HOLD],
+            "resize/required_action": ACTION_HOLD,
+            "resize/required_action_code": ACTION_TO_CODE[ACTION_HOLD],
+            "resize/window_fill": 0,
+            "resize/dwell_remaining": 0,
+            "resize/cooldown_remaining": 0,
+            "resize/gate_pass": -1.0,
+            "resize/schedule_triggered": 0.0,
+            "resize/schedule_applied": 0.0,
+            "resize/pending_resource_switch": 0.0,
+            "resize/unsupported_reason": "",
+            "resize/hard_switch_enabled": 1.0 if self._dynamic_resize_hard_switch_enabled() else 0.0,
+            "resize/active_actor_size": 0.0,
+            "resize/active_rollout_size": 0.0,
+            "resize/target_actor_size": 0.0,
+            "resize/target_rollout_size": 0.0,
+        }
+
+    def _default_resize_budget_metrics(self) -> dict[str, float | str | int]:
+        return {
+            "resize/budget_enabled": 1.0 if self._resize_budget_config.enable else 0.0,
+            "resize/budget_ratio": self._resize_budget_config.memory_budget_ratio,
+            "resize/budget_blocked": 0.0,
+            "resize/budget_reason": "",
+        }
+
+    def _build_resize_control_metrics(self, snapshot: dict[str, float | str | int]) -> dict[str, float | str | int]:
+        metrics = self._default_resize_control_metrics()
+        for key, value in snapshot.items():
+            metrics[f"resize/{key}"] = value
+        metrics["resize/enabled"] = 1.0 if self._dynamic_resize_enabled else 0.0
+        metrics["resize/mode"] = self._dynamic_resize_mode
+        metrics["resize/controller_enabled"] = 1.0 if self._resize_controller is not None else 0.0
+        return metrics
+
+    def _dynamic_resize_hard_switch_enabled(self) -> bool:
+        hard_switch_cfg = self._cfg_to_plain_dict(self._dynamic_resize_cfg.get("hard_switch"))
+        return bool(
+            self._dynamic_resize_enabled
+            and self._dynamic_resize_cfg.get("shared_pool", False)
+            and hard_switch_cfg.get("enable", False)
+        )
+
+    def _dynamic_resize_item_for_current_step(self) -> dict[str, Any] | None:
+        if not self._dynamic_resize_enabled:
+            return None
+        for item in self._normalize_dynamic_resize_schedule():
+            if int(item.get("step", -1)) == self.global_steps:
+                return item
+        return None
+
+    def _should_defer_next_rollout_for_resize(self) -> bool:
+        return self._dynamic_resize_hard_switch_enabled() and self._dynamic_resize_item_for_current_step() is not None
+
+    def _record_resize_control_observation(self, *, batch: DataProto) -> dict[str, float | str | int]:
+        if not self._dynamic_resize_enabled:
+            self._latest_resize_control_metrics = self._default_resize_control_metrics()
+            return dict(self._latest_resize_control_metrics)
+
+        observation = build_resize_observation(timing_raw=self.timing_raw, batch=batch)
+        if self._resize_controller is not None:
+            snapshot = self._resize_controller.observe(step=self.global_steps, observation=observation)
+            metrics = self._build_resize_control_metrics(snapshot)
+        else:
+            rollout_time_s = observation["rollout_time_s"]
+            train_time_s = observation["train_time_s"]
+            metrics = self._default_resize_control_metrics()
+            metrics.update(
+                {
+                    "resize/rollout_train_ratio": rollout_time_s / max(train_time_s, 1e-6),
+                    "resize/avg_rollout_time_s": rollout_time_s,
+                    "resize/avg_train_time_s": train_time_s,
+                    "resize/gate_pass": 1.0,
+                }
+            )
+        self._latest_resize_control_metrics = metrics
+        append_resize_trace(
+            self._resize_trace_config,
+            {
+                "event": "resize_observation",
+                "step": self.global_steps,
+                "observation": observation,
+                "metrics": metrics,
+            },
+        )
+        return dict(metrics)
+
+    def _normalize_dynamic_resize_schedule(self) -> list[dict[str, Any]]:
+        schedule = self._dynamic_resize_cfg.get("schedule", []) or []
+        if isinstance(schedule, dict):
+            schedule = list(schedule.values())
+        if not isinstance(schedule, list):
+            raise TypeError(f"trainer.dynamic_resize.schedule must be a list or dict, got {type(schedule).__name__}")
+        normalized = []
+        for item in schedule:
+            if not isinstance(item, dict):
+                raise TypeError(
+                    "Each trainer.dynamic_resize.schedule item must be a dict, "
+                    f"got {type(item).__name__}: {item!r}"
+                )
+            normalized.append(item)
+        return normalized
+
+    @staticmethod
+    def _pool_target_size(spec: Any) -> int | None:
+        if spec is None:
+            return None
+        if isinstance(spec, int):
+            return spec
+        if not isinstance(spec, dict):
+            return None
+        if "world_size" in spec:
+            return int(spec["world_size"])
+        if "n_gpus" in spec:
+            return int(spec["n_gpus"])
+        if "size" not in spec:
+            return None
+        size = spec["size"]
+        if isinstance(size, int):
+            return size
+        if isinstance(size, (list, tuple)):
+            index = int(spec.get("index", 0))
+            if index < 0 or index >= len(size):
+                raise ValueError(f"dynamic resize pool index {index} out of range for size={size}")
+            return int(size[index])
+        return None
+
+    def _active_actor_size(self) -> int:
+        actor_wg = getattr(self, "actor_wg", None) or getattr(self, "actor_rollout_wg", None)
+        if actor_wg is None:
+            return 0
+        world_size = getattr(actor_wg, "world_size", None)
+        if world_size is not None:
+            return int(world_size)
+        return len(getattr(actor_wg, "workers", []) or [])
+
+    def _active_rollout_size(self) -> int:
+        manager = getattr(self, "llm_server_manager", None)
+        if manager is None:
+            return 0
+        replicas = getattr(manager, "rollout_replicas", []) or []
+        worker_count = sum(len(getattr(replica, "workers", []) or []) for replica in replicas)
+        if worker_count > 0:
+            return worker_count
+        return len(getattr(manager, "server_handles", []) or [])
+
+    def _gate_dynamic_resize_schedule_item(
+        self, item: dict[str, Any]
+    ) -> tuple[bool, str, dict[str, float | str | int]]:
+        active_actor = self._active_actor_size()
+        active_rollout = self._active_rollout_size()
+        actor_target, rollout_target = self._dynamic_resize_target_sizes(
+            item, active_actor=active_actor, active_rollout=active_rollout
+        )
+
+        if self._resize_controller is not None:
+            required_action = self._resize_controller.infer_required_action(
+                active_actor=active_actor,
+                active_rollout=active_rollout,
+                actor_target=actor_target,
+                rollout_target=rollout_target,
+            )
+            gate_pass, snapshot = self._resize_controller.gate(step=self.global_steps, required_action=required_action)
+            metrics = self._build_resize_control_metrics(snapshot)
+        else:
+            required_action = ACTION_HOLD
+            actor_delta = actor_target - active_actor
+            rollout_delta = rollout_target - active_rollout
+            if rollout_delta > 0 and actor_delta < 0:
+                required_action = "expand_rollout"
+            elif actor_delta > 0 and rollout_delta < 0:
+                required_action = "expand_train"
+            gate_pass = True
+            metrics = dict(self._latest_resize_control_metrics)
+            metrics.update(
+                {
+                    "resize/required_action": required_action,
+                    "resize/required_action_code": ACTION_TO_CODE.get(required_action, 0.0),
+                    "resize/gate_pass": 1.0,
+                }
+            )
+
+        metrics.update(
+            {
+                "resize/schedule_triggered": 1.0,
+                "resize/active_actor_size": float(active_actor),
+                "resize/active_rollout_size": float(active_rollout),
+                "resize/target_actor_size": float(actor_target),
+                "resize/target_rollout_size": float(rollout_target),
+            }
+        )
+        return gate_pass, required_action, metrics
+
+    def _dynamic_resize_target_sizes(
+        self, item: dict[str, Any], *, active_actor: int | None = None, active_rollout: int | None = None
+    ) -> tuple[int, int]:
+        actor_target = self._pool_target_size(item.get("actor_pool"))
+        rollout_target = self._pool_target_size(item.get("rollout_pool"))
+        if active_actor is None:
+            active_actor = self._active_actor_size()
+        if active_rollout is None:
+            active_rollout = self._active_rollout_size()
+        actor_target = active_actor if actor_target is None else actor_target
+        rollout_target = active_rollout if rollout_target is None else rollout_target
+
+        topology = getattr(self.resource_pool_manager, "dynamic_resize_topology", None)
+        if topology is not None and actor_target + rollout_target != topology.total_size:
+            raise ValueError(
+                "dynamic resize target actor_pool + rollout_pool must equal shared pool size "
+                f"{topology.total_size}, got actor={actor_target}, rollout={rollout_target}"
+            )
+        return int(actor_target), int(rollout_target)
+
+    def _dynamic_resize_checkpoint_step_folder(self) -> str:
+        checkpoint_folder = self.config.trainer.default_local_dir
+        if not os.path.isabs(checkpoint_folder):
+            checkpoint_folder = os.path.join(os.getcwd(), checkpoint_folder)
+        return os.path.join(checkpoint_folder, f"global_step_{self.global_steps}")
+
+    def _load_dynamic_resize_checkpoint(self, global_step_folder: str) -> None:
+        actor_path = os.path.join(global_step_folder, "actor")
+        critic_path = os.path.join(global_step_folder, str(Role.Critic))
+        self.actor_rollout_wg.load_checkpoint(actor_path, del_local_after_load=False)
+        if self.use_critic:
+            self.critic_wg.load_checkpoint(critic_path, del_local_after_load=False)
+
+    def _split_dynamic_resize_resource_pools(self, *, actor_size: int, rollout_size: int) -> None:
+        topology = getattr(self.resource_pool_manager, "dynamic_resize_topology", None)
+        if topology is None:
+            raise ValueError("dynamic resize hard switch requires shared pool topology")
+        if actor_size + rollout_size != topology.total_size:
+            raise ValueError(
+                f"dynamic resize split must sum to {topology.total_size}, got actor={actor_size}, rollout={rollout_size}"
+            )
+
+        shared_pool = self.resource_pool_manager.resource_pool_dict[topology.shared_pool_name]
+        actor_pool, rollout_pool = split_resource_pool(shared_pool, [actor_size, rollout_size])
+        self.resource_pool_manager.resource_pool_dict["dynamic_resize_actor_pool"] = actor_pool
+        self.resource_pool_manager.resource_pool_dict["dynamic_resize_rollout_pool"] = rollout_pool
+        for role in [Role.Actor, Role.ActorRollout, Role.Critic, Role.RefPolicy]:
+            if role in self.resource_pool_manager.mapping:
+                self.resource_pool_manager.mapping[role] = "dynamic_resize_actor_pool"
+        self._dynamic_resize_rollout_resource_pool = rollout_pool
+        self._active_dynamic_resize_topology = {"actor_size": actor_size, "rollout_size": rollout_size}
+
+    @staticmethod
+    def _kill_ray_actors(handles) -> None:
+        for handle in list(handles or []):
+            try:
+                ray.kill(handle, no_restart=True)
+            except Exception as exc:
+                logger.debug("[one-step-off][resize] ignoring Ray actor kill failure: %s", exc)
+
+    async def _destroy_dynamic_resize_runtime(self) -> None:
+        checkpoint_manager = getattr(self, "checkpoint_manager", None)
+        if checkpoint_manager is not None:
+            try:
+                await checkpoint_manager.abort_replicas()
+                await checkpoint_manager.sleep_replicas()
+            except Exception as exc:
+                logger.warning("[one-step-off][resize] failed to quiesce rollout replicas before rebuild: %s", exc)
+
+        async_rollout_manager = getattr(self, "async_rollout_manager", None)
+        if async_rollout_manager is not None:
+            self._kill_ray_actors(getattr(async_rollout_manager, "agent_loop_workers", []))
+
+        llm_server_manager = getattr(self, "llm_server_manager", None)
+        if llm_server_manager is not None:
+            for replica in getattr(llm_server_manager, "rollout_replicas", []) or []:
+                self._kill_ray_actors(getattr(replica, "workers", []))
+            self._kill_ray_actors(getattr(llm_server_manager, "server_handles", []))
+            load_balancer = getattr(llm_server_manager, "global_load_balancer", None)
+            if load_balancer is not None:
+                self._kill_ray_actors([load_balancer])
+
+        for worker_group in getattr(self, "all_wg", {}).values():
+            self._kill_ray_actors(getattr(worker_group, "workers", []))
+
+    def _build_dynamic_resize_checkpoint_manager(self) -> None:
+        checkpoint_manager_class_fqn = self.config.actor_rollout_ref.rollout.get("checkpoint_manager_class")
+        if checkpoint_manager_class_fqn:
+            CheckpointEngineManager = load_class_from_fqn(checkpoint_manager_class_fqn, "CheckpointEngineManager")
+        else:
+            from verl.checkpoint_engine import CheckpointEngineManager
+
+        self.checkpoint_manager = CheckpointEngineManager(
+            config=omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine),
+            actor_wg=self.actor_rollout_wg,
+            replicas=self.llm_server_manager.get_replicas(),
+        )
+
+    def _refresh_dynamic_resize_checkpoint_group_name(self) -> None:
+        checkpoint_engine_config = self.config.actor_rollout_ref.rollout.checkpoint_engine
+        if checkpoint_engine_config.get("backend") not in {"nccl", "hccl"}:
+            return
+        backend = checkpoint_engine_config.get("backend")
+        engine_kwargs = checkpoint_engine_config.get("engine_kwargs")
+        if engine_kwargs is None:
+            engine_kwargs = {}
+            checkpoint_engine_config.engine_kwargs = engine_kwargs
+        with open_dict(engine_kwargs):
+            backend_kwargs = engine_kwargs.get(backend)
+            if backend_kwargs is None:
+                backend_kwargs = {}
+                engine_kwargs[backend] = backend_kwargs
+            backend_kwargs_context = open_dict(backend_kwargs) if isinstance(backend_kwargs, DictConfig) else nullcontext()
+            with backend_kwargs_context:
+                backend_kwargs["group_name"] = f"dynamic_resize_{self.global_steps}_{uuid.uuid4().hex}"
+            engine_kwargs[backend] = backend_kwargs
+
+    def _rebuild_dynamic_resize_runtime(self, *, actor_size: int, rollout_size: int) -> None:
+        self._split_dynamic_resize_resource_pools(actor_size=actor_size, rollout_size=rollout_size)
+        self._refresh_dynamic_resize_checkpoint_group_name()
+        mapped_pool_names = set(self.resource_pool_manager.mapping.values())
+        self.resource_pool_to_cls = {
+            pool: {}
+            for pool_name, pool in self.resource_pool_manager.resource_pool_dict.items()
+            if pool_name in mapped_pool_names
+        }
+        self._create_worker_classes()
+        self._init_worker_groups()
+        self._init_models()
+        self._init_async_rollout_manager()
+        self._build_dynamic_resize_checkpoint_manager()
+
+    async def _apply_dynamic_resize_hard_switch(
+        self, *, item: dict[str, Any], required_action: str
+    ) -> dict[str, float | str | int]:
+        actor_target, rollout_target = self._dynamic_resize_target_sizes(item)
+        metrics: dict[str, float | str | int] = {
+            "resize/hard_switch_enabled": 1.0,
+            "resize/hard_switch_attempted": 1.0,
+            "resize/hard_switch_success": 0.0,
+        }
+
+        if not dynamic_resize_shared_pool_enabled(self.config):
+            reason = "shared_pool_required_for_hard_switch"
+            metrics.update({"resize/unsupported_reason": reason, "resize/pending_resource_switch": 1.0})
+            return metrics
+
+        checkpoint_step_folder = self._dynamic_resize_checkpoint_step_folder()
+        with marked_timer("dynamic_resize_save_checkpoint", self.timing_raw, color="green"):
+            self._save_checkpoint(save_full_model_for_dynamic_resize=True)
+
+        await self._destroy_dynamic_resize_runtime()
+        with marked_timer("dynamic_resize_rebuild_runtime", self.timing_raw, color="green"):
+            self._rebuild_dynamic_resize_runtime(actor_size=actor_target, rollout_size=rollout_target)
+            self._load_dynamic_resize_checkpoint(checkpoint_step_folder)
+
+        with marked_timer("dynamic_resize_update_weights", self.timing_raw, color="green"):
+            await self.checkpoint_manager.update_weights(self.global_steps)
+
+        metrics.update(
+            {
+                "resize/schedule_applied": 1.0,
+                "resize/pending_resource_switch": 0.0,
+                "resize/hard_switch_success": 1.0,
+                "resize/active_actor_size": float(actor_target),
+                "resize/active_rollout_size": float(rollout_target),
+                "resize/target_actor_size": float(actor_target),
+                "resize/target_rollout_size": float(rollout_target),
+                "resize/unsupported_reason": "",
+            }
+        )
+        if self._resize_controller is not None:
+            snapshot = self._resize_controller.mark_resize_applied(step=self.global_steps, action=required_action)
+            metrics.update(self._build_resize_control_metrics(snapshot))
+        return metrics
+
+    async def _maybe_dynamic_resize(self) -> dict[str, float | str | int]:
+        if not self._dynamic_resize_enabled:
+            return {}
+
+        metrics = dict(self._latest_resize_control_metrics)
+        for item in self._normalize_dynamic_resize_schedule():
+            if int(item.get("step", -1)) != self.global_steps:
+                continue
+
+            gate_pass, required_action, gate_metrics = self._gate_dynamic_resize_schedule_item(item)
+            metrics.update(gate_metrics)
+            if not gate_pass:
+                logger.info(
+                    "[one-step-off][resize][gate] skip scheduled resize: step=%s required_action=%s",
+                    self.global_steps,
+                    required_action,
+                )
+                continue
+
+            if required_action == ACTION_HOLD:
+                metrics.update({"resize/schedule_applied": 1.0, "resize/pending_resource_switch": 0.0})
+                if self._resize_controller is not None:
+                    snapshot = self._resize_controller.mark_resize_applied(
+                        step=self.global_steps, action=required_action
+                    )
+                    metrics.update(self._build_resize_control_metrics(snapshot))
+                continue
+
+            if self._dynamic_resize_hard_switch_enabled():
+                metrics.update(
+                    await self._apply_dynamic_resize_hard_switch(item=item, required_action=required_action)
+                )
+                continue
+
+            reason = "dynamic_resize_hard_switch_disabled"
+            metrics.update(
+                {
+                    "resize/schedule_applied": 0.0,
+                    "resize/pending_resource_switch": 1.0,
+                    "resize/unsupported_reason": reason,
+                }
+            )
+            logger.warning(
+                "[one-step-off][resize] schedule passed gate at step=%s but resource switching is deferred: %s",
+                self.global_steps,
+                reason,
+            )
+
+        self._latest_resize_control_metrics = metrics
+        append_resize_trace(
+            self._resize_trace_config,
+            {"event": "resize_schedule", "step": self.global_steps, "metrics": metrics},
+        )
+        return dict(metrics)
+
+    def _init_resource_pools(self):
+        self.resource_pool_manager.create_resource_pool()
+        self._dynamic_resize_rollout_resource_pool = None
+        if dynamic_resize_shared_pool_enabled(self.config):
+            topology = getattr(self.resource_pool_manager, "dynamic_resize_topology", None)
+            if topology is None:
+                raise ValueError("trainer.dynamic_resize.shared_pool requires dynamic resize pool topology")
+            shared_pool = self.resource_pool_manager.resource_pool_dict[topology.shared_pool_name]
+            actor_pool, rollout_pool = split_resource_pool(
+                shared_pool,
+                [topology.initial_actor_size, topology.initial_rollout_size],
+            )
+            self.resource_pool_manager.resource_pool_dict["dynamic_resize_actor_pool"] = actor_pool
+            self.resource_pool_manager.resource_pool_dict["dynamic_resize_rollout_pool"] = rollout_pool
+            for role in [Role.Actor, Role.ActorRollout, Role.Critic, Role.RefPolicy]:
+                if role in self.resource_pool_manager.mapping:
+                    self.resource_pool_manager.mapping[role] = "dynamic_resize_actor_pool"
+            self._dynamic_resize_rollout_resource_pool = rollout_pool
+            self._active_dynamic_resize_topology = {
+                "actor_size": topology.initial_actor_size,
+                "rollout_size": topology.initial_rollout_size,
+            }
+
+        mapped_pool_names = set(self.resource_pool_manager.mapping.values())
+        self.resource_pool_to_cls = {
+            pool: {}
+            for pool_name, pool in self.resource_pool_manager.resource_pool_dict.items()
+            if pool_name in mapped_pool_names
+        }
 
     def _create_actor_rollout_classes(self):
         for role in [Role.Actor]:
@@ -186,7 +702,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         else:
             from verl.experimental.agent_loop import AgentLoopManager
 
-        self.llm_server_manager = LLMServerManager.create(config=self.config)
+        self.llm_server_manager = LLMServerManager.create(
+            config=self.config,
+            rollout_resource_pool=getattr(self, "_dynamic_resize_rollout_resource_pool", None),
+        )
         self.async_rollout_mode = True
         self.async_rollout_manager = AgentLoopManager.create(
             config=self.config,
@@ -377,7 +896,12 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         await asyncio.sleep(0)
         self._fit_stop_profile()
         self._fit_collect_metrics(batch)
+        self.metrics.update(self._record_resize_control_observation(batch=batch))
         self._fit_experimental(batch)
+        self.metrics.update(await self._maybe_dynamic_resize())
+        if batch_data_future is None and not self.is_last_step:
+            batch_data_future = asyncio.create_task(self._async_gen_next_batch(continuous_iterator))
+            await asyncio.sleep(0)
         self._fit_postprocess_step()
 
         return batch_data_future
@@ -399,7 +923,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             self._fit_update_weights()
 
         # async next generation
-        if not self.is_last_step:
+        if not self.is_last_step and not self._should_defer_next_rollout_for_resize():
             batch_data_future = asyncio.create_task(self._async_gen_next_batch(continuous_iterator))
             await asyncio.sleep(0)
         else:

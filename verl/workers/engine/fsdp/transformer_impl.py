@@ -776,6 +776,7 @@ class FSDPEngine(BaseEngine):
         hdfs_path: Optional[str] = None,
         global_step: int = 0,
         max_ckpt_to_keep: Optional[int] = None,
+        save_full_model_for_dynamic_resize: bool = False,
         **kwargs,
     ) -> None:
         """
@@ -788,7 +789,11 @@ class FSDPEngine(BaseEngine):
             load_fsdp_model_to_gpu(self.module)
 
         self.checkpoint_manager.save_checkpoint(
-            local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
+            local_path=local_path,
+            hdfs_path=hdfs_path,
+            global_step=global_step,
+            max_ckpt_to_keep=max_ckpt_to_keep,
+            save_full_model_for_dynamic_resize=save_full_model_for_dynamic_resize,
         )
 
         torch.distributed.barrier()

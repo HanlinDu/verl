@@ -29,7 +29,7 @@ import torch
 from cachetools import LRUCache
 from omegaconf import DictConfig
 
-from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
+from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup, split_resource_pool
 from verl.utils import normalize_token_ids
 from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import rollout_trace_op
@@ -435,11 +435,12 @@ class LLMServerManager:
                 * self.rollout_config.data_parallel_size
                 * self.rollout_config.pipeline_model_parallel_size
             )
-        world_size = (
-            self.worker_group.world_size
-            if self.worker_group
-            else self.rollout_config.n_gpus_per_node * self.rollout_config.nnodes
-        )
+        if self.worker_group:
+            world_size = self.worker_group.world_size
+        elif self.rollout_resource_pool is not None:
+            world_size = self.rollout_resource_pool.world_size
+        else:
+            world_size = self.rollout_config.n_gpus_per_node * self.rollout_config.nnodes
         num_replicas = world_size // rollout_world_size
 
         self.rollout_replicas = [
@@ -463,7 +464,16 @@ class LLMServerManager:
                 ]
             )
         else:
-            await asyncio.gather(*[server.init_standalone() for server in self.rollout_replicas])
+            if self.rollout_resource_pool is not None:
+                rollout_resource_pools = split_resource_pool(self.rollout_resource_pool, rollout_world_size)
+                await asyncio.gather(
+                    *[
+                        server.init_standalone(resource_pool=resource_pool)
+                        for server, resource_pool in zip(self.rollout_replicas, rollout_resource_pools, strict=True)
+                    ]
+                )
+            else:
+                await asyncio.gather(*[server.init_standalone() for server in self.rollout_replicas])
 
         self.server_handles = [server._server_handle for server in self.rollout_replicas]
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
