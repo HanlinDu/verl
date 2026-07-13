@@ -21,6 +21,7 @@ from verl.experimental.one_step_off_policy.ray_trainer import OneStepOffRayTrain
 from verl.experimental.one_step_off_policy.staging_backend import (
     HostStagingConfig,
     read_host_staging_manifest,
+    read_paged_state_manifest,
     read_restore_session_manifest,
 )
 from verl.experimental.one_step_off_policy.trace_utils import ResizeTraceConfig
@@ -125,11 +126,18 @@ def test_dynamic_resize_handoff_session_manifest_is_written_and_completed(tmp_pa
         }
     )
     global_step_folder = str(tmp_path / "global_step_7")
+    actor_checkpoint_dir = tmp_path / "global_step_7" / "actor"
+    actor_checkpoint_dir.mkdir(parents=True)
+    (actor_checkpoint_dir / "dynamic_resize_full_model.pt").write_bytes(b"full-model")
+    (actor_checkpoint_dir / "model_world_size_2_rank_0.pt").write_bytes(b"model-rank-0")
+    (actor_checkpoint_dir / "optim_world_size_2_rank_0.pt").write_bytes(b"optim-rank-0")
 
     prepare_metrics = trainer._prepare_dynamic_resize_handoff_session(global_step_folder)
 
     stage_dir = tmp_path / "global_step_7" / "dynamic_resize_handoff"
     host_manifest = read_host_staging_manifest(str(stage_dir))
+    model_artifact_manifest = read_paged_state_manifest(str(stage_dir), "checkpoint_model")
+    optimizer_artifact_manifest = read_paged_state_manifest(str(stage_dir), "checkpoint_optimizer")
     restore_manifest = read_restore_session_manifest(str(stage_dir))
 
     assert prepare_metrics["resize/handoff_manifest_written"] == 1.0
@@ -137,15 +145,23 @@ def test_dynamic_resize_handoff_session_manifest_is_written_and_completed(tmp_pa
     assert prepare_metrics["resize/handoff_stage_dir"] == str(stage_dir)
     assert host_manifest["backend"] == "pinned_cpu"
     assert host_manifest["service_name"] == "resize-service"
+    assert model_artifact_manifest["page_count"] == 2
+    assert optimizer_artifact_manifest["page_count"] == 1
     assert restore_manifest["backend"] == "pinned_cpu"
     assert restore_manifest["service_name"] == "resize-service"
     assert restore_manifest["optimizer_restore_policy"] == "immediate"
+    assert restore_manifest["model_page_count"] == 2
+    assert restore_manifest["optimizer_page_count"] == 1
+    assert prepare_metrics["resize/handoff_model_artifact_count"] == 2.0
+    assert prepare_metrics["resize/handoff_optimizer_artifact_count"] == 1.0
 
     complete_metrics = trainer._complete_dynamic_resize_handoff_session(global_step_folder)
     completed_manifest = read_restore_session_manifest(str(stage_dir))
 
     assert complete_metrics["resize/handoff_manifest_written"] == 1.0
     assert complete_metrics["resize/handoff_restore_session_status"] == "completed"
+    assert complete_metrics["resize/handoff_model_artifact_count"] == 2.0
+    assert complete_metrics["resize/handoff_optimizer_artifact_count"] == 1.0
     assert completed_manifest["status"] == "completed"
 
 
@@ -259,6 +275,52 @@ def test_dynamic_resize_schedule_uses_hard_switch_for_release_old_metadata():
     assert metrics["resize/schedule_triggered"] == 1.0
     assert metrics["resize/schedule_applied"] == 1.0
     assert metrics["resize/hard_switch_success"] == 1.0
+
+
+def test_dynamic_resize_handoff_metrics_persist_without_next_schedule():
+    trainer = object.__new__(OneStepOffRayTrainer)
+    trainer.global_steps = 1
+    trainer._dynamic_resize_enabled = True
+    trainer._dynamic_resize_mode = "schedule"
+    trainer._dynamic_resize_cfg = {
+        "enable": True,
+        "shared_pool": True,
+        "hard_switch": {"enable": True},
+        "schedule": [{"step": 1, "actor_pool": {"world_size": 1}, "rollout_pool": {"world_size": 3}}],
+    }
+    trainer._resize_controller = None
+    trainer._resize_trace_config = ResizeTraceConfig()
+    trainer._latest_resize_control_metrics = {}
+    trainer._latest_resize_budget_metrics = {}
+    trainer._latest_resize_handoff_metrics = {}
+
+    def _gate(item):
+        return True, ACTION_EXPAND_ROLLOUT, {"resize/schedule_triggered": 1.0}
+
+    async def _hard_switch(*, item, required_action):
+        return {
+            "resize/schedule_applied": 1.0,
+            "resize/handoff_manifest_written": 1.0,
+            "resize/handoff_model_artifact_count": 3.0,
+            "resize/handoff_optimizer_artifact_count": 2.0,
+        }
+
+    trainer._gate_dynamic_resize_schedule_item = _gate
+    trainer._apply_dynamic_resize_hard_switch = _hard_switch
+
+    first_metrics = asyncio.run(trainer._maybe_dynamic_resize())
+    assert first_metrics["resize/handoff_manifest_written"] == 1.0
+
+    trainer.global_steps = 2
+    trainer._latest_resize_control_metrics = {"resize/schedule_triggered": 0.0}
+    trainer._active_dynamic_resize_topology = {"actor_size": 1, "rollout_size": 3}
+
+    second_metrics = asyncio.run(trainer._maybe_dynamic_resize())
+
+    assert second_metrics["resize/schedule_triggered"] == 0.0
+    assert second_metrics["resize/handoff_manifest_written"] == 1.0
+    assert second_metrics["resize/handoff_model_artifact_count"] == 3.0
+    assert second_metrics["resize/handoff_optimizer_artifact_count"] == 2.0
 
 
 def test_dynamic_resize_budget_gate_blocks_schedule_before_hard_switch(tmp_path):

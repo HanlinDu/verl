@@ -48,10 +48,12 @@ from verl.experimental.one_step_off_policy.resize_controller import (
 from verl.experimental.one_step_off_policy.resize_metrics import build_resize_observation
 from verl.experimental.one_step_off_policy.staging_backend import (
     HostStagingConfig,
+    build_checkpoint_artifact_manifest,
     create_restore_session_manifest,
     finalize_restore_session_manifest,
     has_restore_session_manifest,
     read_restore_session_manifest,
+    write_paged_state_manifest,
     write_host_staging_manifest,
 )
 from verl.experimental.one_step_off_policy.trace_utils import append_resize_trace, build_resize_trace_config
@@ -260,6 +262,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/handoff_stage_dir": "",
             "resize/handoff_session_id": "",
             "resize/handoff_error": "",
+            "resize/handoff_model_artifact_count": 0.0,
+            "resize/handoff_optimizer_artifact_count": 0.0,
+            "resize/handoff_staged_model_bytes": 0.0,
+            "resize/handoff_staged_optimizer_bytes": 0.0,
         }
 
     def _build_resize_control_metrics(self, snapshot: dict[str, float | str | int]) -> dict[str, float | str | int]:
@@ -567,21 +573,48 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
     def _dynamic_resize_handoff_stage_dir(global_step_folder: str) -> str:
         return os.path.join(global_step_folder, "dynamic_resize_handoff")
 
+    @staticmethod
+    def _checkpoint_artifact_file_names(checkpoint_dir: str, prefixes: tuple[str, ...]) -> list[str]:
+        if not os.path.isdir(checkpoint_dir):
+            return []
+        names = []
+        for file_name in os.listdir(checkpoint_dir):
+            if any(file_name.startswith(prefix) for prefix in prefixes):
+                names.append(file_name)
+        return sorted(names)
+
     def _prepare_dynamic_resize_handoff_session(self, global_step_folder: str) -> dict[str, float | str | int]:
         metrics = self._default_resize_handoff_metrics()
         if not self._host_staging_config.enable:
             return metrics
 
         stage_dir = self._dynamic_resize_handoff_stage_dir(global_step_folder)
+        actor_checkpoint_dir = os.path.join(global_step_folder, "actor")
         session_id = f"dynamic_resize_step_{self.global_steps}_{uuid.uuid4().hex}"
         try:
             write_host_staging_manifest(stage_dir, self._host_staging_config)
+            model_manifest = build_checkpoint_artifact_manifest(
+                actor_checkpoint_dir,
+                prefix="checkpoint_model",
+                file_names=self._checkpoint_artifact_file_names(
+                    actor_checkpoint_dir, ("dynamic_resize_full_model.pt", "model_world_size_")
+                ),
+            )
+            optimizer_manifest = build_checkpoint_artifact_manifest(
+                actor_checkpoint_dir,
+                prefix="checkpoint_optimizer",
+                file_names=self._checkpoint_artifact_file_names(actor_checkpoint_dir, ("optim_world_size_",)),
+            )
+            write_paged_state_manifest(stage_dir, "checkpoint_model", model_manifest)
+            write_paged_state_manifest(stage_dir, "checkpoint_optimizer", optimizer_manifest)
             manifest = create_restore_session_manifest(
                 stage_dir,
                 backend=self._host_staging_config.effective_backend(),
                 service_name=self._host_staging_config.service_name,
                 session_id=session_id,
                 optimizer_restore_policy=self._host_staging_config.optimizer_restore_policy,
+                model_manifest=model_manifest,
+                optimizer_manifest=optimizer_manifest,
             )
         except Exception as exc:
             logger.warning("[one-step-off][resize][handoff] failed to write handoff manifest: %s", exc)
@@ -602,6 +635,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 "resize/handoff_stage_dir": stage_dir,
                 "resize/handoff_session_id": manifest.get("session_id", session_id),
                 "resize/handoff_error": "",
+                "resize/handoff_model_artifact_count": float(manifest.get("model_page_count", 0) or 0),
+                "resize/handoff_optimizer_artifact_count": float(manifest.get("optimizer_page_count", 0) or 0),
+                "resize/handoff_staged_model_bytes": float(manifest.get("staged_model_bytes", 0) or 0),
+                "resize/handoff_staged_optimizer_bytes": float(manifest.get("staged_optimizer_bytes", 0) or 0),
             }
         )
         return metrics
@@ -636,6 +673,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                     "resize/handoff_stage_dir": stage_dir,
                     "resize/handoff_session_id": manifest.get("session_id", ""),
                     "resize/handoff_error": str(exc),
+                    "resize/handoff_model_artifact_count": float(manifest.get("model_page_count", 0) or 0),
+                    "resize/handoff_optimizer_artifact_count": float(manifest.get("optimizer_page_count", 0) or 0),
+                    "resize/handoff_staged_model_bytes": float(manifest.get("staged_model_bytes", 0) or 0),
+                    "resize/handoff_staged_optimizer_bytes": float(manifest.get("staged_optimizer_bytes", 0) or 0),
                 }
             )
             return metrics
@@ -647,6 +688,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 "resize/handoff_stage_dir": stage_dir,
                 "resize/handoff_session_id": manifest.get("session_id", ""),
                 "resize/handoff_error": "",
+                "resize/handoff_model_artifact_count": float(manifest.get("model_page_count", 0) or 0),
+                "resize/handoff_optimizer_artifact_count": float(manifest.get("optimizer_page_count", 0) or 0),
+                "resize/handoff_staged_model_bytes": float(manifest.get("staged_model_bytes", 0) or 0),
+                "resize/handoff_staged_optimizer_bytes": float(manifest.get("staged_optimizer_bytes", 0) or 0),
             }
         )
         return metrics
@@ -864,6 +909,12 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             self._resize_trace_config,
             {"event": "resize_schedule", "step": self.global_steps, "metrics": metrics},
         )
+        self._latest_resize_budget_metrics = {
+            key: value for key, value in metrics.items() if key.startswith("resize/budget_")
+        }
+        self._latest_resize_handoff_metrics = {
+            key: value for key, value in metrics.items() if key.startswith("resize/handoff_")
+        }
         return dict(metrics)
 
     def _init_resource_pools(self):

@@ -234,6 +234,48 @@ def write_paged_state_manifest(stage_dir: str, prefix: str, manifest: dict[str, 
     return manifest
 
 
+def build_checkpoint_artifact_manifest(
+    checkpoint_dir: str,
+    *,
+    prefix: str,
+    file_names: list[str],
+) -> dict[str, Any]:
+    """Describe checkpoint files that back a handoff session.
+
+    This is metadata-only: files remain in the normal checkpoint directory and
+    can later be replaced by pinned/disk paged artifacts without changing the
+    restore-session schema.
+    """
+
+    existing_file_names = [
+        file_name for file_name in sorted(set(file_names)) if os.path.isfile(os.path.join(checkpoint_dir, file_name))
+    ]
+    pages: list[dict[str, Any]] = []
+    for idx, file_name in enumerate(existing_file_names):
+        path = os.path.join(checkpoint_dir, file_name)
+        pages.append(
+            {
+                "page_id": idx,
+                "file_name": file_name,
+                "source_path": path,
+                "storage": "checkpoint_file",
+                "entry_count": 1,
+                "tensor_keys": [],
+                "estimated_bytes": os.path.getsize(path),
+            }
+        )
+
+    return {
+        "manifest_version": 1,
+        "prefix": prefix,
+        "page_bytes": 0,
+        "page_count": len(pages),
+        "files": [page["file_name"] for page in pages],
+        "pages": pages,
+        "total_bytes": sum(int(page["estimated_bytes"]) for page in pages),
+    }
+
+
 def probe_local_pin_memory_capability() -> tuple[bool, str]:
     try:
         sample = torch.empty(1, dtype=torch.uint8).pin_memory()

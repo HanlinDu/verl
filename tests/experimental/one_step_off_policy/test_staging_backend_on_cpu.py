@@ -5,6 +5,7 @@ import torch
 
 from verl.experimental.one_step_off_policy.staging_backend import (
     HostStagingConfig,
+    build_checkpoint_artifact_manifest,
     create_restore_session_manifest,
     finalize_restore_session_manifest,
     has_paged_state_dict,
@@ -56,6 +57,25 @@ def test_host_staging_manifest_roundtrip(tmp_path: Path):
     assert manifest["host_preload_threshold"] == pytest.approx(0.73)
     assert manifest["device_preload_threshold"] == pytest.approx(0.82)
     assert manifest["cleanup_after_load"] is False
+
+
+def test_checkpoint_artifact_manifest_records_existing_files(tmp_path: Path):
+    model_path = tmp_path / "dynamic_resize_full_model.pt"
+    optim_path = tmp_path / "optim_world_size_2_rank_0.pt"
+    model_path.write_bytes(b"model")
+    optim_path.write_bytes(b"optimizer")
+
+    manifest = build_checkpoint_artifact_manifest(
+        str(tmp_path),
+        prefix="checkpoint_model",
+        file_names=[model_path.name, optim_path.name, "missing.pt"],
+    )
+
+    assert manifest["prefix"] == "checkpoint_model"
+    assert manifest["page_count"] == 2
+    assert manifest["total_bytes"] == model_path.stat().st_size + optim_path.stat().st_size
+    assert manifest["pages"][0]["storage"] == "checkpoint_file"
+    assert manifest["pages"][0]["source_path"].startswith(str(tmp_path))
 
 
 def test_pinned_cpu_request_falls_back_to_disk_backend():
