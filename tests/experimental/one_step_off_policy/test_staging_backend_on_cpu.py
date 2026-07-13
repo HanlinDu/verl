@@ -3,6 +3,10 @@ from pathlib import Path
 import pytest
 import torch
 
+from verl.utils.checkpoint.fsdp_checkpoint_manager import (
+    dynamic_resize_optimizer_status_path,
+    write_dynamic_resize_optimizer_restore_status,
+)
 from verl.experimental.one_step_off_policy.staging_backend import (
     HostStagingConfig,
     build_checkpoint_artifact_manifest,
@@ -76,6 +80,28 @@ def test_checkpoint_artifact_manifest_records_existing_files(tmp_path: Path):
     assert manifest["total_bytes"] == model_path.stat().st_size + optim_path.stat().st_size
     assert manifest["pages"][0]["storage"] == "checkpoint_file"
     assert manifest["pages"][0]["source_path"].startswith(str(tmp_path))
+
+
+def test_dynamic_resize_optimizer_restore_status_file_records_skip(tmp_path: Path):
+    (tmp_path / "optim_world_size_2_rank_0.pt").write_bytes(b"optim-0")
+    (tmp_path / "optim_world_size_2_rank_1.pt").write_bytes(b"optim-1")
+
+    manifest = write_dynamic_resize_optimizer_restore_status(
+        str(tmp_path),
+        status="skipped",
+        reason="missing_target_world_size_optimizer_shard_after_full_model_fallback",
+        rank=0,
+        world_size=1,
+        expected_optimizer_path=str(tmp_path / "optim_world_size_1_rank_0.pt"),
+        loaded_model_from_dynamic_full=True,
+    )
+
+    path = dynamic_resize_optimizer_status_path(str(tmp_path), 0)
+
+    assert Path(path).exists()
+    assert manifest["status"] == "skipped"
+    assert manifest["source_optimizer_file_count"] == 2
+    assert manifest["source_optimizer_files"] == ["optim_world_size_2_rank_0.pt", "optim_world_size_2_rank_1.pt"]
 
 
 def test_pinned_cpu_request_falls_back_to_disk_backend():

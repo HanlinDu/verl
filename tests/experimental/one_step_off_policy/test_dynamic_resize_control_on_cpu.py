@@ -27,6 +27,7 @@ from verl.experimental.one_step_off_policy.staging_backend import (
 from verl.experimental.one_step_off_policy.trace_utils import ResizeTraceConfig
 from verl.experimental.separation.utils import build_dynamic_resize_pool_topology, create_resource_pool_manager
 from verl.trainer.ppo.utils import Role
+from verl.utils.checkpoint.fsdp_checkpoint_manager import write_dynamic_resize_optimizer_restore_status
 
 
 def test_resize_controller_allows_matching_stable_signal():
@@ -154,6 +155,15 @@ def test_dynamic_resize_handoff_session_manifest_is_written_and_completed(tmp_pa
     assert restore_manifest["optimizer_page_count"] == 1
     assert prepare_metrics["resize/handoff_model_artifact_count"] == 2.0
     assert prepare_metrics["resize/handoff_optimizer_artifact_count"] == 1.0
+    write_dynamic_resize_optimizer_restore_status(
+        str(actor_checkpoint_dir),
+        status="skipped",
+        reason="missing_target_world_size_optimizer_shard_after_full_model_fallback",
+        rank=0,
+        world_size=1,
+        expected_optimizer_path=str(actor_checkpoint_dir / "optim_world_size_1_rank_0.pt"),
+        loaded_model_from_dynamic_full=True,
+    )
 
     complete_metrics = trainer._complete_dynamic_resize_handoff_session(global_step_folder)
     completed_manifest = read_restore_session_manifest(str(stage_dir))
@@ -162,7 +172,11 @@ def test_dynamic_resize_handoff_session_manifest_is_written_and_completed(tmp_pa
     assert complete_metrics["resize/handoff_restore_session_status"] == "completed"
     assert complete_metrics["resize/handoff_model_artifact_count"] == 2.0
     assert complete_metrics["resize/handoff_optimizer_artifact_count"] == 1.0
+    assert complete_metrics["resize/handoff_optimizer_restore_status"] == "skipped"
+    assert complete_metrics["resize/handoff_optimizer_restore_skipped_ranks"] == 1.0
     assert completed_manifest["status"] == "completed"
+    assert completed_manifest["optimizer_restore_status"] == "skipped"
+    assert completed_manifest["optimizer_restore_skipped_rank_count"] == 1
 
 
 def test_dynamic_resize_defer_next_rollout_requires_hard_switch_schedule_match():

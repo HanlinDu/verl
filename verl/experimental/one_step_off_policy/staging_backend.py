@@ -87,6 +87,10 @@ class RestoreSessionManifest:
     staged_optimizer_bytes: int = 0
     applied_model_pages: int = 0
     applied_optimizer_pages: int = 0
+    optimizer_restore_status: str = "unknown"
+    optimizer_restore_reason: str = ""
+    optimizer_restore_rank_count: int = 0
+    optimizer_restore_skipped_rank_count: int = 0
     last_error: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -109,6 +113,10 @@ class RestoreSessionManifest:
             staged_optimizer_bytes=max(int(data.get("staged_optimizer_bytes", 0)), 0),
             applied_model_pages=max(int(data.get("applied_model_pages", 0)), 0),
             applied_optimizer_pages=max(int(data.get("applied_optimizer_pages", 0)), 0),
+            optimizer_restore_status=str(data.get("optimizer_restore_status", "unknown")),
+            optimizer_restore_reason=str(data.get("optimizer_restore_reason", "")),
+            optimizer_restore_rank_count=max(int(data.get("optimizer_restore_rank_count", 0)), 0),
+            optimizer_restore_skipped_rank_count=max(int(data.get("optimizer_restore_skipped_rank_count", 0)), 0),
             last_error=str(data.get("last_error", "")),
         )
 

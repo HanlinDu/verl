@@ -42,6 +42,40 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 _DYNAMIC_RESIZE_FULL_MODEL = "dynamic_resize_full_model.pt"
+_DYNAMIC_RESIZE_OPTIMIZER_STATUS_PREFIX = "dynamic_resize_optimizer_restore_status"
+
+
+def dynamic_resize_optimizer_status_path(local_path: str, rank: int) -> str:
+    return os.path.join(local_path, f"{_DYNAMIC_RESIZE_OPTIMIZER_STATUS_PREFIX}_rank_{rank}.json")
+
+
+def write_dynamic_resize_optimizer_restore_status(
+    local_path: str,
+    *,
+    status: str,
+    reason: str,
+    rank: int,
+    world_size: int,
+    expected_optimizer_path: str,
+    loaded_model_from_dynamic_full: bool,
+) -> dict:
+    source_optimizer_files = sorted(
+        os.path.basename(path) for path in glob(os.path.join(local_path, "optim_world_size_*_rank_*.pt"))
+    )
+    manifest = {
+        "manifest_version": 1,
+        "status": str(status),
+        "reason": str(reason),
+        "rank": int(rank),
+        "world_size": int(world_size),
+        "expected_optimizer_path": expected_optimizer_path,
+        "loaded_model_from_dynamic_full": bool(loaded_model_from_dynamic_full),
+        "source_optimizer_files": source_optimizer_files,
+        "source_optimizer_file_count": len(source_optimizer_files),
+    }
+    with open(dynamic_resize_optimizer_status_path(local_path, rank), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    return manifest
 
 
 @dataclass
@@ -218,6 +252,15 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     self.optimizer.load_state_dict(optimizer_state_dict)
                     log_with_rank(f"Loaded optimizer from {remote_optim_path}", rank=self.rank, logger=logger)
                 elif loaded_model_from_dynamic_full:
+                    write_dynamic_resize_optimizer_restore_status(
+                        local_path,
+                        status="skipped",
+                        reason="missing_target_world_size_optimizer_shard_after_full_model_fallback",
+                        rank=self.rank,
+                        world_size=self.world_size,
+                        expected_optimizer_path=remote_optim_path,
+                        loaded_model_from_dynamic_full=True,
+                    )
                     log_with_rank(
                         f"Skipped optimizer load for dynamic resize world-size change; "
                         f"missing {remote_optim_path}, keeping the freshly initialized optimizer",

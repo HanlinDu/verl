@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import asyncio
+import json
 import logging
 import os
 import uuid
@@ -53,6 +54,7 @@ from verl.experimental.one_step_off_policy.staging_backend import (
     finalize_restore_session_manifest,
     has_restore_session_manifest,
     read_restore_session_manifest,
+    update_restore_session_manifest,
     write_paged_state_manifest,
     write_host_staging_manifest,
 )
@@ -266,6 +268,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/handoff_optimizer_artifact_count": 0.0,
             "resize/handoff_staged_model_bytes": 0.0,
             "resize/handoff_staged_optimizer_bytes": 0.0,
+            "resize/handoff_optimizer_restore_status": "",
+            "resize/handoff_optimizer_restore_skipped_ranks": 0.0,
+            "resize/handoff_optimizer_restore_rank_count": 0.0,
+            "resize/handoff_optimizer_restore_reason": "",
         }
 
     def _build_resize_control_metrics(self, snapshot: dict[str, float | str | int]) -> dict[str, float | str | int]:
@@ -583,6 +589,55 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 names.append(file_name)
         return sorted(names)
 
+    @staticmethod
+    def _dynamic_resize_optimizer_restore_summary(actor_checkpoint_dir: str) -> dict[str, float | str | int]:
+        if not os.path.isdir(actor_checkpoint_dir):
+            return {}
+        statuses = []
+        for file_name in sorted(os.listdir(actor_checkpoint_dir)):
+            if not file_name.startswith("dynamic_resize_optimizer_restore_status_rank_") or not file_name.endswith(
+                ".json"
+            ):
+                continue
+            path = os.path.join(actor_checkpoint_dir, file_name)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    statuses.append(json.load(f))
+            except Exception as exc:
+                logger.warning("[one-step-off][resize][handoff] failed to read optimizer restore status %s: %s", path, exc)
+        if not statuses:
+            return {}
+
+        skipped_count = sum(1 for item in statuses if item.get("status") == "skipped")
+        if skipped_count:
+            status = "skipped"
+        elif all(item.get("status") == "loaded" for item in statuses):
+            status = "loaded"
+        else:
+            status = "unknown"
+        reason = next((str(item.get("reason", "")) for item in statuses if item.get("reason")), "")
+        return {
+            "optimizer_restore_status": status,
+            "optimizer_restore_reason": reason,
+            "optimizer_restore_rank_count": len(statuses),
+            "optimizer_restore_skipped_rank_count": skipped_count,
+        }
+
+    @staticmethod
+    def _dynamic_resize_optimizer_restore_metrics(
+        summary: dict[str, float | str | int],
+    ) -> dict[str, float | str | int]:
+        if not summary:
+            return {}
+        return {
+            "resize/handoff_optimizer_restore_status": str(summary.get("optimizer_restore_status", "")),
+            "resize/handoff_optimizer_restore_reason": str(summary.get("optimizer_restore_reason", "")),
+            "resize/handoff_optimizer_restore_rank_count": float(summary.get("optimizer_restore_rank_count", 0) or 0),
+            "resize/handoff_optimizer_restore_skipped_ranks": float(
+                summary.get("optimizer_restore_skipped_rank_count", 0) or 0
+            ),
+        }
+
     def _prepare_dynamic_resize_handoff_session(self, global_step_folder: str) -> dict[str, float | str | int]:
         metrics = self._default_resize_handoff_metrics()
         if not self._host_staging_config.enable:
@@ -658,6 +713,12 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             )
             return metrics
 
+        optimizer_restore_summary = self._dynamic_resize_optimizer_restore_summary(
+            os.path.join(global_step_folder, "actor")
+        )
+        if optimizer_restore_summary:
+            update_restore_session_manifest(stage_dir, **optimizer_restore_summary)
+
         try:
             manifest = finalize_restore_session_manifest(stage_dir)
         except Exception as exc:
@@ -677,6 +738,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                     "resize/handoff_optimizer_artifact_count": float(manifest.get("optimizer_page_count", 0) or 0),
                     "resize/handoff_staged_model_bytes": float(manifest.get("staged_model_bytes", 0) or 0),
                     "resize/handoff_staged_optimizer_bytes": float(manifest.get("staged_optimizer_bytes", 0) or 0),
+                    **self._dynamic_resize_optimizer_restore_metrics(optimizer_restore_summary),
                 }
             )
             return metrics
@@ -692,6 +754,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 "resize/handoff_optimizer_artifact_count": float(manifest.get("optimizer_page_count", 0) or 0),
                 "resize/handoff_staged_model_bytes": float(manifest.get("staged_model_bytes", 0) or 0),
                 "resize/handoff_staged_optimizer_bytes": float(manifest.get("staged_optimizer_bytes", 0) or 0),
+                **self._dynamic_resize_optimizer_restore_metrics(optimizer_restore_summary),
             }
         )
         return metrics
