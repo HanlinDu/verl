@@ -20,6 +20,7 @@ from verl.experimental.one_step_off_policy.resize_metrics import build_resize_ob
 from verl.experimental.one_step_off_policy.ray_trainer import OneStepOffRayTrainer
 from verl.experimental.one_step_off_policy.staging_backend import (
     HostStagingConfig,
+    create_restore_session_manifest,
     read_host_staging_manifest,
     read_paged_state_manifest,
     read_restore_session_manifest,
@@ -177,6 +178,37 @@ def test_dynamic_resize_handoff_session_manifest_is_written_and_completed(tmp_pa
     assert completed_manifest["status"] == "completed"
     assert completed_manifest["optimizer_restore_status"] == "skipped"
     assert completed_manifest["optimizer_restore_skipped_rank_count"] == 1
+
+
+def test_dynamic_resize_stages_optimizer_handoff_and_updates_manifest(tmp_path):
+    class _FakeActorWorkerGroup:
+        def stage_optimizer_for_dynamic_resize(self, stage_dir, handoff_config):
+            assert stage_dir.endswith("dynamic_resize_handoff")
+            assert handoff_config["stage_optimizer"] is True
+            return [
+                {"rank": 0, "status": "staged", "page_count": 2, "total_bytes": 100},
+                {"rank": 1, "status": "staged", "page_count": 3, "total_bytes": 200},
+            ]
+
+    trainer = object.__new__(OneStepOffRayTrainer)
+    trainer._host_staging_config = HostStagingConfig.from_dict(
+        {"enable": True, "backend": "disk_fallback", "stage_optimizer": True, "chunk_mb": 1}
+    )
+    trainer.actor_wg = _FakeActorWorkerGroup()
+    global_step_folder = str(tmp_path / "global_step_8")
+    stage_dir = tmp_path / "global_step_8" / "dynamic_resize_handoff"
+    create_restore_session_manifest(str(stage_dir), backend="disk_fallback", session_id="session-8")
+
+    metrics = trainer._stage_dynamic_resize_optimizer_handoff(global_step_folder)
+    manifest = read_restore_session_manifest(str(stage_dir))
+
+    assert metrics["resize/handoff_optimizer_stage_status"] == "staged"
+    assert metrics["resize/handoff_optimizer_stage_rank_count"] == 2.0
+    assert metrics["resize/handoff_optimizer_stage_page_count"] == 5.0
+    assert metrics["resize/handoff_optimizer_stage_bytes"] == 300.0
+    assert manifest["status"] == "optimizer_staged"
+    assert manifest["optimizer_page_count"] == 5
+    assert manifest["staged_optimizer_bytes"] == 300
 
 
 def test_dynamic_resize_defer_next_rollout_requires_hard_switch_schedule_match():

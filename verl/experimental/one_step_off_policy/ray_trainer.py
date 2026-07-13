@@ -272,6 +272,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/handoff_optimizer_restore_skipped_ranks": 0.0,
             "resize/handoff_optimizer_restore_rank_count": 0.0,
             "resize/handoff_optimizer_restore_reason": "",
+            "resize/handoff_optimizer_stage_status": "",
+            "resize/handoff_optimizer_stage_rank_count": 0.0,
+            "resize/handoff_optimizer_stage_page_count": 0.0,
+            "resize/handoff_optimizer_stage_bytes": 0.0,
         }
 
     def _build_resize_control_metrics(self, snapshot: dict[str, float | str | int]) -> dict[str, float | str | int]:
@@ -638,6 +642,74 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             ),
         }
 
+    def _stage_dynamic_resize_optimizer_handoff(self, global_step_folder: str) -> dict[str, float | str | int]:
+        metrics = self._default_resize_handoff_metrics()
+        if not self._host_staging_config.enable or not self._host_staging_config.stage_optimizer:
+            return metrics
+
+        stage_dir = self._dynamic_resize_handoff_stage_dir(global_step_folder)
+        actor_wg = getattr(self, "actor_wg", None) or getattr(self, "actor_rollout_wg", None)
+        if actor_wg is None:
+            metrics.update(
+                {
+                    "resize/handoff_optimizer_stage_status": "unavailable",
+                    "resize/handoff_error": "actor_worker_group_unavailable",
+                }
+            )
+            return metrics
+
+        try:
+            stage_fn = getattr(actor_wg, "stage_optimizer_for_dynamic_resize", None)
+            if callable(stage_fn):
+                rank_results = stage_fn(stage_dir, self._host_staging_config.to_manifest_dict())
+            else:
+                rank_results = actor_wg.execute_all_sync(
+                    "stage_optimizer_for_dynamic_resize",
+                    stage_dir,
+                    self._host_staging_config.to_manifest_dict(),
+                )
+        except Exception as exc:
+            logger.warning("[one-step-off][resize][handoff] failed to stage optimizer state: %s", exc)
+            metrics.update(
+                {
+                    "resize/handoff_optimizer_stage_status": "failed",
+                    "resize/handoff_stage_dir": stage_dir,
+                    "resize/handoff_error": str(exc),
+                }
+            )
+            return metrics
+
+        staged_results = [item for item in rank_results if isinstance(item, dict) and item.get("status") == "staged"]
+        page_count = sum(int(item.get("page_count", 0) or 0) for item in staged_results)
+        total_bytes = sum(int(item.get("total_bytes", 0) or 0) for item in staged_results)
+        if staged_results and len(staged_results) == len(rank_results):
+            stage_status = "staged"
+        elif staged_results:
+            stage_status = "partial"
+        else:
+            stage_status = "skipped"
+
+        if staged_results:
+            update_restore_session_manifest(
+                stage_dir,
+                status="optimizer_staged",
+                optimizer_page_count=page_count,
+                staged_optimizer_bytes=total_bytes,
+                last_error="",
+            )
+
+        metrics.update(
+            {
+                "resize/handoff_optimizer_stage_status": stage_status,
+                "resize/handoff_optimizer_stage_rank_count": float(len(staged_results)),
+                "resize/handoff_optimizer_stage_page_count": float(page_count),
+                "resize/handoff_optimizer_stage_bytes": float(total_bytes),
+                "resize/handoff_stage_dir": stage_dir,
+                "resize/handoff_error": "",
+            }
+        )
+        return metrics
+
     def _prepare_dynamic_resize_handoff_session(self, global_step_folder: str) -> dict[str, float | str | int]:
         metrics = self._default_resize_handoff_metrics()
         if not self._host_staging_config.enable:
@@ -884,12 +956,23 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         with marked_timer("dynamic_resize_save_checkpoint", self.timing_raw, color="green"):
             self._save_checkpoint(save_full_model_for_dynamic_resize=True)
             metrics.update(self._prepare_dynamic_resize_handoff_session(checkpoint_step_folder))
+            optimizer_stage_metrics = self._stage_dynamic_resize_optimizer_handoff(checkpoint_step_folder)
+            metrics.update(optimizer_stage_metrics)
 
         await self._destroy_dynamic_resize_runtime()
         with marked_timer("dynamic_resize_rebuild_runtime", self.timing_raw, color="green"):
             self._rebuild_dynamic_resize_runtime(actor_size=actor_target, rollout_size=rollout_target)
             self._load_dynamic_resize_checkpoint(checkpoint_step_folder)
             metrics.update(self._complete_dynamic_resize_handoff_session(checkpoint_step_folder))
+            metrics.update(
+                {
+                    key: value
+                    for key, value in optimizer_stage_metrics.items()
+                    if key.startswith("resize/handoff_optimizer_stage")
+                }
+            )
+            if optimizer_stage_metrics.get("resize/handoff_error") and not metrics.get("resize/handoff_error"):
+                metrics["resize/handoff_error"] = optimizer_stage_metrics["resize/handoff_error"]
 
         with marked_timer("dynamic_resize_update_weights", self.timing_raw, color="green"):
             await self.checkpoint_manager.update_weights(self.global_steps)

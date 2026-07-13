@@ -202,6 +202,48 @@ class TrainingWorker(Worker, DistProfilerExtension):
         }
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def stage_optimizer_for_dynamic_resize(self, stage_dir: str, handoff_config: dict) -> dict[str, float | str | int]:
+        """Stage this rank's optimizer state for dynamic resize handoff."""
+        from verl.experimental.one_step_off_policy.staging_backend import (
+            HostStagingConfig,
+            save_paged_optimizer_state_dict,
+        )
+
+        cfg = HostStagingConfig.from_dict(handoff_config)
+        rank = int(torch.distributed.get_rank()) if torch.distributed.is_initialized() else 0
+        metrics: dict[str, float | str | int] = {
+            "rank": rank,
+            "status": "skipped",
+            "reason": "",
+            "page_count": 0,
+            "total_bytes": 0,
+        }
+        if not cfg.enable:
+            metrics["reason"] = "handoff_disabled"
+            return metrics
+        if not cfg.stage_optimizer:
+            metrics["reason"] = "stage_optimizer_disabled"
+            return metrics
+
+        optimizer = getattr(self.engine, "optimizer", None)
+        if optimizer is None:
+            metrics.update({"status": "unavailable", "reason": "optimizer_unavailable"})
+            return metrics
+
+        page_bytes = max(int(cfg.chunk_mb), 1) * 1024 * 1024
+        prefix = f"optim_state_rank_{rank}"
+        manifest = save_paged_optimizer_state_dict(stage_dir, prefix, optimizer.state_dict(), page_bytes)
+        metrics.update(
+            {
+                "status": "staged",
+                "reason": "",
+                "page_count": int(manifest.get("page_count", 0) or 0),
+                "total_bytes": int(manifest.get("total_bytes", 0) or 0),
+            }
+        )
+        return metrics
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_loss_fn(self, loss_fn):
         self.loss_fn = loss_fn
 
@@ -736,6 +778,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             max_ckpt_to_keep,
             save_full_model_for_dynamic_resize=save_full_model_for_dynamic_resize,
         )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def stage_optimizer_for_dynamic_resize(self, stage_dir: str, handoff_config: dict):
+        assert "actor" in self.role, "stage_optimizer_for_dynamic_resize only support actor role"
+        return self.actor.stage_optimizer_for_dynamic_resize(stage_dir, handoff_config)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
