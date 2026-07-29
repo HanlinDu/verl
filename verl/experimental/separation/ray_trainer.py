@@ -149,16 +149,12 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             critic_cfg = omega_conf_to_dataclass(self.config.critic)
 
             # convert critic_cfg into TrainingWorkerConfig for the unified model engine worker
-            from verl.workers.config import FSDPEngineConfig
             from verl.workers.engine_workers import TrainingWorkerConfig
 
             self.orig_critic_cfg = critic_cfg
-            if self.orig_critic_cfg.strategy == "fsdp":
-                engine_config: FSDPEngineConfig = self.orig_critic_cfg.model.fsdp_config
-                engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
-                engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
-            else:
-                raise NotImplementedError(f"Unknown strategy {self.orig_critic_cfg.strategy=}")
+            engine_config = self.orig_critic_cfg.engine
+            engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
+            engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
 
             critic_cfg = TrainingWorkerConfig(
                 model_type="value_model",

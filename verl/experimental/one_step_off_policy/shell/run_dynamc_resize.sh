@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+set -xeuo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "${SCRIPT_DIR}/../../../.." && pwd)
+cd "${REPO_ROOT}"
+
+NUM_GPUS=${NUM_GPUS:-8}
+ACTOR_STRATEGY=${ACTOR_STRATEGY:-"fsdp2"}
+
+MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-1.5B-Instruct}
+MODEL_PATH=${MODEL_PATH:-/file_system/common-models/Qwen/Qwen2.5-1.5B-Instruct}
+RESOLVED_MODEL_PATH="${MODEL_PATH}"
+
+TRAIN_FILE=${TRAIN_FILE:-/file_system/common-data/new_gsm8k/train.parquet}
+VAL_FILE=${VAL_FILE:-/file_system/common-data/new_gsm8k/test.parquet}
+
+n_gpus_rollout=${N_GPUS_ROLLOUT:-4}
+n_gpus_training=$((NUM_GPUS - n_gpus_rollout))
+resize_step=${RESIZE_STEP:-2}
+second_resize_step=$((resize_step + 2))
+shared_pool_gpus=${SHARED_POOL_GPUS:-${NUM_GPUS}}
+first_split_plan=${FIRST_SPLIT_PLAN:-${SPLIT_PLAN:-"[6,2]"}}
+second_split_plan=${SECOND_SPLIT_PLAN:-"[2,6]"}
+total_training_steps=${TOTAL_TRAINING_STEPS:-$((second_resize_step + 2))}
+RESIZE_MODE=${RESIZE_MODE:-schedule}
+HYSTERESIS_ENABLE=${HYSTERESIS_ENABLE:-false}
+HYSTERESIS_WINDOW=${HYSTERESIS_WINDOW:-2}
+HYSTERESIS_UP_THRESHOLD=${HYSTERESIS_UP_THRESHOLD:-1.15}
+HYSTERESIS_DOWN_THRESHOLD=${HYSTERESIS_DOWN_THRESHOLD:-0.9}
+HYSTERESIS_MIN_DWELL=${HYSTERESIS_MIN_DWELL:-1}
+HYSTERESIS_COOLDOWN=${HYSTERESIS_COOLDOWN:-0}
+HYSTERESIS_CONSECUTIVE=${HYSTERESIS_CONSECUTIVE:-1}
+HYSTERESIS_MIN_OBSERVATIONS=${HYSTERESIS_MIN_OBSERVATIONS:-1}
+HOST_STAGING_ENABLE=${HOST_STAGING_ENABLE:-true}
+HOST_STAGING_BACKEND=${HOST_STAGING_BACKEND:-disk_fallback}
+HOST_STAGING_CHUNK_MB=${HOST_STAGING_CHUNK_MB:-256}
+HOST_STAGING_STAGE_OPTIMIZER=${HOST_STAGING_STAGE_OPTIMIZER:-true}
+HOST_STAGING_OPTIMIZER_RESTORE_POLICY=${HOST_STAGING_OPTIMIZER_RESTORE_POLICY:-deferred}
+HOST_STAGING_PROGRESSIVE_SWAP=${HOST_STAGING_PROGRESSIVE_SWAP:-true}
+HOST_STAGING_HOST_PRELOAD_THRESHOLD=${HOST_STAGING_HOST_PRELOAD_THRESHOLD:-0.85}
+HOST_STAGING_CLEANUP=${HOST_STAGING_CLEANUP:-true}
+HOST_STAGING_PRECLEAR_KV=${HOST_STAGING_PRECLEAR_KV:-true}
+COMM_CACHE_ENABLE=${COMM_CACHE_ENABLE:-false}
+COMM_CACHE_RESERVE_SCHEDULE=${COMM_CACHE_RESERVE_SCHEDULE:-true}
+BUDGET_PROTECTION_ENABLE=${BUDGET_PROTECTION_ENABLE:-false}
+MEMORY_BUDGET_RATIO=${MEMORY_BUDGET_RATIO:-0.85}
+CKPT_DIR=${CKPT_DIR:-/file_system/dhl/save_ckpt/dynamic-resize}
+RAY_TMPDIR=${RAY_TMPDIR:-}
+
+if [[ -n "${RAY_TMPDIR}" ]]; then
+  mkdir -p "${RAY_TMPDIR}"
+  export RAY_TMPDIR
+fi
+
+mkdir -p "${CKPT_DIR}"
+
+DYN_RESIZE_DATA_DIR="${DYN_RESIZE_DATA_DIR:-${CKPT_DIR}/data}"
+mkdir -p "${DYN_RESIZE_DATA_DIR}"
+export TRAIN_FILE VAL_FILE DYN_RESIZE_DATA_DIR
+export DATA_SOURCE="${DATA_SOURCE:-openai/gsm8k}"
+
+# Convert simple GSM8K parquet files (answer/prompt/completion) into verl RLHF format.
+# If the input already has data_source, prompt chat messages, and reward_model, it is copied through unchanged.
+eval "$(python3 - <<'PY_CONVERT'
+import os
+import shlex
+from pathlib import Path
+
+import pandas as pd
+
+
+def convert(src: str, dst_name: str) -> str:
+    df = pd.read_parquet(src)
+    needs_conversion = (
+        "data_source" not in df.columns
+        or "reward_model" not in df.columns
+        or not df["prompt"].map(lambda x: isinstance(x, list)).all()
+    )
+    if not needs_conversion:
+        return src
+
+    if "answer" not in df.columns:
+        raise ValueError(
+            f"{src} is missing verl fields and has no 'answer' column to build reward_model.ground_truth"
+        )
+
+    out = pd.DataFrame()
+    out["data_source"] = [os.environ.get("DATA_SOURCE", "openai/gsm8k")] * len(df)
+    out["prompt"] = df["prompt"].map(
+        lambda q: [
+            {
+                "role": "user",
+                "content": str(q)
+                + ' Let\'s think step by step and output the final answer after "####".',
+            }
+        ]
+    )
+    out["ability"] = "math"
+    out["reward_model"] = df["answer"].map(lambda a: {"style": "rule", "ground_truth": str(a)})
+    out["extra_info"] = [{"index": int(i)} for i in range(len(out))]
+
+    dst = Path(os.environ["DYN_RESIZE_DATA_DIR"]) / dst_name
+    out.to_parquet(dst, index=False)
+    return str(dst)
+
+train = convert(os.environ["TRAIN_FILE"], "train.verl.parquet")
+val = convert(os.environ["VAL_FILE"], "val.verl.parquet")
+print(f"TRAIN_FILE={shlex.quote(train)}")
+print(f"VAL_FILE={shlex.quote(val)}")
+PY_CONVERT
+)"
+
+python3 -m verl.experimental.one_step_off_policy.main_ppo \
+  --config-path=config \
+  --config-name=one_step_off_ppo_trainer_dynamic_resize.yaml \
+  data.train_files="${TRAIN_FILE}" \
+  data.val_files="${VAL_FILE}" \
+  actor_rollout_ref.model.path="${RESOLVED_MODEL_PATH}" \
+  trainer.nnodes=1 \
+  trainer.n_gpus_per_node=${n_gpus_training} \
+  rollout.nnodes=1 \
+  rollout.n_gpus_per_node=${n_gpus_rollout} \
+  trainer.default_local_dir="${CKPT_DIR}" \
+  trainer.total_training_steps=${total_training_steps} \
+  trainer.save_freq=-1 \
+  trainer.dynamic_resize.mode=${RESIZE_MODE} \
+  trainer.dynamic_resize.hysteresis.enable=${HYSTERESIS_ENABLE} \
+  trainer.dynamic_resize.hysteresis.window_size=${HYSTERESIS_WINDOW} \
+  trainer.dynamic_resize.hysteresis.up_threshold=${HYSTERESIS_UP_THRESHOLD} \
+  trainer.dynamic_resize.hysteresis.down_threshold=${HYSTERESIS_DOWN_THRESHOLD} \
+  trainer.dynamic_resize.hysteresis.min_dwell_steps=${HYSTERESIS_MIN_DWELL} \
+  trainer.dynamic_resize.hysteresis.cooldown_steps=${HYSTERESIS_COOLDOWN} \
+  trainer.dynamic_resize.hysteresis.consecutive_signal_steps=${HYSTERESIS_CONSECUTIVE} \
+  trainer.dynamic_resize.hysteresis.min_observation_count=${HYSTERESIS_MIN_OBSERVATIONS} \
+  trainer.dynamic_resize.handoff.enable=${HOST_STAGING_ENABLE} \
+  trainer.dynamic_resize.handoff.backend=${HOST_STAGING_BACKEND} \
+  trainer.dynamic_resize.handoff.chunk_mb=${HOST_STAGING_CHUNK_MB} \
+  trainer.dynamic_resize.handoff.stage_optimizer=${HOST_STAGING_STAGE_OPTIMIZER} \
+  trainer.dynamic_resize.handoff.optimizer_restore_policy=${HOST_STAGING_OPTIMIZER_RESTORE_POLICY} \
+  trainer.dynamic_resize.handoff.progressive_swap=${HOST_STAGING_PROGRESSIVE_SWAP} \
+  trainer.dynamic_resize.handoff.host_preload_threshold=${HOST_STAGING_HOST_PRELOAD_THRESHOLD} \
+  trainer.dynamic_resize.handoff.cleanup_after_load=${HOST_STAGING_CLEANUP} \
+  trainer.dynamic_resize.handoff.preclear_rollout_kv_cache=${HOST_STAGING_PRECLEAR_KV} \
+  trainer.dynamic_resize.budget_protection.enable=${BUDGET_PROTECTION_ENABLE} \
+  trainer.dynamic_resize.budget_protection.memory_budget_ratio=${MEMORY_BUDGET_RATIO} \
+  trainer.dynamic_resize.communicator_cache.enable=${COMM_CACHE_ENABLE} \
+  trainer.dynamic_resize.communicator_cache.reserve_schedule_topologies=${COMM_CACHE_RESERVE_SCHEDULE} \
+  trainer.dynamic_resize.shared_pool.n_gpus_per_node=${shared_pool_gpus} \
+  +trainer.dynamic_resize.schedule.stage1.step=${resize_step} \
+  +trainer.dynamic_resize.schedule.stage1.actor_pool.mode=split \
+  +trainer.dynamic_resize.schedule.stage1.actor_pool.from_pool=shared_pool \
+  +trainer.dynamic_resize.schedule.stage1.actor_pool.index=0 \
+  +trainer.dynamic_resize.schedule.stage1.actor_pool.size=${first_split_plan} \
+  +trainer.dynamic_resize.schedule.stage1.rollout_pool.mode=split \
+  +trainer.dynamic_resize.schedule.stage1.rollout_pool.from_pool=shared_pool \
+  +trainer.dynamic_resize.schedule.stage1.rollout_pool.index=1 \
+  +trainer.dynamic_resize.schedule.stage1.rollout_pool.size=${first_split_plan} \
+  +trainer.dynamic_resize.schedule.stage1.release_old=false \
+  +trainer.dynamic_resize.schedule.stage2.step=${second_resize_step} \
+  +trainer.dynamic_resize.schedule.stage2.actor_pool.mode=split \
+  +trainer.dynamic_resize.schedule.stage2.actor_pool.from_pool=shared_pool \
+  +trainer.dynamic_resize.schedule.stage2.actor_pool.index=0 \
+  +trainer.dynamic_resize.schedule.stage2.actor_pool.size=${second_split_plan} \
+  +trainer.dynamic_resize.schedule.stage2.rollout_pool.mode=split \
+  +trainer.dynamic_resize.schedule.stage2.rollout_pool.from_pool=shared_pool \
+  +trainer.dynamic_resize.schedule.stage2.rollout_pool.index=1 \
+  +trainer.dynamic_resize.schedule.stage2.rollout_pool.size=${second_split_plan} \
+  +trainer.dynamic_resize.schedule.stage2.release_old=false \
+  trainer.test_freq=-1 \
+  trainer.resume_mode=disable \
+  trainer.logger='["console"]' \
+  actor_rollout_ref.hybrid_engine=false \
+  actor_rollout_ref.actor.use_torch_compile=false \
+  actor_rollout_ref.actor.strategy=${ACTOR_STRATEGY} \
+  critic.strategy=${ACTOR_STRATEGY} \
+  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+  critic.ppo_micro_batch_size_per_gpu=4 \
+  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
+  actor_rollout_ref.rollout.name=vllm \
+  actor_rollout_ref.rollout.enforce_eager=true \
+  actor_rollout_ref.rollout.max_num_seqs=64 \
+  actor_rollout_ref.rollout.max_num_batched_tokens=2048 \
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.3 \
+  critic.model.path="${RESOLVED_MODEL_PATH}" \
+  critic.model.tokenizer_path="${RESOLVED_MODEL_PATH}" \
+  +global_profiler.enabled=true \
+  +global_profiler.tool=torch_profiler \
+  +global_profiler.save_dir="${CKPT_DIR}/profiler"
