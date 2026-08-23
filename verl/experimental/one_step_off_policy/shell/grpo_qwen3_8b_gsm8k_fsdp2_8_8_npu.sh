@@ -43,7 +43,6 @@ python3 -m verl.experimental.one_step_off_policy.main_ppo \
     critic.strategy=fsdp2 \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.hybrid_engine=False \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \

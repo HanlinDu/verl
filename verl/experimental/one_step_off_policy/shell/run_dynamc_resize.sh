@@ -23,6 +23,9 @@ shared_pool_gpus=${SHARED_POOL_GPUS:-${NUM_GPUS}}
 first_split_plan=${FIRST_SPLIT_PLAN:-${SPLIT_PLAN:-"[6,2]"}}
 second_split_plan=${SECOND_SPLIT_PLAN:-"[2,6]"}
 total_training_steps=${TOTAL_TRAINING_STEPS:-$((second_resize_step + 2))}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-960}
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-240}
+USE_KL_LOSS=${USE_KL_LOSS:-false}
 RESIZE_MODE=${RESIZE_MODE:-schedule}
 HYSTERESIS_ENABLE=${HYSTERESIS_ENABLE:-false}
 HYSTERESIS_WINDOW=${HYSTERESIS_WINDOW:-2}
@@ -33,6 +36,7 @@ HYSTERESIS_COOLDOWN=${HYSTERESIS_COOLDOWN:-0}
 HYSTERESIS_CONSECUTIVE=${HYSTERESIS_CONSECUTIVE:-1}
 HYSTERESIS_MIN_OBSERVATIONS=${HYSTERESIS_MIN_OBSERVATIONS:-1}
 HOST_STAGING_ENABLE=${HOST_STAGING_ENABLE:-true}
+HARD_SWITCH_ENABLE=${HARD_SWITCH_ENABLE:-true}
 HOST_STAGING_BACKEND=${HOST_STAGING_BACKEND:-disk_fallback}
 HOST_STAGING_CHUNK_MB=${HOST_STAGING_CHUNK_MB:-256}
 HOST_STAGING_STAGE_OPTIMIZER=${HOST_STAGING_STAGE_OPTIMIZER:-true}
@@ -67,6 +71,7 @@ import os
 import shlex
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 
@@ -75,7 +80,7 @@ def convert(src: str, dst_name: str) -> str:
     needs_conversion = (
         "data_source" not in df.columns
         or "reward_model" not in df.columns
-        or not df["prompt"].map(lambda x: isinstance(x, list)).all()
+        or not df["prompt"].map(lambda x: isinstance(x, (list, tuple, np.ndarray))).all()
     )
     if not needs_conversion:
         return src
@@ -122,9 +127,11 @@ python3 -m verl.experimental.one_step_off_policy.main_ppo \
   rollout.nnodes=1 \
   rollout.n_gpus_per_node=${n_gpus_rollout} \
   trainer.default_local_dir="${CKPT_DIR}" \
+  data.train_batch_size=${TRAIN_BATCH_SIZE} \
   trainer.total_training_steps=${total_training_steps} \
   trainer.save_freq=-1 \
   trainer.dynamic_resize.mode=${RESIZE_MODE} \
+  +trainer.dynamic_resize.hard_switch.enable=${HARD_SWITCH_ENABLE} \
   trainer.dynamic_resize.hysteresis.enable=${HYSTERESIS_ENABLE} \
   trainer.dynamic_resize.hysteresis.window_size=${HYSTERESIS_WINDOW} \
   trainer.dynamic_resize.hysteresis.up_threshold=${HYSTERESIS_UP_THRESHOLD} \
@@ -170,12 +177,16 @@ python3 -m verl.experimental.one_step_off_policy.main_ppo \
   trainer.test_freq=-1 \
   trainer.resume_mode=disable \
   trainer.logger='["console"]' \
-  actor_rollout_ref.hybrid_engine=false \
+  actor_rollout_ref.hybrid_engine=true \
   actor_rollout_ref.actor.use_torch_compile=false \
   actor_rollout_ref.actor.strategy=${ACTOR_STRATEGY} \
+  actor_rollout_ref.actor.use_kl_loss=${USE_KL_LOSS} \
   critic.strategy=${ACTOR_STRATEGY} \
+  actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE} \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+  critic.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE} \
   critic.ppo_micro_batch_size_per_gpu=4 \
+  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.enforce_eager=true \

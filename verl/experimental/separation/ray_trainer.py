@@ -123,11 +123,14 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         else:
             from verl.checkpoint_engine import CheckpointEngineManager
 
-        self.checkpoint_manager = CheckpointEngineManager(
+        checkpoint_manager_kwargs = dict(
             config=omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine),
             actor_wg=self.actor_rollout_wg,
             replicas=self.llm_server_manager.get_replicas(),
         )
+        if not checkpoint_manager_class_fqn:
+            checkpoint_manager_kwargs["rollout_wg"] = getattr(self, "_runtime_rollout_worker_group", None)
+        self.checkpoint_manager = CheckpointEngineManager(**checkpoint_manager_kwargs)
 
     def _init_resource_pools(self):
         self.resource_pool_manager.create_resource_pool()
@@ -169,7 +172,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
 
     def _create_reference_policy_class(self):
         # create reference policy if needed
-        if self.use_reference_policy:
+        if self.use_reference_policy and Role.RefPolicy in self.role_worker_mapping:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
             ref_policy_cls = RayClassWithInitArgs(
                 self.role_worker_mapping[Role.RefPolicy],

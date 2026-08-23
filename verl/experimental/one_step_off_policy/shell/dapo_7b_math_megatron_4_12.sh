@@ -89,7 +89,6 @@ python3 -m verl.experimental.one_step_off_policy.main_ppo \
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     actor_rollout_ref.actor.clip_ratio_c=10.0 \
-    actor_rollout_ref.hybrid_engine=False \
     +actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \

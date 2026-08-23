@@ -46,7 +46,7 @@ class OneStepTaskRunner:
 
         OmegaConf.resolve(config)
 
-        role_worker_mapping, ray_worker_group_cls = create_role_worker_mapping(config)
+        role_worker_mapping, ray_worker_group_cls = create_role_worker_mapping(config, use_hybrid_worker=True)
 
         # validate config
         validate_config(
@@ -69,7 +69,11 @@ class OneStepTaskRunner:
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
-        resource_pool_manager = create_resource_pool_manager(config, role_worker_mapping.keys())
+        resource_pool_manager = create_resource_pool_manager(
+            config,
+            role_worker_mapping.keys(),
+            use_hybrid_pool=True,
+        )
 
         from verl.utils.dataset.rl_dataset import collate_fn
 

@@ -22,7 +22,7 @@ actor_rollout_ref:
     calculate_log_probs: True
 
     checkpoint_engine:
-      backend: "nccl"
+      backend: "naive"
 
 # Only then will the use of log probs be correct.
 # And it can be used in conjunction with other rollout_correction algorithms.
