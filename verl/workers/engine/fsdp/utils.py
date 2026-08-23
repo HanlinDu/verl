@@ -14,6 +14,7 @@
 import logging
 import os
 
+import torch
 from torch.distributed.device_mesh import init_device_mesh
 
 from verl.utils.device import get_device_name, is_npu_available
@@ -32,7 +33,7 @@ def apply_npu_fsdp_patches(model_config=None):
         apply_npu_patches()
 
 
-def create_device_mesh(world_size, fsdp_size):
+def create_device_mesh(world_size, fsdp_size, process_group=None):
     """
     Create a device mesh for distributed training based on the world size and FSDP size.
 
@@ -44,6 +45,18 @@ def create_device_mesh(world_size, fsdp_size):
         torch.distributed.device_mesh.DeviceMesh: The initialized device mesh.
     """
     device_name = get_device_name()
+    if process_group is not None:
+        if fsdp_size >= 0 and fsdp_size != world_size:
+            raise NotImplementedError("custom FSDP process groups currently support one-dimensional meshes only")
+        from torch.distributed.device_mesh import DeviceMesh
+
+        return DeviceMesh.from_group(
+            process_group,
+            device_type=device_name,
+            mesh=torch.arange(world_size),
+            mesh_dim_names=["fsdp"],
+        )
+
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh(device_name, mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
     else:

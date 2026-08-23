@@ -452,6 +452,10 @@ class LLMServerManager:
             )
             for replica_rank in range(num_replicas)
         ]
+        for local_rank, server in enumerate(self.rollout_replicas):
+            # ``replica_rank`` may include a server-name offset after dynamic
+            # resize, while worker slicing is always local to this group.
+            server.worker_group_rank = local_rank
 
         if self.worker_group and self.rollout_config.name != "trtllm":
             await asyncio.gather(*[server.init_hybrid(self.worker_group) for server in self.rollout_replicas])
@@ -523,3 +527,28 @@ class LLMServerManager:
     async def stop_profile(self):
         """Stop profiling on all rollout replicas."""
         await asyncio.gather(*[replica.stop_profile() for replica in self.rollout_replicas])
+
+    @auto_await
+    async def rebuild_hybrid_runtime(self, worker_group: RayWorkerGroup, start_rank: int = 0):
+        """Rebuild rollout server topology while retaining hybrid workers.
+
+        Existing server actors and the load balancer are replaced because
+        their TP/DP/PP communicators are topology-bound. The supplied group is
+        a logical view over persistent ``ActorRolloutRefWorker`` handles.
+        """
+        if self.worker_group is None:
+            raise RuntimeError("rebuild_hybrid_runtime requires a hybrid worker group")
+
+        await asyncio.gather(*[replica.shutdown_runtime(kill_workers=False) for replica in self.rollout_replicas])
+
+        load_balancer = getattr(self, "global_load_balancer", None)
+        if load_balancer is not None:
+            ray.kill(load_balancer, no_restart=True)
+
+        self.worker_group = worker_group
+        self.start_rank = start_rank
+        self.rollout_replicas = []
+        self.server_handles = []
+        self.server_addresses = []
+        await self._initialize_llm_servers()
+        await self._init_global_load_balancer()

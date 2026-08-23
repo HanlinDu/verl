@@ -119,6 +119,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         processing_class: PreTrainedTokenizer | ProcessorMixin = None,
         checkpoint_config: DictConfig = None,
         trust_remote_code: bool = False,
+        process_group=None,
         **kwargs,
     ):
         if processing_class is None and "tokenizer" in kwargs:
@@ -135,6 +136,9 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             checkpoint_config=checkpoint_config,
         )
         self.trust_remote_code = trust_remote_code
+        self.process_group = process_group
+        self.rank = torch.distributed.get_rank(group=process_group)
+        self.world_size = torch.distributed.get_world_size(group=process_group)
 
     def _get_lora_train_meta(self, unwrap_model):
         peft_config = getattr(unwrap_model, "peft_config", None)
@@ -218,13 +222,15 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     self.model.load_state_dict(model_state_dict)
                     log_with_rank(f"Loaded model from {remote_model_path}", rank=self.rank, logger=logger)
                 elif os.path.exists(dynamic_full_model_path):
-                    full_state_dict = (
-                        torch.load(copy_to_local(dynamic_full_model_path), map_location="cpu", weights_only=False)
-                        if self.rank == 0
-                        else {}
+                    full_state_dict = torch.load(
+                        copy_to_local(dynamic_full_model_path), map_location="cpu", weights_only=False
                     )
                     if fsdp_version(self.model) == 2:
-                        fsdp2_load_full_state_dict(self.model, full_state_dict)
+                        fsdp2_load_full_state_dict(
+                            self.model,
+                            full_state_dict,
+                            process_group=self.process_group,
+                        )
                     elif fsdp_version(self.model) == 1 and self.world_size == 1:
                         self.model.load_state_dict(full_state_dict)
                     else:
@@ -307,7 +313,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 )
 
         # wait for everyone to load checkpoints
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=self.process_group)
 
     def save_checkpoint(
         self,
@@ -344,7 +350,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             self.ensure_checkpoint_capacity(max_ckpt_to_keep)
 
         local_path = local_mkdir_safe(local_path)
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=self.process_group)
 
         # check if the checkpoint_save_contents is valid
         if self.should_save_model:
@@ -446,10 +452,10 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     log_only_rank_0=True,
                 )
                 del full_state_dict
-            torch.distributed.barrier()
+            torch.distributed.barrier(group=self.process_group)
 
         # wait for everyone to dump to local
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=self.process_group)
 
         if self.should_save_hf_model:
             # Only rank 0 will save hf model and,
@@ -502,7 +508,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 del save_model
 
             # wait for rank0 to dump hf_model to local
-            torch.distributed.barrier()
+            torch.distributed.barrier(group=self.process_group)
 
         if self.rank == 0:
             self.register_checkpoint(local_path, max_ckpt_to_keep)

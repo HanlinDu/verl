@@ -1016,7 +1016,11 @@ class RayPPOTrainer:
                 )
             )
             self.critic_wg.save_checkpoint(
-                critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
+                critic_local_path,
+                critic_remote_path,
+                self.global_steps,
+                max_ckpt_to_keep=max_critic_ckpt_to_keep,
+                save_full_model_for_dynamic_resize=save_full_model_for_dynamic_resize,
             )
 
         # save dataloader

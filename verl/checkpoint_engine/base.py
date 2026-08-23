@@ -320,7 +320,7 @@ class CheckpointEngineWorker(Worker):
         initialize_global_process_group_ray(timeout_second=None, backend="cpu:gloo")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    async def update_weights(self, global_steps: int = None):
+    async def update_weights(self, global_steps: int = None, mode: str = "receive"):
         weights = self.checkpoint_engine.receive_weights(global_steps=global_steps)
         await self.server_adapter.update_weights(weights, global_steps=global_steps)
 
@@ -369,6 +369,8 @@ class CheckpointEngineManager:
         config: The checkpoint engine config.
         actor_wg: The actor worker group (the training side that produces weights).
         replicas: The list of rollout replicas.
+        rollout_wg: Optional pre-bound hybrid rollout worker group. This
+            preserves fused-worker role dispatch during weight synchronization.
     """
 
     def __init__(
@@ -376,6 +378,7 @@ class CheckpointEngineManager:
         config: CheckpointEngineConfig,
         actor_wg: RayWorkerGroup,
         replicas: list[RolloutReplica],
+        rollout_wg: RayWorkerGroup | None = None,
     ) -> None:
         self.config = config
         self.backend = config.backend
@@ -383,6 +386,7 @@ class CheckpointEngineManager:
         self.backend_cls = CheckpointEngineRegistry.get(config.backend)
         self.actor_wg = actor_wg
         self.replicas = replicas
+        self.rollout_wg = rollout_wg
 
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for actor worker group and rollout replicas."""
@@ -483,10 +487,12 @@ class CheckpointEngineManager:
         await self.abort_replicas()
 
         # 2. create a temporay worker group for all replicas
-        workers = []
-        for replica in self.replicas:
-            workers.extend(replica.workers)
-        rollout = RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls))
+        rollout = self.rollout_wg
+        if rollout is None:
+            workers = []
+            for replica in self.replicas:
+                workers.extend(replica.workers)
+            rollout = RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls))
         actor_wg = self.actor_wg
 
         # 3. release kv_cache before weight sync (weights stay in place)
@@ -498,7 +504,7 @@ class CheckpointEngineManager:
         # 5. update weights of all workers
         ray.get(
             actor_wg.update_weights(global_steps=global_steps, mode=self.backend)
-            + rollout.update_weights(global_steps=global_steps)
+            + rollout.update_weights(global_steps=global_steps, mode="receive")
         )
 
         # 6. finalize all workers

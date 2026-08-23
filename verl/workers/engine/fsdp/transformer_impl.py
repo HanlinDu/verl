@@ -59,6 +59,7 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_optimizer,
     replace_lora_wrapper,
 )
+from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.torch_functional import logprobs_from_logits
@@ -114,6 +115,7 @@ class FSDPEngine(BaseEngine):
         self.mode = None
 
         self.rank = torch.distributed.get_rank()
+        self.process_group = None
 
         # Apply NPU patches for FSDP backend
         from .utils import apply_npu_fsdp_patches
@@ -173,6 +175,32 @@ class FSDPEngine(BaseEngine):
     def is_optimizer_offload_enabled(self) -> bool:
         return self._is_offload_optimizer
 
+    def shutdown(self):
+        """Release the FSDP model runtime without touching distributed groups.
+
+        The process-group/device-mesh teardown must be coordinated across all
+        workers by the resize controller. Keeping that responsibility outside
+        the engine prevents one rank from destroying a collective while other
+        ranks are still using it.
+        """
+        module = getattr(self, "module", None)
+        optimizer = getattr(self, "optimizer", None)
+        if optimizer is not None:
+            optimizer.zero_grad(set_to_none=True)
+
+        self.module = None
+        self.optimizer = None
+        self.lr_scheduler = None
+        self.checkpoint_manager = None
+        self.ulysses_device_mesh = None
+        self.ulysses_parallel_group = None
+        self.device_mesh = None
+
+        del module
+        del optimizer
+        gc.collect()
+        aggressive_empty_cache(force_sync=True)
+
     def is_mp_src_rank_with_outputs(self):
         if self.ulysses_device_mesh is not None:
             is_collect = self.ulysses_device_mesh["sp"].get_local_rank() == 0
@@ -187,6 +215,11 @@ class FSDPEngine(BaseEngine):
         Applies device, dtype, and precision configurations, including mixed precision.
         Sets up checkpoint manager and FLOPs counter.
         """
+        # Rebuild the mesh after a runtime shutdown. The resize coordinator is
+        # responsible for installing any new process-group topology first.
+        if self.device_mesh is None:
+            self._init_device_mesh()
+
         # This is used to import external_lib into the huggingface systems
         self._build_model_optimizer()
 
@@ -197,6 +230,7 @@ class FSDPEngine(BaseEngine):
             processing_class=self.model_config.get_processor(),
             checkpoint_config=self.checkpoint_config,
             trust_remote_code=self.model_config.trust_remote_code,
+            process_group=getattr(self, "process_group", None),
         )
 
         self.to(
@@ -209,15 +243,22 @@ class FSDPEngine(BaseEngine):
         log_gpu_memory_usage("After offload model/optimizer/grad during init", logger=logger)
 
     def _init_device_mesh(self):
-        world_size = torch.distributed.get_world_size()
+        process_group = getattr(self, "process_group", None)
+        world_size = torch.distributed.get_world_size(group=process_group)
         from torch.distributed.device_mesh import init_device_mesh
 
         fsdp_size = self.engine_config.fsdp_size
 
-        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=fsdp_size)
+        self.device_mesh = create_device_mesh(
+            world_size=world_size,
+            fsdp_size=fsdp_size,
+            process_group=process_group,
+        )
         self.ulysses_device_mesh = None
         self.ulysses_parallel_group = None
         self.ulysses_sequence_parallel_size = self.engine_config.ulysses_sequence_parallel_size
+        if process_group is not None and self.ulysses_sequence_parallel_size > 1:
+            raise NotImplementedError("custom FSDP process groups do not yet support Ulysses sequence parallelism")
         dp_size = self.get_data_parallel_size()
         if self.ulysses_sequence_parallel_size > 1:
             self.ulysses_device_mesh = init_device_mesh(
@@ -575,7 +616,7 @@ class FSDPEngine(BaseEngine):
             module = self._apply_qat(module)
 
         # Synchronize all distributed processes before proceeding
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=getattr(self, "process_group", None))
         if self.rank == 0:
             print_model_size(module)
         log_gpu_memory_usage("After init model from HF AutoModel", logger=logger)
@@ -618,16 +659,16 @@ class FSDPEngine(BaseEngine):
         if self.ulysses_device_mesh is not None:
             return self.ulysses_device_mesh["dp"].get_local_rank()
         else:
-            return torch.distributed.get_rank()
+            return torch.distributed.get_rank(group=getattr(self, "process_group", None))
 
     def get_data_parallel_size(self):
-        return torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
+        return torch.distributed.get_world_size(group=getattr(self, "process_group", None)) // self.ulysses_sequence_parallel_size
 
     def get_data_parallel_group(self):
         if self.ulysses_device_mesh is not None:
             return self.ulysses_device_mesh.get_group(mesh_dim="dp")
         else:
-            return torch.distributed.group.WORLD
+            return getattr(self, "process_group", None) or torch.distributed.group.WORLD
 
     def get_model_parallel_group(self):
         raise NotImplementedError
@@ -796,7 +837,7 @@ class FSDPEngine(BaseEngine):
             save_full_model_for_dynamic_resize=save_full_model_for_dynamic_resize,
         )
 
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=getattr(self, "process_group", None))
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.module)
 
@@ -815,7 +856,7 @@ class FSDPEngine(BaseEngine):
             local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
         )
 
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=getattr(self, "process_group", None))
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.module)
 

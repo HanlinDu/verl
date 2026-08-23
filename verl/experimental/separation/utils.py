@@ -147,7 +147,7 @@ def build_dynamic_resize_pool_topology(config) -> DynamicResizePoolTopology | No
     )
 
 
-def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
+def create_resource_pool_manager(config, roles: list, use_hybrid_pool: bool = False) -> ResourcePoolManager:
     """
     Create resource pool manager
 
@@ -163,12 +163,23 @@ def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
     dynamic_resize_topology = build_dynamic_resize_pool_topology(config)
 
     # Actor/Critic resource pool
-    training_roles = [Role.Actor, Role.ActorRollout, Role.Critic, Role.RefPolicy]
+    training_roles = [Role.Actor, Role.ActorRollout, Role.ActorRolloutRef, Role.Critic, Role.RefPolicy]
     if any(role in roles for role in training_roles):
         assert config.trainer.n_gpus_per_node > 0, "config.trainer.n_gpus_per_node must be greater than 0"
         assert config.trainer.nnodes > 0, "config.trainer.nnodes must be greater than 0"
 
-        if dynamic_resize_topology is not None:
+        if use_hybrid_pool:
+            trainer_store = _pool_store(
+                nnodes=int(config.trainer.nnodes),
+                n_gpus_per_node=int(config.trainer.n_gpus_per_node),
+            )
+            rollout_store = _pool_store(
+                nnodes=int(config.rollout.nnodes),
+                n_gpus_per_node=int(config.rollout.n_gpus_per_node),
+            )
+            resource_pool_spec["hybrid_pool"] = _combine_pool_stores(trainer_store, rollout_store)
+            trainer_pool_name = "hybrid_pool"
+        elif dynamic_resize_topology is not None:
             resource_pool_spec[dynamic_resize_topology.shared_pool_name] = dynamic_resize_topology.shared_pool_spec
             trainer_pool_name = dynamic_resize_topology.shared_pool_name
         else:
@@ -181,7 +192,7 @@ def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
                 mapping[role] = trainer_pool_name
 
     # Rollout resource pool
-    if Role.Rollout in roles:
+    if Role.Rollout in roles and not use_hybrid_pool:
         assert config.rollout.n_gpus_per_node > 0, "config.rollout.n_gpus_per_node must be greater than 0"
         assert config.rollout.nnodes > 0, "config.rollout.nnodes must be greater than 0"
         if dynamic_resize_topology is not None:
@@ -197,7 +208,7 @@ def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
     return resource_pool_manager
 
 
-def create_role_worker_mapping(config):
+def create_role_worker_mapping(config, use_hybrid_worker: bool = False):
     """
     Create mapping from roles to worker classes
 
@@ -207,24 +218,35 @@ def create_role_worker_mapping(config):
     Returns:
         dict: Mapping from roles to worker classes
     """
-    # Always use the unified model engine worker implementation.
-    from verl.experimental.separation.engine_workers import DetachActorWorker
     from verl.single_controller.ray import RayWorkerGroup
     from verl.workers.engine_workers import TrainingWorker
 
     ray_worker_group_cls = RayWorkerGroup
 
-    train_role = Role.Actor
-    if config.get("async_training", {}).get("use_trainer_do_validate", False):
-        train_role = Role.ActorRollout
+    if use_hybrid_worker:
+        from verl.workers.engine_workers import ActorRolloutRefWorker
+
+        lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
+        if lora_rank <= 0:
+            lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
+        ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+        train_role = Role.ActorRollout if ref_in_actor or not need_reference_policy(config) else Role.ActorRolloutRef
+        train_worker_cls = ActorRolloutRefWorker
+    else:
+        from verl.experimental.separation.engine_workers import DetachActorWorker
+
+        train_role = Role.Actor
+        if config.get("async_training", {}).get("use_trainer_do_validate", False):
+            train_role = Role.ActorRollout
+        train_worker_cls = DetachActorWorker
 
     role_worker_mapping = {
-        train_role: ray.remote(DetachActorWorker),
+        train_role: ray.remote(train_worker_cls),
         Role.Critic: ray.remote(TrainingWorker),
     }
 
     # Add reference policy (if KL loss or reward is required)
-    if need_reference_policy(config):
-        role_worker_mapping[Role.RefPolicy] = ray.remote(DetachActorWorker)
+    if need_reference_policy(config) and train_role != Role.ActorRolloutRef:
+        role_worker_mapping[Role.RefPolicy] = ray.remote(train_worker_cls)
 
     return role_worker_mapping, ray_worker_group_cls

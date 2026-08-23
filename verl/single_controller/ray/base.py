@@ -747,6 +747,9 @@ class RayWorkerGroup(WorkerGroup):
             )
 
             _rebind_actor_methods(new_worker_group, prefix)
+            # Keep the logical role so a later subgroup() can rebind the
+            # prefixed methods to the new controller-side worker view.
+            new_worker_group.sub_cls_name = prefix
             new_worker_group_dict[prefix] = new_worker_group
         return new_worker_group_dict
 
@@ -766,6 +769,69 @@ class RayWorkerGroup(WorkerGroup):
             new_wg.sub_cls_name = key
             wg_dict[key] = new_wg
         return wg_dict
+
+    def subgroup(self, worker_indices: list[int], name_prefix: str | None = None):
+        """Create a logical view over existing Ray workers.
+
+        This method never creates or kills Ray actors. It only changes the
+        handles used by the returned controller-side group, which is useful
+        while a shared physical pool is repartitioned between actor and
+        rollout roles.
+
+        The remote workers keep their original ``RANK``/``WORLD_SIZE`` and
+        torch process groups. A runtime coordinator must rebuild those
+        distributed runtimes before using the view for collectives.
+        """
+        indices = list(worker_indices)
+        if not indices:
+            raise ValueError("worker_indices must not be empty")
+        if len(set(indices)) != len(indices):
+            raise ValueError(f"worker_indices must be unique, got {indices}")
+        if min(indices) < 0 or max(indices) >= self.world_size:
+            raise IndexError(f"worker_indices {indices} out of range for world_size={self.world_size}")
+
+        subgroup = self.from_detached(
+            name_prefix=name_prefix or self.name_prefix,
+            worker_names=[self._worker_names[index] for index in indices],
+            worker_handles=[self._workers[index] for index in indices],
+            ray_cls_with_init=self.ray_cls_with_init,
+            profile_steps=self.profile_steps,
+            worker_nsight_options=self.worker_nsight_options,
+            device_name=self.device_name,
+            use_gpu=self.use_gpu,
+            master_addr=self._master_addr,
+            master_port=self._master_port,
+        )
+        # ``from_detached`` creates a fresh controller and resets the role
+        # prefix. Preserve the spawned logical role so prefixed WorkerDict
+        # methods can be exposed through the same unprefixed API.
+        subgroup.sub_cls_name = self.sub_cls_name
+        subgroup._worker_names = [self._worker_names[index] for index in indices]
+        subgroup._world_size = len(indices)
+        subgroup._dispatch_info = {}
+        subgroup._collect_info = {}
+        subgroup._checker_thread = None
+
+        # Rebind generated controller methods to the copied group. The
+        # dispatch functors close over their owning group, so copying only the
+        # worker handles would otherwise continue dispatching to ``self``.
+        if subgroup.ray_cls_with_init is not None:
+            if subgroup.fused_worker_used:
+                raw_cls = subgroup.ray_cls_with_init.cls.raw_cls_dict[subgroup.sub_cls_name]
+            else:
+                raw_cls = subgroup.ray_cls_with_init.cls
+            subgroup._bind_worker_method(raw_cls, func_generator)
+
+            # Deprecated colocated WorkerDict classes expose registered
+            # methods as ``<role>_<method>``.  spawn() presents those methods
+            # without the role prefix; restore that view after rebinding so
+            # functors close over this subgroup rather than the parent group.
+            if not subgroup.fused_worker_used and subgroup.sub_cls_name:
+                prefix = f"{subgroup.sub_cls_name}_"
+                for method_name in dir(subgroup):
+                    if method_name.startswith(prefix):
+                        setattr(subgroup, method_name.removeprefix(prefix), getattr(subgroup, method_name))
+        return subgroup
 
     def fuse(self, prefix_set):
         """Fuse multiple worker groups into the current worker group.
