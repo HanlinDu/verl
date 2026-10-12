@@ -55,8 +55,8 @@ from verl.experimental.one_step_off_policy.staging_backend import (
     has_restore_session_manifest,
     read_restore_session_manifest,
     update_restore_session_manifest,
-    write_paged_state_manifest,
     write_host_staging_manifest,
+    write_paged_state_manifest,
 )
 from verl.experimental.one_step_off_policy.trace_utils import append_resize_trace, build_resize_trace_config
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
@@ -70,12 +70,11 @@ from verl.trainer.ppo.ray_trainer import (
 )
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
-from verl.utils.debug import marked_timer
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.debug import marked_timer
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import LLMServerManager
-
 
 logger = logging.getLogger(__name__)
 
@@ -274,6 +273,11 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/handoff_optimizer_stage_rank_count": 0.0,
             "resize/handoff_optimizer_stage_page_count": 0.0,
             "resize/handoff_optimizer_stage_bytes": 0.0,
+            "resize/handoff_model_transfer_status": "disabled",
+            "resize/handoff_model_transfer_success": 0.0,
+            "resize/handoff_model_transfer_tensor_count": 0.0,
+            "resize/handoff_model_transfer_bytes": 0.0,
+            "resize/handoff_model_transfer_fallback_reason": "",
         }
 
     def _build_resize_control_metrics(self, snapshot: dict[str, float | str | int]) -> dict[str, float | str | int]:
@@ -347,8 +351,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         for item in schedule:
             if not isinstance(item, dict):
                 raise TypeError(
-                    "Each trainer.dynamic_resize.schedule item must be a dict, "
-                    f"got {type(item).__name__}: {item!r}"
+                    f"Each trainer.dynamic_resize.schedule item must be a dict, got {type(item).__name__}: {item!r}"
                 )
             normalized.append(item)
         return normalized
@@ -370,7 +373,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         size = spec["size"]
         if isinstance(size, int):
             return size
-        if isinstance(size, (list, tuple)):
+        if isinstance(size, list | tuple):
             index = int(spec.get("index", 0))
             if index < 0 or index >= len(size):
                 raise ValueError(f"dynamic resize pool index {index} out of range for size={size}")
@@ -440,7 +443,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                         pass
         return int(total)
 
-    def _get_dynamic_resize_resource_snapshot(self, worker_group, staging_path: str | None = None) -> ResizeBudgetSnapshot:
+    def _get_dynamic_resize_resource_snapshot(
+        self, worker_group, staging_path: str | None = None
+    ) -> ResizeBudgetSnapshot:
         if worker_group is None:
             return ResizeBudgetSnapshot()
         try:
@@ -458,7 +463,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         model_bytes = self._estimate_dynamic_resize_model_bytes(item)
         stage_bytes = model_bytes
         stage_optimizer = bool(getattr(self._host_staging_config, "stage_optimizer", False))
-        estimated_host_peak_bytes = int(item.get("estimated_host_peak_bytes") or model_bytes * (3.0 if stage_optimizer else 1.25))
+        estimated_host_peak_bytes = int(
+            item.get("estimated_host_peak_bytes") or model_bytes * (3.0 if stage_optimizer else 1.25)
+        )
         estimated_gpu_peak_bytes = int(item.get("estimated_gpu_peak_bytes") or model_bytes)
         metrics.update(
             {
@@ -606,7 +613,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 with open(path, encoding="utf-8") as f:
                     statuses.append(json.load(f))
             except Exception as exc:
-                logger.warning("[one-step-off][resize][handoff] failed to read optimizer restore status %s: %s", path, exc)
+                logger.warning(
+                    "[one-step-off][resize][handoff] failed to read optimizer restore status %s: %s", path, exc
+                )
         if not statuses:
             return {}
 
@@ -829,12 +838,82 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         )
         return metrics
 
-    def _load_dynamic_resize_checkpoint(self, global_step_folder: str) -> None:
+    def _load_dynamic_resize_checkpoint(self, global_step_folder: str, *, load_actor: bool = True) -> None:
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, str(Role.Critic))
-        self.actor_rollout_wg.load_checkpoint(actor_path, del_local_after_load=False)
+        if load_actor:
+            self.actor_rollout_wg.load_checkpoint(actor_path, del_local_after_load=False)
         if self.use_critic:
             self.critic_wg.load_checkpoint(critic_path, del_local_after_load=False)
+
+    def _gpu_direct_actor_model_resize_enabled(self) -> bool:
+        return bool(
+            self.hybrid_engine
+            and self._host_staging_config.enable
+            and self._host_staging_config.effective_backend() == "gpu_direct"
+        )
+
+    def _stage_gpu_direct_actor_model(self, actor_target: int) -> dict[str, float | str | int]:
+        active_topology = getattr(self, "_active_dynamic_resize_topology", None) or {}
+        actor_source = int(active_topology.get("actor_size", 0) or 0)
+        if actor_source <= 0:
+            raise RuntimeError("active actor topology is unavailable for GPU-direct model resize")
+
+        old_ranks = list(range(actor_source))
+        new_ranks = list(range(actor_target))
+        results = self._physical_actor_rollout_wg.stage_actor_model_for_resize(old_ranks, new_ranks)
+        target_results = [result for result in results if result.get("status") == "staged"]
+        if len(target_results) != actor_target:
+            raise RuntimeError(
+                f"GPU-direct model resize staged {len(target_results)} target ranks, expected {actor_target}"
+            )
+        tensor_counts = {int(result.get("tensor_count", 0)) for result in target_results}
+        if len(tensor_counts) != 1:
+            raise RuntimeError(f"GPU-direct model resize returned inconsistent tensor counts: {tensor_counts}")
+        total_bytes = sum(int(result.get("staged_bytes", 0)) for result in target_results)
+        logger.info(
+            "[one-step-off][resize] staged actor model directly on %s ranks: tensors=%s bytes=%s",
+            actor_target,
+            next(iter(tensor_counts)),
+            total_bytes,
+        )
+        return {
+            "resize/handoff_model_transfer_status": "staged",
+            "resize/handoff_model_transfer_success": 0.0,
+            "resize/handoff_model_transfer_tensor_count": float(next(iter(tensor_counts))),
+            "resize/handoff_model_transfer_bytes": float(total_bytes),
+            "resize/handoff_model_transfer_fallback_reason": "",
+        }
+
+    def _restore_gpu_direct_actor_model(self) -> dict[str, float | str | int]:
+        results = self.actor_wg.restore_actor_model_after_resize()
+        restored = [result for result in results if result.get("status") == "restored"]
+        if len(restored) != self.actor_wg.world_size:
+            raise RuntimeError(
+                f"GPU-direct model resize restored {len(restored)} ranks, expected {self.actor_wg.world_size}"
+            )
+        total_bytes = sum(int(result.get("restored_bytes", 0)) for result in restored)
+        logger.info(
+            "[one-step-off][resize] restored actor model directly on %s ranks: tensors=%s bytes=%s",
+            self.actor_wg.world_size,
+            max(int(result.get("tensor_count", 0)) for result in restored),
+            total_bytes,
+        )
+        return {
+            "resize/handoff_model_transfer_status": "restored",
+            "resize/handoff_model_transfer_success": 1.0,
+            "resize/handoff_model_transfer_tensor_count": float(
+                max(int(result.get("tensor_count", 0)) for result in restored)
+            ),
+            "resize/handoff_model_transfer_bytes": float(total_bytes),
+            "resize/handoff_model_transfer_fallback_reason": "",
+        }
+
+    def _clear_gpu_direct_actor_model(self) -> None:
+        try:
+            self._physical_actor_rollout_wg.clear_staged_actor_model_resize_state()
+        except Exception as exc:
+            logger.warning("[one-step-off][resize] failed to clear staged GPU-direct actor state: %s", exc)
 
     def _split_dynamic_resize_resource_pools(self, *, actor_size: int, rollout_size: int) -> None:
         topology = getattr(self.resource_pool_manager, "dynamic_resize_topology", None)
@@ -842,7 +921,8 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             raise ValueError("dynamic resize hard switch requires shared pool topology")
         if actor_size + rollout_size != topology.total_size:
             raise ValueError(
-                f"dynamic resize split must sum to {topology.total_size}, got actor={actor_size}, rollout={rollout_size}"
+                f"dynamic resize split must sum to {topology.total_size}, "
+                f"got actor={actor_size}, rollout={rollout_size}"
             )
 
         shared_pool = self.resource_pool_manager.resource_pool_dict[topology.shared_pool_name]
@@ -1001,7 +1081,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             if backend_kwargs is None:
                 backend_kwargs = {}
                 engine_kwargs[backend] = backend_kwargs
-            backend_kwargs_context = open_dict(backend_kwargs) if isinstance(backend_kwargs, DictConfig) else nullcontext()
+            backend_kwargs_context = (
+                open_dict(backend_kwargs) if isinstance(backend_kwargs, DictConfig) else nullcontext()
+            )
             with backend_kwargs_context:
                 backend_kwargs["group_name"] = f"dynamic_resize_{self.global_steps}_{uuid.uuid4().hex}"
                 backend_kwargs["rebuild_group"] = True
@@ -1071,6 +1153,25 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             metrics.update(optimizer_stage_metrics)
 
         await self._destroy_dynamic_resize_runtime()
+        direct_model_staged = False
+        if self._gpu_direct_actor_model_resize_enabled():
+            try:
+                with marked_timer("dynamic_resize_stage_model_gpu", self.timing_raw, color="green"):
+                    metrics.update(self._stage_gpu_direct_actor_model(actor_target))
+                direct_model_staged = True
+            except Exception as exc:
+                logger.warning(
+                    "[one-step-off][resize] GPU-direct actor model staging failed; using disk fallback: %s", exc
+                )
+                self._clear_gpu_direct_actor_model()
+                metrics.update(
+                    {
+                        "resize/handoff_model_transfer_status": "fallback",
+                        "resize/handoff_model_transfer_success": 0.0,
+                        "resize/handoff_model_transfer_fallback_reason": str(exc),
+                    }
+                )
+
         with marked_timer("dynamic_resize_rebuild_runtime", self.timing_raw, color="green"):
             if self.hybrid_engine:
                 await self._rebuild_hybrid_dynamic_resize_runtime(
@@ -1079,8 +1180,34 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 )
             else:
                 self._rebuild_dynamic_resize_runtime(actor_size=actor_target, rollout_size=rollout_target)
-            self._load_dynamic_resize_checkpoint(checkpoint_step_folder)
+
+            direct_model_restored = False
+            if direct_model_staged:
+                try:
+                    metrics.update(self._restore_gpu_direct_actor_model())
+                    direct_model_restored = True
+                except Exception as exc:
+                    logger.warning(
+                        "[one-step-off][resize] GPU-direct actor model restore failed; using disk fallback: %s", exc
+                    )
+                    self._clear_gpu_direct_actor_model()
+                    metrics.update(
+                        {
+                            "resize/handoff_model_transfer_status": "fallback",
+                            "resize/handoff_model_transfer_success": 0.0,
+                            "resize/handoff_model_transfer_fallback_reason": str(exc),
+                        }
+                    )
+
+            self._load_dynamic_resize_checkpoint(
+                checkpoint_step_folder,
+                load_actor=not direct_model_restored,
+            )
+            model_transfer_metrics = {
+                key: value for key, value in metrics.items() if key.startswith("resize/handoff_model_transfer_")
+            }
             metrics.update(self._complete_dynamic_resize_handoff_session(checkpoint_step_folder))
+            metrics.update(model_transfer_metrics)
             metrics.update(
                 {
                     key: value
@@ -1146,9 +1273,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 continue
 
             if self._dynamic_resize_hard_switch_enabled():
-                metrics.update(
-                    await self._apply_dynamic_resize_hard_switch(item=item, required_action=required_action)
-                )
+                metrics.update(await self._apply_dynamic_resize_hard_switch(item=item, required_action=required_action))
                 continue
 
             reason = "dynamic_resize_hard_switch_disabled"

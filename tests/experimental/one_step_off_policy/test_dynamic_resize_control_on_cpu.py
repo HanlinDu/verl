@@ -3,21 +3,21 @@ from types import SimpleNamespace
 
 from omegaconf import OmegaConf
 
+from verl.experimental.one_step_off_policy.ray_trainer import OneStepOffRayTrainer
 from verl.experimental.one_step_off_policy.resize_budget import (
     ResizeBudgetConfig,
     ResizeBudgetController,
     ResizeBudgetSnapshot,
 )
 from verl.experimental.one_step_off_policy.resize_controller import (
-    ACTION_HOLD,
-    ACTION_TO_CODE,
     ACTION_EXPAND_ROLLOUT,
     ACTION_EXPAND_TRAIN,
+    ACTION_HOLD,
+    ACTION_TO_CODE,
     ResizeController,
     ResizeControllerConfig,
 )
 from verl.experimental.one_step_off_policy.resize_metrics import build_resize_observation
-from verl.experimental.one_step_off_policy.ray_trainer import OneStepOffRayTrainer
 from verl.experimental.one_step_off_policy.staging_backend import (
     HostStagingConfig,
     create_restore_session_manifest,
@@ -87,9 +87,7 @@ def test_resize_observation_uses_rollout_and_train_timing_sections():
 
 def test_one_step_off_configs_define_disabled_dynamic_resize_by_default():
     fsdp_cfg = OmegaConf.load("verl/experimental/one_step_off_policy/config/one_step_off_ppo_trainer.yaml")
-    megatron_cfg = OmegaConf.load(
-        "verl/experimental/one_step_off_policy/config/one_step_off_ppo_megatron_trainer.yaml"
-    )
+    megatron_cfg = OmegaConf.load("verl/experimental/one_step_off_policy/config/one_step_off_ppo_megatron_trainer.yaml")
 
     assert fsdp_cfg.trainer.dynamic_resize.enable is False
     assert megatron_cfg.trainer.dynamic_resize.enable is False
@@ -100,6 +98,54 @@ def test_one_step_off_configs_define_disabled_dynamic_resize_by_default():
     assert fsdp_cfg.trainer.dynamic_resize.handoff.backend == "disk_fallback"
     assert fsdp_cfg.trainer.dynamic_resize.handoff.stage_optimizer is False
     assert fsdp_cfg.trainer.dynamic_resize.schedule == []
+
+
+def test_dynamic_resize_recipe_enables_phase_one_gpu_direct_model_handoff():
+    cfg = OmegaConf.load("verl/experimental/one_step_off_policy/config/one_step_off_ppo_trainer_dynamic_resize.yaml")
+
+    assert cfg.trainer.dynamic_resize.handoff.backend == "gpu_direct"
+    assert cfg.trainer.dynamic_resize.handoff.stage_optimizer is False
+    assert cfg.trainer.dynamic_resize.handoff.optimizer_full_state_restore is False
+
+
+def test_gpu_direct_model_stage_uses_active_and_target_actor_ranks():
+    class _PhysicalWorkerGroup:
+        def stage_actor_model_for_resize(self, old_ranks, new_ranks):
+            assert old_ranks == [0, 1, 2, 3]
+            assert new_ranks == [0, 1, 2, 3, 4, 5]
+            return [{"status": "staged", "tensor_count": 7, "staged_bytes": 10} for _ in range(6)] + [
+                {"status": "non_member", "tensor_count": 0, "staged_bytes": 0} for _ in range(2)
+            ]
+
+    trainer = object.__new__(OneStepOffRayTrainer)
+    trainer._active_dynamic_resize_topology = {"actor_size": 4, "rollout_size": 4}
+    trainer._physical_actor_rollout_wg = _PhysicalWorkerGroup()
+
+    metrics = trainer._stage_gpu_direct_actor_model(actor_target=6)
+
+    assert metrics["resize/handoff_model_transfer_status"] == "staged"
+    assert metrics["resize/handoff_model_transfer_success"] == 0.0
+    assert metrics["resize/handoff_model_transfer_tensor_count"] == 7.0
+    assert metrics["resize/handoff_model_transfer_bytes"] == 60.0
+
+
+def test_dynamic_resize_checkpoint_load_can_skip_actor_for_gpu_direct_restore():
+    class _WorkerGroup:
+        def __init__(self):
+            self.calls = []
+
+        def load_checkpoint(self, path, del_local_after_load):
+            self.calls.append((path, del_local_after_load))
+
+    trainer = object.__new__(OneStepOffRayTrainer)
+    trainer.actor_rollout_wg = _WorkerGroup()
+    trainer.critic_wg = _WorkerGroup()
+    trainer.use_critic = True
+
+    trainer._load_dynamic_resize_checkpoint("/tmp/global_step_1", load_actor=False)
+
+    assert trainer.actor_rollout_wg.calls == []
+    assert trainer.critic_wg.calls == [("/tmp/global_step_1/critic", False)]
 
 
 def test_dynamic_resize_handoff_metrics_reflect_disabled_default_and_pinned_backend():

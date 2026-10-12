@@ -55,13 +55,15 @@ trainer:
       enable: true
     handoff:
       enable: true
-      backend: disk_fallback
+      # Phase-1 direct path: FSDP2, one-dimensional full shard, actor expansion.
+      # A full checkpoint is still written before commit and used on failure.
+      backend: gpu_direct
       chunk_mb: 256
-      stage_optimizer: true
+      stage_optimizer: false
       optimizer_restore_policy: deferred
       progressive_swap: true
       async_optimizer_preload: true
-      optimizer_full_state_restore: true
+      optimizer_full_state_restore: false
       preload_queue_depth: 2
       host_preload_threshold: 0.85
       device_preload_threshold: 0.9
