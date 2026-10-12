@@ -680,6 +680,25 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.ref.destroy_process_group()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def stage_actor_model_for_resize(self, old_ranks: list[int], new_ranks: list[int]):
+        """Stage actor model shards for a GPU-direct FSDP2 resize."""
+        if self.actor is None:
+            raise RuntimeError("actor runtime shell is unavailable")
+        return self.actor.engine.stage_model_for_resize(old_ranks, new_ranks)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def restore_actor_model_after_resize(self):
+        """Load the staged actor shard into the rebuilt FSDP2 runtime."""
+        if self.actor is None:
+            raise RuntimeError("actor runtime shell is unavailable")
+        return self.actor.engine.restore_staged_model_after_resize()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def clear_staged_actor_model_resize_state(self):
+        if self.actor is not None:
+            self.actor.engine.clear_staged_model_resize_state()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def reconfigure_checkpoint_engine(self, group_name: str | None = None, rebuild_group: bool = True):
         """Recreate checkpoint-engine state without replacing this Ray worker.
 

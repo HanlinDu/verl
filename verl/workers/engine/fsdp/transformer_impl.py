@@ -39,6 +39,7 @@ from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_id, get_device_name
+from verl.utils.fsdp_resize import restore_fsdp2_model_state, stage_fsdp2_model_state
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     FSDPModule,
@@ -116,6 +117,7 @@ class FSDPEngine(BaseEngine):
 
         self.rank = torch.distributed.get_rank()
         self.process_group = None
+        self._resize_model_state: dict[str, torch.Tensor] | None = None
 
         # Apply NPU patches for FSDP backend
         from .utils import apply_npu_fsdp_patches
@@ -199,6 +201,76 @@ class FSDPEngine(BaseEngine):
         del module
         del optimizer
         gc.collect()
+        aggressive_empty_cache(force_sync=True)
+
+    def stage_model_for_resize(self, old_ranks: list[int], new_ranks: list[int]) -> dict[str, int | str]:
+        """Stage this rank's target FSDP2 shard through a temporary NCCL group."""
+        import socket
+
+        if device_name != "cuda":
+            raise NotImplementedError("GPU-direct model resize phase 1 supports CUDA only")
+        if self.engine_config.strategy != "fsdp2":
+            raise NotImplementedError("GPU-direct model resize currently supports FSDP2 only")
+        if (
+            self._is_lora
+            or int(self.model_config.lora.get("rank", 0) or 0) > 0
+            or self.model_config.lora_adapter_path is not None
+        ):
+            raise NotImplementedError("GPU-direct model resize does not support LoRA")
+        if self.engine_config.ulysses_sequence_parallel_size != 1:
+            raise NotImplementedError("GPU-direct model resize does not support Ulysses sequence parallelism")
+        if self.engine_config.fsdp_size >= 0:
+            raise NotImplementedError("GPU-direct model resize currently requires fsdp_size=-1")
+        if old_ranks != list(range(len(old_ranks))) or new_ranks != list(range(len(new_ranks))):
+            raise NotImplementedError("GPU-direct model resize currently requires contiguous actor ranks from zero")
+        if len(new_ranks) <= len(old_ranks):
+            raise NotImplementedError("GPU-direct model resize phase 1 supports actor expansion only")
+
+        hostnames: list[str | None] = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(hostnames, socket.gethostname())
+        if len(set(hostnames)) != 1:
+            raise NotImplementedError("GPU-direct model resize phase 1 supports a single node only")
+
+        global_rank = torch.distributed.get_rank()
+        transfer_ranks = sorted(set(old_ranks) | set(new_ranks))
+        torch.distributed.barrier()
+        transfer_group = torch.distributed.new_group(ranks=transfer_ranks)
+        try:
+            if global_rank not in transfer_ranks:
+                self._resize_model_state = None
+                result = {"status": "non_member", "tensor_count": 0, "staged_bytes": 0}
+            else:
+                model = self.module if global_rank in old_ranks else None
+                staged_state, stats = stage_fsdp2_model_state(
+                    model,
+                    old_ranks=old_ranks,
+                    new_ranks=new_ranks,
+                    transfer_group=transfer_group,
+                    device=torch.device(device_name, get_device_id()),
+                )
+                self._resize_model_state = staged_state
+                result = {"status": "staged" if staged_state is not None else "source_only", **stats}
+            if global_rank in transfer_ranks:
+                torch.distributed.barrier(group=transfer_group)
+        finally:
+            if global_rank in transfer_ranks:
+                torch.distributed.destroy_process_group(transfer_group)
+            torch.distributed.barrier()
+        return result
+
+    def restore_staged_model_after_resize(self) -> dict[str, int | str]:
+        """Commit a staged local model shard into the rebuilt FSDP2 runtime."""
+        if self._resize_model_state is None:
+            raise RuntimeError("no GPU-direct model state is staged on this actor rank")
+        if self.module is None:
+            raise RuntimeError("cannot restore GPU-direct model state before rebuilding the FSDP runtime")
+        stats = restore_fsdp2_model_state(self.module, self._resize_model_state)
+        self._resize_model_state = None
+        aggressive_empty_cache(force_sync=True)
+        return {"status": "restored", **stats}
+
+    def clear_staged_model_resize_state(self) -> None:
+        self._resize_model_state = None
         aggressive_empty_cache(force_sync=True)
 
     def is_mp_src_rank_with_outputs(self):
@@ -662,7 +734,10 @@ class FSDPEngine(BaseEngine):
             return torch.distributed.get_rank(group=getattr(self, "process_group", None))
 
     def get_data_parallel_size(self):
-        return torch.distributed.get_world_size(group=getattr(self, "process_group", None)) // self.ulysses_sequence_parallel_size
+        return (
+            torch.distributed.get_world_size(group=getattr(self, "process_group", None))
+            // self.ulysses_sequence_parallel_size
+        )
 
     def get_data_parallel_group(self):
         if self.ulysses_device_mesh is not None:
