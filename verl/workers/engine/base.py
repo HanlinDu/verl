@@ -343,9 +343,10 @@ class EngineRegistry:
     @classmethod
     def get_engine_cls(cls, model_type: str, backend: str):
         assert model_type in cls._engines, f"Unknown model_type: {model_type}"
-        if backend not in cls._engines[model_type]:
-            from . import _load_backend
+        from . import _BACKEND_ERRORS, _load_backend
 
+        module_name = "mindspeed" if backend == "mindspeed_megatron" else backend
+        if backend not in cls._engines[model_type] or module_name in _BACKEND_ERRORS:
             _load_backend(backend)
         assert backend in cls._engines[model_type], f"Unknown backend: {backend}"
         device = get_device_name()
@@ -372,12 +373,6 @@ class EngineRegistry:
             if nvidia_key in registry:
                 return registry[nvidia_key]
 
-        # A dependency may have registered a different device before import failed.
-        # Retry loading the selected backend once; never accept partial registration.
-        from . import _load_backend
-
-        if _load_backend(backend):
-            return cls.get_engine_cls(model_type, backend)
         raise ValueError(
             f"No engine registered for device={device!r}, vendor={vendor!r}, "
             f"model_type={model_type!r}, backend={backend!r}"

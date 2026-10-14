@@ -188,6 +188,25 @@ def check():
         else:
             raise AssertionError("unsupported device lookup passed")
         assert attempts == ["automodel"]
+    for error in (ImportError("failed after registration"), IndexError("late runtime failure")):
+        with sandbox() as (engine, registry, attempts, loaded, failures):
+            original = engine.import_module
+
+            def late_failure(name, package, wrapped=original, failure=error):
+                module = wrapped(name, package)
+                if name == ".automodel":
+                    raise failure
+                return module
+
+            engine.import_module = late_failure
+            for _ in range(2):
+                try:
+                    registry.get_engine_cls("language_model", "automodel")
+                except type(error) as caught:
+                    assert caught is error
+                else:
+                    raise AssertionError("registered class from failed import accepted")
+            assert attempts == ["automodel"]
     print("engine lazy-import CPU checks PASS (synthetic siblings, actual initializer/registry)")
 
 

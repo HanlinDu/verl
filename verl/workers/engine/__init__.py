@@ -30,25 +30,33 @@ _OPTIONAL_EXPORTS = {
     "mindspeed": ("MindspeedEngineWithLMHead", "MindspeedEngineWithValueHead", "MindSpeedMegatronEngineWithLMHead"),
     "megatron": ("MegatronEngine", "MegatronEngineWithLMHead", "MegatronEngineWithValueHead"),
 }
+_BACKEND_ERRORS = {}
 
 
 def _load_backend(backend):
     module_name = "mindspeed" if backend == "mindspeed_megatron" else backend
     if module_name not in _OPTIONAL_EXPORTS:
-        return False
+        return
+    if module_name in _BACKEND_ERRORS:
+        raise _BACKEND_ERRORS[module_name]
     if all(name in globals() for name in _OPTIONAL_EXPORTS[module_name]):
-        return False
-    if module_name == "megatron":
-        # Preserve adaptor/monkey-patch ordering; Mindspeed is optional for Megatron.
-        try:
-            import_module(".mindspeed", __name__)
-        except ImportError:
-            pass
-    module = import_module(f".{module_name}", __name__)
-    exports = {name: getattr(module, name) for name in _OPTIONAL_EXPORTS[module_name]}
-    globals().update(exports)
-    __all__.extend(name for name in exports if name not in __all__)
-    return True
+        return
+    try:
+        if module_name == "megatron":
+            # Preserve adaptor/monkey-patch ordering; Mindspeed is optional for Megatron.
+            try:
+                import_module(".mindspeed", __name__)
+            except ImportError:
+                pass
+        module = import_module(f".{module_name}", __name__)
+        exports = {name: getattr(module, name) for name in _OPTIONAL_EXPORTS[module_name]}
+        globals().update(exports)
+        __all__.extend(name for name in exports if name not in __all__)
+    except Exception as error:
+        # ponytail: failures are frozen for this process; restart after fixing dependencies.
+        # Failed imports can leave decorated classes registered. Never return those classes.
+        _BACKEND_ERRORS[module_name] = error
+        raise
 
 
 def __getattr__(name):
