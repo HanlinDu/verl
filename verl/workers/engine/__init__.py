@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from importlib import import_module
+
 from .base import BaseEngine, EngineRegistry
 from .fsdp import FSDPEngine, FSDPEngineWithLMHead
 
@@ -21,44 +23,42 @@ __all__ = [
     "FSDPEngineWithLMHead",
 ]
 
-try:
-    from .torchtitan import TorchTitanEngine, TorchTitanEngineWithLMHead
+_OPTIONAL_EXPORTS = {
+    "torchtitan": ("TorchTitanEngine", "TorchTitanEngineWithLMHead"),
+    "veomni": ("VeOmniEngine", "VeOmniEngineWithLMHead"),
+    "automodel": ("AutomodelEngine", "AutomodelEngineWithLMHead"),
+    "mindspeed": ("MindspeedEngineWithLMHead", "MindspeedEngineWithValueHead", "MindSpeedMegatronEngineWithLMHead"),
+    "megatron": ("MegatronEngine", "MegatronEngineWithLMHead", "MegatronEngineWithValueHead"),
+}
 
-    __all__ += ["TorchTitanEngine", "TorchTitanEngineWithLMHead"]
-except ImportError:
-    TorchTitanEngine = None
-    TorchTitanEngineWithLMHead = None
 
-try:
-    from .veomni import VeOmniEngine, VeOmniEngineWithLMHead
+def _load_backend(backend):
+    module_name = "mindspeed" if backend == "mindspeed_megatron" else backend
+    if module_name not in _OPTIONAL_EXPORTS:
+        return False
+    if all(name in globals() for name in _OPTIONAL_EXPORTS[module_name]):
+        return False
+    if module_name == "megatron":
+        # Preserve adaptor/monkey-patch ordering; Mindspeed is optional for Megatron.
+        try:
+            import_module(".mindspeed", __name__)
+        except ImportError:
+            pass
+    module = import_module(f".{module_name}", __name__)
+    exports = {name: getattr(module, name) for name in _OPTIONAL_EXPORTS[module_name]}
+    globals().update(exports)
+    __all__.extend(name for name in exports if name not in __all__)
+    return True
 
-    __all__ += ["VeOmniEngine", "VeOmniEngineWithLMHead"]
-except ImportError:
-    VeOmniEngine = None
-    VeOmniEngineWithLMHead = None
 
-try:
-    from .automodel import AutomodelEngine, AutomodelEngineWithLMHead
-
-    __all__ += ["AutomodelEngine", "AutomodelEngineWithLMHead"]
-except ImportError:
-    AutomodelEngine = None
-    AutomodelEngineWithLMHead = None
-
-# Mindspeed must be imported before Megatron to ensure the related monkey patches take effect as expected
-try:
-    from .mindspeed import MindspeedEngineWithLMHead, MindspeedEngineWithValueHead, MindSpeedMegatronEngineWithLMHead
-
-    __all__ += ["MindspeedEngineWithLMHead", "MindspeedEngineWithValueHead", "MindSpeedMegatronEngineWithLMHead"]
-except ImportError:
-    MindspeedEngineWithLMHead = None
-    MindspeedEngineWithValueHead = None
-    MindSpeedMegatronEngineWithLMHead = None
-
-try:
-    from .megatron import MegatronEngine, MegatronEngineWithLMHead, MegatronEngineWithValueHead
-
-    __all__ += ["MegatronEngine", "MegatronEngineWithLMHead", "MegatronEngineWithValueHead"]
-except ImportError:
-    MegatronEngine = None
-    MegatronEngineWithLMHead = None
+def __getattr__(name):
+    for backend, names in _OPTIONAL_EXPORTS.items():
+        if name in names:
+            try:
+                _load_backend(backend)
+            except ImportError:
+                # Compatibility for optional-class availability checks only.
+                # Selected registry backends use _load_backend directly and fail visibly.
+                return None
+            return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
