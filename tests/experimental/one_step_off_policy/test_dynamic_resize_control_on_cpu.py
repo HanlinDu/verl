@@ -191,24 +191,32 @@ def test_gpu_direct_resize_logs_the_move_its_verification_and_every_rank(caplog)
                     result.update(verified=1, verified_scalar_count=22)
             return results
 
+        resize_runtime = resize_actor_runtime  # the critic worker group
+
     trainer = object.__new__(OneStepOffRayTrainer)
     trainer._active_dynamic_resize_topology = {"actor_size": 4, "rollout_size": 4}
-    trainer._physical_actor_rollout_wg = _PhysicalWorkerGroup()
+    trainer._physical_actor_rollout_wg = trainer._physical_critic_wg = _PhysicalWorkerGroup()
 
     with caplog.at_level(logging.DEBUG, logger=_TRAINER_LOGGER.name):
         trainer._resize_actor_runtime_gpu_direct([0, 1, 2, 3, 4, 5])
+        trainer._resize_critic_runtime_gpu_direct([0, 1, 2, 3, 4, 5])
 
     messages = [record.getMessage() for record in caplog.records]
     assert (
         "[one-step-off][resize] actor runtime moved [0, 1, 2, 3] -> [0, 1, 2, 3, 4, 5] ranks on GPU: tensors=7 "
         "optimizer_tensors=14 net_recv_bytes=200 self_copy_bytes=200 seconds=1.00 verified=1 verified_scalars=22"
     ) in messages
+    assert (
+        "[one-step-off][resize] critic runtime moved [0, 1, 2, 3] -> [0, 1, 2, 3, 4, 5] ranks on GPU: tensors=7 "
+        "net_recv_bytes=200 seconds=1.00 verified=1 verified_scalars=22"
+    ) in messages
     # DEBUG adds what every physical rank reported: members, senders and bystanders
-    per_rank = [message for message in messages if message.startswith("[one-step-off][resize] actor rank ")]
-    assert len(per_rank) == 8
-    assert per_rank[5].startswith("[one-step-off][resize] actor rank 5: ")
-    assert "'net_recv_bytes': 100" in per_rank[5]
-    assert "'status': 'non_member'" in per_rank[7]
+    for role in ("actor", "critic"):
+        per_rank = [message for message in messages if message.startswith(f"[one-step-off][resize] {role} rank ")]
+        assert len(per_rank) == 8
+        assert per_rank[5].startswith(f"[one-step-off][resize] {role} rank 5: ")
+        assert "'net_recv_bytes': 100" in per_rank[5]
+        assert "'status': 'non_member'" in per_rank[7]
 
 
 def test_verl_logging_level_reaches_the_resize_log_lines_of_the_trainer():

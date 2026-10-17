@@ -55,9 +55,9 @@ trainer:
       enable: true
     handoff:
       enable: true
-      # gpu_direct: FSDP2 (fsdp_size=-1), actor expansion and shrink. The actor runtime -- params,
-      # optimizer state, buffers, scheduler -- moves shard-to-shard over NCCL; no checkpoint is written
-      # or read for the switch and a failure aborts the run. Critic-free algorithms only.
+      # gpu_direct: FSDP2 (fsdp_size=-1), actor expansion and shrink. The actor (and token-classification
+      # critic) runtime -- params, optimizer state, buffers, scheduler -- moves shard-to-shard over NCCL;
+      # no checkpoint is written or read for the switch and a failure aborts the run.
       # VERL_RESIZE_VERIFY=1 additionally compares every moved tensor (checksums) and the scalar state
       # (step, param_groups, LR scheduler) with the source.
       backend: gpu_direct

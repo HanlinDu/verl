@@ -226,8 +226,15 @@ class FSDPEngine(BaseEngine):
             raise NotImplementedError("GPU-direct resize requires fsdp_size=-1 (one-dimensional mesh)")
         if self._is_offload_param or self._is_offload_optimizer or self._uses_fsdp2_cpu_offload_policy:
             raise NotImplementedError("GPU-direct resize requires parameters and optimizer state to stay on GPU")
-        if self.model_config.model_type != "language_model":
-            raise NotImplementedError("GPU-direct resize currently supports language models only")
+        if self.model_config.model_type == "value_model":
+            # The weight-free rebuild only knows how to mirror the token-classification critic.
+            module = self.module
+            if module is not None and not type(module).__name__.endswith("ForTokenClassification"):
+                raise NotImplementedError(
+                    f"GPU-direct resize supports *ForTokenClassification critics only, got {type(module).__name__}"
+                )
+        elif self.model_config.model_type != "language_model":
+            raise NotImplementedError(f"GPU-direct resize does not support model_type={self.model_config.model_type}")
 
     def prepare_resize_target(self, process_group) -> None:
         """Build module/optimizer/scheduler for ``process_group`` without loading weights.
@@ -444,12 +451,23 @@ class FSDPEngine(BaseEngine):
                 self.model_config.hf_config.classifier_dropout = 0.0
                 self.model_config.hf_config.hidden_dropout = "0"
                 self.model_config.hf_config.summary_dropout_prob = 0.0
-                module = load_valuehead_model(
-                    local_path=self.model_config.local_path,
-                    torch_dtype=torch_dtype,
-                    model_config=self.model_config.hf_config,
-                    trust_remote_code=self.model_config.trust_remote_code,
-                )
+                if self._build_without_weights:
+                    # Mirrors the first (token-classification) branch of load_valuehead_model on meta.
+                    from transformers import AutoModelForTokenClassification
+
+                    module = AutoModelForTokenClassification.from_config(
+                        self.model_config.hf_config,
+                        torch_dtype=torch_dtype,
+                        attn_implementation="flash_attention_2",
+                        trust_remote_code=self.model_config.trust_remote_code,
+                    )
+                else:
+                    module = load_valuehead_model(
+                        local_path=self.model_config.local_path,
+                        torch_dtype=torch_dtype,
+                        model_config=self.model_config.hf_config,
+                        trust_remote_code=self.model_config.trust_remote_code,
+                    )
 
             use_liger = self.model_config.use_liger
             # Apply Liger kernel; disable fused_linear_cross_entropy (conflicts with verl's forward patching)

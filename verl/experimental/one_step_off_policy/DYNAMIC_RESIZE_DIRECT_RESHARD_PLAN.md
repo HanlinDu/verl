@@ -1,5 +1,33 @@
 # Multi-Node Dynamic Resize with Direct Reshard
 
+> Section 0 records what is implemented on this branch. Sections 1-18 are the original plan (August 2026)
+> together with the code inspection of the staged handoff that existed at the time; where they disagree
+> with the code, `DYNAMIC_RESIZE.md` describes the current implementation.
+
+## 0. Implementation Status (2026-10-17, single node)
+
+The `gpu_direct` handoff backend now implements the single-node core of this
+plan for the hybrid shared-pool runtime; see `verl/utils/fsdp_resize.py`,
+`FSDPEngine.prepare_resize_target/transfer_resize_state/commit_resize`,
+`TrainingWorker.resize_runtime` and `OneStepOffRayTrainer._rebuild_hybrid_training_runtime`.
+
+| Plan item | Status |
+|---|---|
+| Range intersection planner (Section 4), uneven/empty shards, expand and shrink | Done: `FSDPResizePlanner`, CPU tests in `tests/utils/test_fsdp_resize_on_cpu.py` |
+| Transaction order: old state live -> destinations prepared -> transfer -> verify -> commit -> release (17.10) | Done; a failure on any rank raises on every rank before/after the collectives, no checkpoint fallback |
+| Persistent physical actor with replaceable role runtime (Phase 2, option 1) | Done for the hybrid worker: new FSDP2 runtime is built next to the live one (meta -> `fully_shard` -> `to_empty`), old/new subgroups coexist until commit |
+| FSDP2 weights integration (Phase 4) | Done: one zero-copy `all_to_all_single` per tensor, old local shard as input, new local shard as output; rows a rank keeps never cross the wire |
+| Exact optimizer continuation (Phase 5) | Done: AdamW moments reuse the parameter plan, `step`/`param_groups`/scheduler state travel as metadata; bitwise equal to the source, state and next update, on the real model (`tests/special_distributed/run_fsdp2_resize_optimizer.py`) |
+| Checksum verification (Section 13) | Done, opt-in: `VERL_RESIZE_VERIFY=1` compares an exact position-sensitive checksum of every moved tensor, reduced over each side's mesh (no all-gather), and the scalar state that travels as metadata entry by entry |
+| Critic | Done for `*ForTokenClassification` critics (same code path); reference policy with FSDP2 CPU offload is rejected at startup |
+| Metrics (Section 14) | `resize/gpu_direct_*`: tensor counts, net/self bytes, transfer seconds, peak device memory, verified flag |
+| Multi-node transport, TransferQueue fallback, overlap with compute (Phases 3/6) | Not started; the transfer has no single-node assumption but has only been validated on one node |
+
+Measured on 8x RTX 5090 (PCIe, no NVLink): Qwen3-0.6B 4->6->2->6 and
+Qwen2.5-3B 4->6->4, every switch 0.7-1.7 s for the whole fp32 training state
+(parameters + two Adam moments), network bytes exactly at the lower bound of
+the shard layout, training continues normally after each switch.
+
 ## 1. Background
 
 The current experimental dynamic-resize path changes the effective GPU split
