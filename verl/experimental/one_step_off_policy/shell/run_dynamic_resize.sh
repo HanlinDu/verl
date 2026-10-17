@@ -50,6 +50,7 @@ COMM_CACHE_RESERVE_SCHEDULE=${COMM_CACHE_RESERVE_SCHEDULE:-true}
 BUDGET_PROTECTION_ENABLE=${BUDGET_PROTECTION_ENABLE:-false}
 MEMORY_BUDGET_RATIO=${MEMORY_BUDGET_RATIO:-0.85}
 CKPT_DIR=${CKPT_DIR:-/file_system/dhl/save_ckpt/dynamic-resize}
+PROFILER_ENABLE=${PROFILER_ENABLE:-true}
 RAY_TMPDIR=${RAY_TMPDIR:-}
 
 if [[ -n "${RAY_TMPDIR}" ]]; then
@@ -195,6 +196,7 @@ python3 -m verl.experimental.one_step_off_policy.main_ppo \
   actor_rollout_ref.rollout.gpu_memory_utilization=0.3 \
   critic.model.path="${RESOLVED_MODEL_PATH}" \
   critic.model.tokenizer_path="${RESOLVED_MODEL_PATH}" \
-  +global_profiler.enabled=true \
+  +global_profiler.enabled=${PROFILER_ENABLE} \
   +global_profiler.tool=torch_profiler \
-  +global_profiler.save_dir="${CKPT_DIR}/profiler"
+  +global_profiler.save_dir="${CKPT_DIR}/profiler" \
+  "$@"
