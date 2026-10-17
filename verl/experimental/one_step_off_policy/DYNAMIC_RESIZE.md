@@ -137,18 +137,19 @@ G="algorithm.adv_estimator=grpo actor_rollout_ref.rollout.n=5 actor_rollout_ref.
 batch sizes keep a run short. `$RUN` is a new, empty directory for each run.
 
 ```bash
-# one switch: [4,4] (actor, rollout) -> [6,2] at step 2, three steps
-CKPT_DIR=$RUN/ckpt bash $L $G trainer.total_training_steps=3
-# the same switch through the checkpoint round trip
-HOST_STAGING_BACKEND=disk_fallback CKPT_DIR=$RUN/ckpt bash $L $G trainer.total_training_steps=3
+# resize: [4,4] (actor, rollout) -> [6,2] at step 2 -> [2,6] at step 4, six steps
+CKPT_DIR=$RUN/ckpt bash $L $G
+# back to an earlier topology: [4,4] -> [6,2] -> [4,4]
+SECOND_SPLIT_PLAN="[4,4]" CKPT_DIR=$RUN/ckpt bash $L $G
+# the two default switches through the checkpoint round trip
+HOST_STAGING_BACKEND=disk_fallback CKPT_DIR=$RUN/ckpt bash $L $G
 # dynamic resize off: separate actor and rollout workers on 4 + 4 GPUs
-CKPT_DIR=$RUN/ckpt bash $L $G trainer.total_training_steps=3 \
-  actor_rollout_ref.hybrid_engine=false trainer.dynamic_resize.enable=false
+CKPT_DIR=$RUN/ckpt bash $L $G actor_rollout_ref.hybrid_engine=false trainer.dynamic_resize.enable=false
 ```
 
-A run passes when the launcher exits with code 0 after its last step line (`step:3`) and the switch line
-(`step:2`) reports `resize/hard_switch_success:1.0`; with resize off every step line reports
-`resize/enabled:0.0` instead.
+A run passes when the launcher exits with code 0 after its last step line (`step:6`) and every switch
+line (`step:2` and `step:4`) reports `resize/hard_switch_success:1.0`; with resize off every step line
+reports `resize/enabled:0.0` instead.
 
 ## The hard switch, step by step
 
@@ -169,3 +170,26 @@ A run passes when the launcher exits with code 0 after its last step line (`step
    agent-loop manager.
 6. `reconfigure_checkpoint_engine` with a fresh group name, then `update_weights` pushes the actor
    weights to the new replicas and resumes generation.
+
+Steps 4 and 6 destroy and recreate process groups on every switch; the caveats this creates are
+described under *Process groups and DTensor caches across resizes* below.
+
+## Process groups and DTensor caches across resizes
+
+Every hard switch destroys the training subgroup and the weight-sync engine and creates new ones. Two
+things break on the *second* switch back to a topology that existed before:
+
+* `DeviceMesh.__eq__` / `__hash__` compare content (rank list, shape, dim names) and ignore the process
+  group, which the mesh references by name. DTensor's sharding propagator and redistribute planner cache
+  results keyed on specs that contain the mesh. After a subgroup is destroyed and a later switch recreates
+  one with identical ranks, the cache hits and returns a spec whose mesh resolves to the dead group:
+  `Could not resolve the process group registered under the name N` at the first DTensor collective
+  (gradient clipping is the first). `clear_dtensor_dispatch_caches()` (`verl/utils/distributed.py`) clears
+  `propagate_op_sharding` (a `LocalLRUCache` in torch >= 2.9, hence `.cache`), `_propagate_tensor_meta` and
+  `_gen_transform_infos`; `TrainingWorker.destroy_process_group` calls it on **every** rank, members or not.
+* `NCCLCheckpointEngine.finalize()` runs twice with `rebuild_group=True` (after each `update_weights`, and
+  again from `reconfigure_checkpoint_engine` when a resize retires the engine) and compared `None >= 0`.
+  It now treats `rank is None` as "never joined".
+
+Rules the hybrid runtime imposes: all `new_group` calls happen on every rank in the same order, every
+worker method that touches groups is `ONE_TO_ALL` with barriers, and non-member ranks still make the calls.

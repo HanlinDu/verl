@@ -79,6 +79,38 @@ def destroy_global_process_group():
         torch.distributed.destroy_process_group()
 
 
+def clear_dtensor_dispatch_caches():
+    """Drop DTensor dispatch caches that may reference destroyed process groups.
+
+    ``DeviceMesh.__eq__``/``__hash__`` compare by content (ranks, shape, dim names) and ignore the
+    underlying process groups. DTensor's sharding propagator and redistribute planner cache results
+    keyed by ``DTensorSpec`` (which embeds the mesh). After a dynamic resize destroys a subgroup and a
+    later cycle recreates one with identical content, those caches return specs that point at the dead
+    mesh and collectives fail with ``Could not resolve the process group registered under the name N``.
+    Call this on every rank right after destroying a resize subgroup.
+    """
+    try:
+        from torch.distributed.tensor import DTensor
+
+        propagator = DTensor._op_dispatcher.sharding_propagator
+    except (ImportError, AttributeError):
+        return
+    op_cache = getattr(propagator, "propagate_op_sharding", None)
+    # torch >= 2.9 wraps the lru_cache in a thread-local LocalLRUCache
+    op_cache = getattr(op_cache, "cache", op_cache)
+    if hasattr(op_cache, "cache_clear"):
+        op_cache.cache_clear()
+    meta_cache = getattr(propagator, "_propagate_tensor_meta", None)
+    if hasattr(meta_cache, "cache_clear"):
+        meta_cache.cache_clear()
+    try:
+        from torch.distributed.tensor._redistribute import _gen_transform_infos
+
+        _gen_transform_infos.cache_clear()
+    except (ImportError, AttributeError):
+        pass
+
+
 def initialize_global_process_group_ray(timeout_second=None, backend=None):
     # in current ray environment, LOCAL_RANK is always zero.
 
