@@ -860,18 +860,16 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             and self._host_staging_config.effective_backend() == "gpu_direct"
         )
 
-    def _resize_actor_runtime_gpu_direct(
-        self, actor_ranks: list[int], old_ranks: list[int] | None = None
-    ) -> dict[str, float | str | int]:
-        """Move the actor runtime from ``old_ranks`` (default: the live topology) to ``actor_ranks``
-        shard-to-shard; no checkpoint is written or read."""
-        if old_ranks is None:
-            active_topology = getattr(self, "_active_dynamic_resize_topology", None) or {}
-            actor_source = int(active_topology.get("actor_size", 0) or 0)
-            if actor_source <= 0:
-                raise RuntimeError("active actor topology is unavailable for GPU-direct resize")
-            old_ranks = list(range(actor_source))
+    def _active_actor_ranks(self) -> list[int]:
+        active_topology = getattr(self, "_active_dynamic_resize_topology", None) or {}
+        actor_source = int(active_topology.get("actor_size", 0) or 0)
+        if actor_source <= 0:
+            raise RuntimeError("active actor topology is unavailable for GPU-direct resize")
+        return list(range(actor_source))
 
+    def _resize_actor_runtime_gpu_direct(self, actor_ranks: list[int]) -> dict[str, float | str | int]:
+        """Move the live actor runtime to ``actor_ranks`` shard-to-shard; no checkpoint is written or read."""
+        old_ranks = self._active_actor_ranks()
         results = self._physical_actor_rollout_wg.resize_actor_runtime(old_ranks, actor_ranks)
         members = [result for result in results if result.get("status") == "member"]
         if len(members) != len(actor_ranks):
@@ -911,13 +909,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/gpu_direct_peak_alloc_bytes": float(max(int(r.get("peak_alloc_bytes", 0)) for r in members)),
         }
 
-    def _resize_critic_runtime_gpu_direct(
-        self, critic_ranks: list[int], old_ranks: list[int] | None = None
-    ) -> dict[str, float | str | int]:
+    def _resize_critic_runtime_gpu_direct(self, critic_ranks: list[int]) -> dict[str, float | str | int]:
         """Move the critic runtime shard-to-shard onto ``critic_ranks`` (same topology as the actor)."""
-        if old_ranks is None:
-            active_topology = getattr(self, "_active_dynamic_resize_topology", None) or {}
-            old_ranks = list(range(int(active_topology.get("actor_size", 0) or 0)))
+        old_ranks = self._active_actor_ranks()
         results = self._physical_critic_wg.resize_runtime(old_ranks, critic_ranks)
         members = [result for result in results if result.get("status") == "member"]
         if len(members) != len(critic_ranks):
@@ -1014,13 +1008,11 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             checkpoint_manager_kwargs["rollout_wg"] = getattr(self, "_runtime_rollout_worker_group", None)
         self.checkpoint_manager = CheckpointEngineManager(**checkpoint_manager_kwargs)
 
-    def _rebuild_hybrid_training_runtime(
-        self, actor_size: int, *, gpu_direct: bool = False, old_ranks: list[int] | None = None
-    ) -> None:
+    def _rebuild_hybrid_training_runtime(self, actor_size: int, *, gpu_direct: bool = False) -> None:
         """Rebuild training subgroups while retaining the physical Ray actors.
 
-        With ``gpu_direct`` the live actor runtime (on ``old_ranks``, default: the live topology) is moved
-        shard-to-shard onto the new subgroup instead of being shut down and re-read from disk.
+        With ``gpu_direct`` the live actor runtime is moved shard-to-shard onto the new subgroup instead of
+        being shut down and re-read from disk.
         """
         physical_actor_wg = self._physical_actor_rollout_wg
         physical_world_size = physical_actor_wg.world_size
@@ -1036,11 +1028,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         if gpu_direct:
             # Build the new runtimes beside the old ones, move the state shard-to-shard, then retire the old
             # ones. Groups are created/destroyed inside the workers in a deterministic order.
-            self._latest_gpu_direct_resize_metrics = self._resize_actor_runtime_gpu_direct(actor_ranks, old_ranks)
+            self._latest_gpu_direct_resize_metrics = self._resize_actor_runtime_gpu_direct(actor_ranks)
             if physical_critic_wg is not None:
-                self._latest_gpu_direct_resize_metrics.update(
-                    self._resize_critic_runtime_gpu_direct(actor_ranks, old_ranks)
-                )
+                self._latest_gpu_direct_resize_metrics.update(self._resize_critic_runtime_gpu_direct(actor_ranks))
         else:
             physical_actor_wg.shutdown_actor_runtime()
             physical_actor_wg.destroy_actor_process_group()
@@ -1374,9 +1364,24 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             self.resource_pool_to_cls[resource_pool][str(role)] = role_cls
 
     def _init_models(self):
+        # Shared-pool dynamic resize: build the training runtimes directly on the initial actor ranks
+        # instead of on every physical rank followed by a shrink.
+        initial_actor_ranks = None
+        if dynamic_resize_shared_pool_enabled(self.config) and self.hybrid_engine:
+            topology = self.resource_pool_manager.dynamic_resize_topology
+            self._physical_actor_rollout_wg = self.all_wg[str(self.actor_role)]  # needed by the split check
+            self._validate_hybrid_split(
+                actor_size=topology.initial_actor_size,
+                rollout_size=topology.initial_rollout_size,
+            )
+            initial_actor_ranks = list(range(topology.initial_actor_size))
+
         if self.use_critic:
             self.critic_wg = self.all_wg[str(Role.Critic)]
-            self.critic_wg.reset()
+            if initial_actor_ranks is None:
+                self.critic_wg.reset()
+            else:
+                self.critic_wg.reset_on(initial_actor_ranks)
             # assign critic loss
             from functools import partial
 
@@ -1387,7 +1392,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
 
         if self.use_reference_policy and not self.ref_in_actor and self.actor_role != Role.ActorRolloutRef:
             self.ref_policy_wg = self.all_wg[str(Role.RefPolicy)]
-            self.ref_policy_wg.init_model()
+            self.ref_policy_wg.init_model(actor_ranks=initial_actor_ranks)
 
         self.rm_wg = None
         if self.use_rm:
@@ -1396,7 +1401,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
 
         self.actor_wg = self.all_wg[str(self.actor_role)]
         self._physical_actor_rollout_wg = self.actor_wg
-        self.actor_wg.init_model()
+        self.actor_wg.init_model(actor_ranks=initial_actor_ranks)
         self.actor_rollout_wg = self.actor_wg
         if self.actor_role == Role.ActorRolloutRef:
             self.ref_policy_wg = self.actor_rollout_wg
@@ -1406,26 +1411,22 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         if self.use_reference_policy and not self.ref_in_actor and self.actor_role != Role.ActorRolloutRef:
             self._physical_ref_policy_wg = self.ref_policy_wg
 
-        if dynamic_resize_shared_pool_enabled(self.config) and self.hybrid_engine:
-            topology = self.resource_pool_manager.dynamic_resize_topology
-            self._validate_hybrid_split(
-                actor_size=topology.initial_actor_size,
-                rollout_size=topology.initial_rollout_size,
-            )
-            gpu_direct = self._gpu_direct_actor_model_resize_enabled()
-            if gpu_direct:
+        if initial_actor_ranks is not None:
+            if self._gpu_direct_actor_model_resize_enabled():
                 # Fail at startup, not at the first resize, if an engine cannot move shard-to-shard.
                 self._physical_actor_rollout_wg.check_gpu_direct_resize_supported()
                 if getattr(self, "_physical_critic_wg", None) is not None:
                     self._physical_critic_wg.check_gpu_direct_resize_supported()
-            # init_model built the actor on every physical rank; with gpu_direct the initial split moves
-            # that runtime onto the first actor_size ranks instead of re-reading the checkpoint.
-            self._rebuild_hybrid_training_runtime(
-                actor_size=topology.initial_actor_size,
-                gpu_direct=gpu_direct,
-                old_ranks=list(range(self._physical_actor_rollout_wg.world_size)),
-            )
-            self._set_hybrid_rollout_subgroup(actor_size=topology.initial_actor_size)
+            # The runtimes already live on the initial ranks; only the logical subgroups are needed.
+            self.actor_wg = self._physical_actor_rollout_wg.subgroup(initial_actor_ranks, name_prefix="hybrid_actor")
+            self.actor_rollout_wg = self.actor_wg
+            if self.actor_role == Role.ActorRolloutRef:
+                self.ref_policy_wg = self.actor_wg
+            if getattr(self, "_physical_critic_wg", None) is not None:
+                self.critic_wg = self._physical_critic_wg.subgroup(initial_actor_ranks, name_prefix="hybrid_critic")
+            if getattr(self, "_physical_ref_policy_wg", None) is not None:
+                self.ref_policy_wg = self._physical_ref_policy_wg.subgroup(initial_actor_ranks, name_prefix="hybrid_ref")
+            self._set_hybrid_rollout_subgroup(actor_size=len(initial_actor_ranks))
             self._active_dynamic_resize_topology = {
                 "actor_size": topology.initial_actor_size,
                 "rollout_size": topology.initial_rollout_size,

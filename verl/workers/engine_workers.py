@@ -261,6 +261,15 @@ class TrainingWorker(Worker, DistProfilerExtension):
         self.engine.initialize()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reset_on(self, ranks: list[int]) -> bool:
+        """Create the engine subgroup ``ranks`` on every physical worker and build the runtime only on its
+        members, so a shared-pool job starts with the training state already on its initial ranks."""
+        is_member = self.prepare_process_group(ranks)
+        if is_member:
+            self.engine.initialize()
+        return is_member
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def shutdown_runtime(self):
         """Release the engine runtime while keeping this worker object alive."""
         self.engine.shutdown()
@@ -332,17 +341,28 @@ class TrainingWorker(Worker, DistProfilerExtension):
         stats: dict = {"rank": rank, "status": "non_member"}
         device_module = get_torch_device()
         device_module.reset_peak_memory_stats()
+        device = torch.device(get_device_name(), get_device_id())
         try:
-            # Build the target first on every joining rank, then agree group-wide that all of them succeeded
-            # before any collective of the transfer starts (a lone failure must not hang the others).
-            error = None
-            if in_new:
-                try:
-                    self.engine.prepare_resize_target(new_process_group)
-                except Exception as exc:  # noqa: BLE001
-                    error = f"rank {rank}: {type(exc).__name__}: {exc}"
             if in_old or in_new:
-                raise_if_any_failed(error, transfer_group, torch.device(get_device_name(), get_device_id()))
+                # Rank-local preconditions are agreed group-wide *before* the target build, whose first
+                # collective runs on the new group: a rank that bails out early must not leave the others
+                # waiting in that collective (NCCL communicator setup has no watchdog).
+                error = None
+                if in_new:
+                    try:
+                        self.engine.check_gpu_direct_resize_supported()
+                    except Exception as exc:  # noqa: BLE001
+                        error = f"rank {rank}: {type(exc).__name__}: {exc}"
+                raise_if_any_failed(error, transfer_group, device)
+                # Build the target on every joining rank (failures here are deterministic across ranks or
+                # happen after the new-group barrier), then agree again before the transfer starts.
+                error = None
+                if in_new:
+                    try:
+                        self.engine.prepare_resize_target(new_process_group)
+                    except Exception as exc:  # noqa: BLE001
+                        error = f"rank {rank}: {type(exc).__name__}: {exc}"
+                raise_if_any_failed(error, transfer_group, device)
                 stats.update(self.engine.transfer_resize_state(old_ranks, new_ranks, transfer_group))
                 stats["status"] = "member" if in_new else "sender"
         except Exception:
@@ -356,7 +376,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
             torch.distributed.destroy_process_group(old_process_group)
         if rank in transfer_ranks:
             torch.distributed.destroy_process_group(transfer_group)
-        self.engine.set_process_group(new_process_group if in_new else None)
+        if not in_new:  # members already carry the new group from commit_resize
+            self.engine.set_process_group(None)
         # Content-identical meshes recreated later would otherwise hit cached specs of the dead groups.
         clear_dtensor_dispatch_caches()
         if in_new:
@@ -844,7 +865,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 setattr(self.rollout, attribute, None)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def init_model(self):
+    def init_model(self, actor_ranks: list[int] | None = None):
+        """Build ref/actor/rollout. With ``actor_ranks`` (shared-pool dynamic resize) the training runtimes
+        are built directly on that subgroup instead of on every physical rank."""
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
 
         # 1. build reference model
@@ -882,7 +905,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             ref_training_config.engine_config.use_remove_padding = model_config.get("use_remove_padding", False)
 
             self.ref = self.ref_worker_cls(config=ref_training_config)
-            self.ref.reset()
+            if actor_ranks is None:
+                self.ref.reset()
+            else:
+                self.ref.reset_on(actor_ranks)
             self.set_dispatch_collect(mesh_name="ref", **self.ref.get_dispatch_collect())
 
         # 2. build actor model
@@ -930,7 +956,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 self.loss_fn = partial(ppo_loss, config=actor_config)
             self.actor = self.actor_worker_cls(config=actor_training_config)
-            self.actor.reset()
+            if actor_ranks is None:
+                self.actor.reset()
+            else:
+                self.actor.reset_on(actor_ranks)
             self.actor.set_loss_fn(self.loss_fn)
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 

@@ -116,6 +116,12 @@ class FSDPEngine(BaseEngine):
 
         self.rank = torch.distributed.get_rank()
         self.process_group = None
+        # Runtime objects exist only between initialize() and shutdown(); a rank that never joined a
+        # training subgroup (shared-pool rollout rank) must still look like a shut-down engine.
+        self.module = None
+        self.optimizer = None
+        self.lr_scheduler = None
+        self.checkpoint_manager = None
         # GPU-direct dynamic resize: runtime prepared for the next topology, see prepare_resize_target.
         self._resize_target: dict[str, Any] | None = None
         self._build_without_weights = False
@@ -246,7 +252,7 @@ class FSDPEngine(BaseEngine):
         if self._resize_target is not None:
             raise RuntimeError("a resize target is already prepared on this rank")
         self.check_gpu_direct_resize_supported()
-        live = {name: getattr(self, name) for name in self._RESIZE_RUNTIME_ATTRS}
+        live = {name: getattr(self, name, None) for name in self._RESIZE_RUNTIME_ATTRS}
         self.process_group = process_group
         self.device_mesh = None
         self._build_without_weights = True
@@ -321,6 +327,17 @@ class FSDPEngine(BaseEngine):
         else:
             is_collect = True
         return is_collect
+
+    def set_process_group(self, process_group):
+        """Point the engine at another (sub)group; the device mesh is rebuilt lazily by initialize()."""
+        if process_group is getattr(self, "process_group", None):
+            return
+        if getattr(self, "module", None) is not None:
+            raise RuntimeError("cannot change the process group of a live FSDP runtime; shut it down first")
+        self.process_group = process_group
+        self.device_mesh = None
+        self.ulysses_device_mesh = None
+        self.ulysses_parallel_group = None
 
     # Attributes that make up one runtime instance; prepare_resize_target builds a second set of them.
     _RESIZE_RUNTIME_ATTRS = (

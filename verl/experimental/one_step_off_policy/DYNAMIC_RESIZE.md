@@ -191,9 +191,6 @@ reports `resize/enabled:0.0` instead. In addition:
   verified=1 verified_scalars=330` with the ranks of that switch (330 entries for the Qwen3-0.6B actor;
   with the critic a `critic runtime moved` line as well) and one
   `[one-step-off][resize] actor rank N: {...}` line per GPU of the pool.
-  The move at start-up (pool -> initial split, see the end of *The hard switch, step by step*) is
-  logged the same way before the first step, as `[0, 1, 2, 3, 4, 5, 6, 7] -> [0, 1, 2, 3]` with
-  `verified=1` and fewer scalar entries: no optimizer step has been taken yet.
   `$RUN/ckpt/resize_trace.jsonl` has two lines per step.
 * Plain version: no `[one-step-off][resize]` line and no `resize_trace.jsonl`; the switch lines report
   `resize/gpu_direct_verified:0.0`.
@@ -224,9 +221,8 @@ host; the training state moves GPU to GPU.
    pushes the current actor weights to the replicas and resumes generation.
 6. The trainer records the new topology and launches the next step's generation on the new rollout ranks.
 
-At startup the actor is still built on all physical ranks (upstream `init_model`) and then moved onto the
-initial actor ranks with the same transfer (`_rebuild_hybrid_training_runtime(old_ranks=range(pool))`),
-so a default run shows three transfers: pool -> initial split, then the two scheduled switches.
+Startup does not transfer anything: `init_model(actor_ranks=initial_actor_ranks)` builds the training
+runtimes directly on the initial actor subgroup (see *Startup* below).
 
 ## Training state: shard-to-shard transfer
 
@@ -280,22 +276,36 @@ and an all-zero split vector. Rows a rank keeps are NCCL's self chunk, an on-dev
 Every physical rank executes the same sequence; non-members "accompany" the collectives that need WORLD.
 
 1. `barrier`; `new_group(new_ranks)` and `new_group(old ∪ new)` in the same order on all ranks.
-2. New ranks: `engine.prepare_resize_target(new_pg)` -- save the live runtime attributes, switch
+2. New ranks run the rank-local preconditions (`check_gpu_direct_resize_supported`, a shut-down or empty
+   engine shell is fine); the result is exchanged with `raise_if_any_failed` over `old ∪ new` *before* the
+   first collective on the new group. NCCL communicator creation has no watchdog, so a rank that raised
+   there would leave the others hanging forever.
+3. New ranks: `engine.prepare_resize_target(new_pg)` -- save the live runtime attributes, switch
    `process_group`, set `_build_without_weights=True`, `_init_device_mesh()` (`DeviceMesh.from_group`),
    `_build_model_optimizer()` (`from_config` on the meta device -> `fully_shard` -> `module.to_empty(device)`,
    optimizer and scheduler with empty state), park the result in `_resize_target`, restore the live runtime.
    Old and new runtimes now coexist in the process.
-3. Second verdict exchange: every new rank's target exists, or everyone raises.
-4. `old ∪ new` ranks: `engine.transfer_resize_state(old_ranks, new_ranks, group)` ->
+4. Second verdict exchange: every new rank's target exists, or everyone raises.
+5. `old ∪ new` ranks: `engine.transfer_resize_state(old_ranks, new_ranks, group)` ->
    `transfer_fsdp2_runtime`: `reshard()` both modules, manifest, structure check, parameters, optimizer
    state, buffers, optional verification (checksums and scalar state), `synchronize` + `barrier`. Status
    per rank: `member` (in the new group), `sender` (old only), `non_member`.
-5. Record `peak_alloc_bytes` (old and new shards coexist), `engine.commit_resize()` (shut the live runtime
+6. Record `peak_alloc_bytes` (old and new shards coexist), `engine.commit_resize()` (shut the live runtime
    down, install the target, rebuild `FSDPCheckpointManager`), destroy the old training group and the
    transfer group, `clear_dtensor_dispatch_caches()` on every rank, refresh dispatch info, `barrier`.
 
 Any exception -> `engine.abort_resize()` drops the half-built target and re-raises. There is no fallback
 path: a failed switch fails the run rather than silently training on wrong state.
+
+### Startup: the initial split
+
+`ActorRolloutRefWorker.init_model(actor_ranks=...)` and `TrainingWorker.reset_on(ranks)` create the
+initial actor subgroup first and build the actor, ref and critic runtimes only on its members
+(`FSDPEngine.set_process_group` drops the stale mesh so `initialize()` builds it on the new group).
+Ranks that never joined a training subgroup look like shut-down engines: `module`, `optimizer`,
+`lr_scheduler` and `checkpoint_manager` are `None`. Without `actor_ranks` the behaviour is upstream's,
+so non-resize runs are unaffected. Before this, the actor was built on the whole pool and moved to the
+initial ranks with one extra transfer.
 
 ### Preconditions (`check_gpu_direct_resize_supported`, checked at startup)
 
@@ -429,8 +439,6 @@ Metrics reported on a resize step (`step:N - ... - resize/...` line):
 
 * Validated on one node only. The transfer has no single-node assumption (`old ∪ new` is an arbitrary
   subgroup of WORLD), but multi-node transport and overlap with compute have not been exercised.
-* Startup builds the actor on the whole pool and moves it to the initial actor ranks with one extra
-  transfer (and one extra full-size model build).
 * Peak device memory during a transfer is old + new shards; a model that fits in training may not fit
   twice.
 * Every switch kills and relaunches all vLLM server actors (~34 s for Qwen3-0.6B).
