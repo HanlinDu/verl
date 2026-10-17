@@ -20,6 +20,7 @@ plan for the hybrid shared-pool runtime; see `verl/utils/fsdp_resize.py`,
 | Exact optimizer continuation (Phase 5) | Done: AdamW moments reuse the parameter plan, `step`/`param_groups`/scheduler state travel as metadata; bitwise equal to the source, state and next update, on the real model (`tests/special_distributed/run_fsdp2_resize_optimizer.py`) |
 | Checksum verification (Section 13) | Done, opt-in: `VERL_RESIZE_VERIFY=1` compares an exact position-sensitive checksum of every moved tensor, reduced over each side's mesh (no all-gather), and the scalar state that travels as metadata entry by entry |
 | Critic | Done for `*ForTokenClassification` critics (same code path); reference policy with FSDP2 CPU offload is rejected at startup |
+| Bounded staging memory (Section 2 goal) | Default path peaks at old + new shard; `handoff.gpu_direct_low_memory=true` moves one FSDP2 unit at a time for max(old, new) + one unit (3B 6->4: 16.6 GB -> 10.4 GB measured) |
 | Metrics (Section 14) | `resize/gpu_direct_*`: tensor counts, net/self bytes, transfer seconds, peak device memory, verified flag |
 | Multi-node transport, TransferQueue fallback, overlap with compute (Phases 3/6) | Not started; the transfer has no single-node assumption but has only been validated on one node |
 

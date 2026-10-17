@@ -186,6 +186,103 @@ def reshard_fsdp2_modules(module: torch.nn.Module) -> None:
             sub.reshard()
 
 
+# ---- low-memory pipeline: allocate / move / release one FSDP2 unit at a time ---------------------------
+#
+# The default transfer allocates the whole new runtime before moving anything and frees the whole old
+# runtime afterwards, so every member rank peaks at old_shard + new_shard. Moving one FSDP2 unit (a
+# fully_shard'ed module, i.e. one decoder layer or the root group) at a time -- materialise its new
+# shards, move its tensors, drop its old shards -- bounds the peak at max(old, new) + one unit instead.
+# Communication is unchanged (still one all_to_all_single per tensor); what changes is the storage
+# lifecycle, which has to reach into FSDP2's per-parameter padded buffers (``FSDPParam``).
+
+
+@dataclass
+class ResizeUnit:
+    name: str
+    param_names: list[str]
+    fsdp_params: list[Any]
+
+
+def fsdp2_units(module: torch.nn.Module) -> list[ResizeUnit]:
+    """Group the parameters of ``module`` by the FSDP2 module that shards them (model order)."""
+    name_by_param = {id(param): name for name, param in module.named_parameters()}
+    units: list[ResizeUnit] = []
+    seen: set[str] = set()
+    for module_name, sub in module.named_modules():
+        if not isinstance(sub, FSDPModule):
+            continue
+        group = sub._get_fsdp_state()._fsdp_param_group
+        if group is None:
+            continue
+        names, fsdp_params = [], []
+        for fsdp_param in group.fsdp_params:
+            name = name_by_param.get(id(fsdp_param.sharded_param))
+            if name is None:
+                raise RuntimeError(f"FSDP2 parameter of {module_name or '<root>'} is not a registered parameter")
+            names.append(name)
+            fsdp_params.append(fsdp_param)
+            seen.add(name)
+        units.append(ResizeUnit(module_name or "<root>", names, fsdp_params))
+    unmanaged = [name for name in name_by_param.values() if name not in seen]
+    if unmanaged:
+        units.append(ResizeUnit("<unmanaged>", unmanaged, []))
+    return units
+
+
+@torch.no_grad()
+def materialize_buffers(module: torch.nn.Module, device: torch.device | int) -> None:
+    """Give meta buffers real (uninitialised) storage; parameters are left for the per-unit pipeline."""
+    for sub in module.modules():
+        for key, buf in list(sub._buffers.items()):
+            if buf is not None and buf.is_meta:
+                sub._buffers[key] = torch.empty_like(buf, device=device)
+
+
+def _swap_storage(param: torch.nn.Parameter, device: torch.device | str) -> None:
+    """Give ``param`` fresh (uninitialised) storage on ``device`` while keeping the Parameter object.
+
+    Same mechanism as ``nn.Module.to_empty`` for tensor subclasses: ``swap_tensors`` keeps ties and the
+    references FSDP2 holds to the Parameter object intact (``.data =`` refuses meta <-> device swaps).
+    """
+    fresh = torch.nn.Parameter(torch.empty_like(param, device=device), requires_grad=param.requires_grad)
+    torch.utils.swap_tensors(param, fresh)
+
+
+@torch.no_grad()
+def materialize_unit(unit: ResizeUnit, module: torch.nn.Module, device: torch.device) -> None:
+    """Allocate the local shards of one unit of a meta-initialised FSDP2 model."""
+    params = dict(module.named_parameters())
+    for fsdp_param in unit.fsdp_params:
+        param = fsdp_param.sharded_param
+        if param.is_meta:
+            _swap_storage(param, device)
+            fsdp_param.reset_sharded_param()  # re-pads and re-points FSDP2's sharded storage
+    for name in unit.param_names[len(unit.fsdp_params) :]:  # unmanaged (plain) parameters
+        if params[name].is_meta:
+            _swap_storage(params[name], device)
+
+
+@torch.no_grad()
+def release_unit(unit: ResizeUnit, module: torch.nn.Module, optimizer: torch.optim.Optimizer | None) -> None:
+    """Drop the local shards (and optimizer state) of one unit of the old model after it has been moved."""
+    params = dict(module.named_parameters())
+    for name in unit.param_names:
+        if optimizer is not None:
+            optimizer.state.pop(params[name], None)
+    for fsdp_param in unit.fsdp_params:
+        fsdp_param._sharded_param_data = None  # FSDP2's padded storage; the DTensor local tensor views it
+        _swap_storage(fsdp_param.sharded_param, "meta")
+    for name in unit.param_names[len(unit.fsdp_params) :]:
+        _swap_storage(params[name], "meta")
+
+
+def order_units(units: Sequence[ResizeUnit], sizes: dict[str, int], *, expanding: bool) -> list[ResizeUnit]:
+    """Order that minimises the pipeline's peak: memory falls per unit when expanding (smallest unit
+    first keeps the first, highest step small) and rises when shrinking (largest unit first keeps the
+    last, highest step small)."""
+    return sorted(units, key=lambda unit: sizes[unit.name], reverse=not expanding)
+
+
 def _dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
@@ -227,14 +324,24 @@ def _local(value: torch.Tensor) -> torch.Tensor:
     return value.to_local() if isinstance(value, DTensor) else value
 
 
-def _build_manifest(runtime: ResizeRuntime) -> dict[str, Any]:
+def _build_manifest(runtime: ResizeRuntime, *, with_units: bool = False) -> dict[str, Any]:
     params = dict(runtime.module.named_parameters())  # dedups tied weights
     manifest: dict[str, Any] = {
         "params": [_describe(name, params[name]) for name in sorted(params)],
         "buffers": [_describe(name, buf) for name, buf in sorted(runtime.module.named_buffers(), key=lambda x: x[0])],
         "optimizer": None,
         "lr_scheduler": None,
+        "units": None,
     }
+    if with_units:
+        manifest["units"] = [
+            {
+                "name": unit.name,
+                "params": sorted(unit.param_names),
+                "size": sum(params[name].numel() for name in unit.param_names),
+            }
+            for unit in fsdp2_units(runtime.module)
+        ]
     optimizer = runtime.optimizer
     if optimizer is not None:
         state: dict[str, dict[str, Any]] = {}
@@ -301,6 +408,20 @@ def _scalar_state(runtime: ResizeRuntime) -> dict[str, str]:
     return out
 
 
+def _check_units(expected: list[dict[str, Any]], actual: Sequence[ResizeUnit]) -> None:
+    """Both sides must shard the same parameters in the same FSDP2 units (the pipeline moves unit by unit)."""
+    got = {unit.name: sorted(unit.param_names) for unit in actual}
+    want = {unit["name"]: list(unit["params"]) for unit in expected}
+    if got != want:
+        only_want = sorted(set(want) - set(got))[:4]
+        only_got = sorted(set(got) - set(want))[:4]
+        differing = [name for name in want if name in got and got[name] != want[name]][:4]
+        raise RuntimeError(
+            f"GPU-direct resize FSDP units differ from source: missing={only_want}, unexpected={only_got}, "
+            f"membership differs={differing}"
+        )
+
+
 def _check_structure(expected: list[dict[str, Any]], actual: dict[str, torch.Tensor], what: str) -> None:
     mismatches = []
     actual_names = set(actual)
@@ -329,9 +450,11 @@ class _Transfer:
         group: dist.ProcessGroup,
         device: torch.device,
         verify: bool = False,
+        pipeline: bool = False,
     ):
         self.old_ranks, self.new_ranks = list(old_ranks), list(new_ranks)
         self.group, self.device = group, device
+        self.pipeline = pipeline
         self.rank = dist.get_rank()
         self.in_old, self.in_new = self.rank in self.old_ranks, self.rank in self.new_ranks
         if not self.in_old and not self.in_new:
@@ -435,76 +558,97 @@ class _Transfer:
         old_bufs = dict(self.old.module.named_buffers()) if self.in_old else {}
         new_bufs = dict(self.new.module.named_buffers()) if self.in_new else {}
 
-        obj = [_build_manifest(self.old) if self.rank == self.src else None]
+        obj = [_build_manifest(self.old, with_units=self.pipeline) if self.rank == self.src else None]
         dist.broadcast_object_list(obj, src=self.src, group=self.group, device=self.device)
         manifest = obj[0]
+        self.manifest = manifest
+        self.old_params, self.new_params = old_params, new_params
         # Fail fast if the freshly built (or the live) model does not have exactly the source's structure.
         # The verdict is exchanged so that every rank raises instead of one rank raising and the others
         # waiting in the first all_to_all until the NCCL timeout.
         checks = []
         if self.in_old:
-            checks.append((old_params, old_bufs))
+            checks.append((old_params, old_bufs, self.old))
         if self.in_new:
-            checks.append((new_params, new_bufs))
+            checks.append((new_params, new_bufs, self.new))
         error = None
         try:
-            for params, bufs in checks:
+            for params, bufs, runtime in checks:
                 _check_structure(manifest["params"], params, "parameter")
                 _check_structure(manifest["buffers"], bufs, "buffer")
+                if self.pipeline:
+                    _check_units(manifest["units"], fsdp2_units(runtime.module))
         except Exception as exc:  # noqa: BLE001
             error = f"rank {self.rank}: {exc}"
         raise_if_any_failed(error, self.group, self.device)
 
-        old_digest = None
-        if self.verify and self.in_old:
-            old_digest = self._digests(self.old, manifest, old_params, old_bufs, side_ranks=self.old_ranks)
-        # Read before anything moves, like the checksums of the old side.
-        old_scalars = _scalar_state(self.old) if (self.verify and self.in_old) else None
-
-        # 1. parameters
-        for item in manifest["params"]:
-            self._move(item, old_params.get(item["name"]), new_params.get(item["name"]))
-            self.stats["tensor_count"] += 1
-
-        # 2. optimizer state (same sharding as the parameters), hyper-parameters, scheduler
         opt_manifest = manifest["optimizer"]
         if opt_manifest is not None:
             if self.in_old and self.old.optimizer is None:
                 raise RuntimeError("source rank has optimizer state in the manifest but no optimizer")
             if self.in_new and self.new.optimizer is None:
                 raise RuntimeError("target runtime has no optimizer to receive optimizer state")
-            for item in manifest["params"]:
-                name = item["name"]
-                state_meta = opt_manifest["state"].get(name)
-                if state_meta is None:
-                    continue
+        items_by_name = {item["name"]: item for item in manifest["params"]}
+        self._digest_index = self._build_digest_index(manifest)
+        old_acc = self._new_digest_acc() if (self.verify and self.in_old) else None
+        # Read before anything moves: the low-memory pipeline releases the old optimizer state unit by unit.
+        old_scalars = _scalar_state(self.old) if (self.verify and self.in_old) else None
+        self._old_mesh_group = None
+
+        if self.pipeline:
+            # 1+2. one FSDP2 unit at a time: allocate its new shards, move params + optimizer state, drop
+            #      the old shards. Peak = max(old, new) + one unit instead of old + new.
+            old_units = {unit.name: unit for unit in fsdp2_units(self.old.module)} if self.in_old else {}
+            new_units = {unit.name: unit for unit in fsdp2_units(self.new.module)} if self.in_new else {}
+            sizes = {unit["name"]: int(unit["size"]) for unit in manifest["units"]}
+            expanding = len(self.new_ranks) > len(self.old_ranks)
+            ordered = order_units(
+                [ResizeUnit(u["name"], list(u["params"]), []) for u in manifest["units"]], sizes, expanding=expanding
+            )
+            for unit in ordered:
                 if self.in_new:
-                    self._ensure_optimizer_state(new_params[name], item, state_meta)
-                for key, tensor_item in state_meta["tensors"].items():
-                    old_s = self.old.optimizer.state[old_params[name]][key] if self.in_old else None
-                    new_s = self.new.optimizer.state[new_params[name]][key] if self.in_new else None
-                    self._move(tensor_item, old_s, new_s)
-                    self.stats["optimizer_tensor_count"] += 1
-            if self.in_new:
-                groups = self.new.optimizer.param_groups
-                if len(groups) != len(opt_manifest["param_groups"]):
-                    raise RuntimeError(
-                        f"optimizer param_groups differ: source {len(opt_manifest['param_groups'])}, target {len(groups)}"
-                    )
-                for group, hyper in zip(groups, opt_manifest["param_groups"]):
-                    group.update(hyper)
+                    materialize_unit(new_units[unit.name], self.new.module, self.device)
+                for name in unit.param_names:
+                    self._move_param_and_state(items_by_name[name])
+                if old_acc is not None:
+                    for name in unit.param_names:
+                        self._digest_param_and_state(old_acc, name, self.old, old_params, self.old_ranks)
+                if self.in_old:
+                    release_unit(old_units[unit.name], self.old.module, self.old.optimizer)
+        else:
+            # 1+2. all parameters, then their optimizer state, in manifest order
+            if old_acc is not None:
+                for item in manifest["params"]:
+                    self._digest_param_and_state(old_acc, item["name"], self.old, old_params, self.old_ranks)
+            for item in manifest["params"]:
+                self._move_param_and_state(item)
+
+        # hyper-parameters and scheduler
+        if opt_manifest is not None and self.in_new:
+            groups = self.new.optimizer.param_groups
+            if len(groups) != len(opt_manifest["param_groups"]):
+                raise RuntimeError(
+                    f"optimizer param_groups differ: source {len(opt_manifest['param_groups'])}, target {len(groups)}"
+                )
+            for group, hyper in zip(groups, opt_manifest["param_groups"]):
+                group.update(hyper)
         if self.in_new and manifest["lr_scheduler"] is not None:
             if self.new.lr_scheduler is None:
                 raise RuntimeError("source has an LR scheduler but the target runtime does not")
             self.new.lr_scheduler.load_state_dict(manifest["lr_scheduler"])
 
         # 3. buffers (not sharded by FSDP2; includes non-persistent ones such as rotary inv_freq)
+        if old_acc is not None:
+            for item in manifest["buffers"]:
+                self._digest_one(old_acc, self._digest_index[("buf", item["name"])], old_bufs[item["name"]], item, self.old_ranks)
         for item in manifest["buffers"]:
             self._broadcast_replicated(item, old_bufs.get(item["name"]), new_bufs.get(item["name"]))
             self.stats["buffer_count"] += 1
 
         if self.verify:
-            self._verify(manifest, new_params, new_bufs, old_digest)
+            if old_acc is not None and self._old_mesh_group is not None:
+                dist.all_reduce(old_acc, group=self._old_mesh_group)
+            self._verify(new_params, new_bufs, old_acc)
             self._verify_scalar_state(old_scalars)
             self.stats["verified"] = 1
 
@@ -513,54 +657,91 @@ class _Transfer:
         self.stats["transfer_seconds"] = time.perf_counter() - start
         return dict(self.stats)
 
+    def _move_param_and_state(self, item: dict[str, Any]) -> None:
+        name = item["name"]
+        self._move(item, self.old_params.get(name), self.new_params.get(name))
+        self.stats["tensor_count"] += 1
+        opt_manifest = self.manifest["optimizer"]
+        state_meta = opt_manifest["state"].get(name) if opt_manifest is not None else None
+        if state_meta is None:
+            return
+        if self.in_new:
+            self._ensure_optimizer_state(self.new_params[name], item, state_meta)
+        for key, tensor_item in state_meta["tensors"].items():
+            old_s = self.old.optimizer.state[self.old_params[name]][key] if self.in_old else None
+            new_s = self.new.optimizer.state[self.new_params[name]][key] if self.in_new else None
+            self._move(tensor_item, old_s, new_s)
+            self.stats["optimizer_tensor_count"] += 1
+
     # -- optional end-to-end verification -----------------------------------------------------------------
-    def _digest_entries(self, runtime: ResizeRuntime, manifest, params, bufs) -> list[tuple[torch.Tensor, dict]]:
-        entries = [(params[item["name"]], item) for item in manifest["params"]]
+    def _build_digest_index(self, manifest) -> dict[tuple[str, str], int]:
+        """Slot index of every moved tensor: parameters, their optimizer tensors, then buffers."""
+        index: dict[tuple[str, str], int] = {}
+        for item in manifest["params"]:
+            index[("param", item["name"])] = len(index)
         opt_manifest = manifest["optimizer"]
         if opt_manifest is not None:
             for item in manifest["params"]:
                 state_meta = opt_manifest["state"].get(item["name"])
-                if state_meta is None:
-                    continue
-                state = runtime.optimizer.state[params[item["name"]]]
-                entries.extend((state[key], tensor_item) for key, tensor_item in state_meta["tensors"].items())
-        entries.extend((bufs[item["name"]], item) for item in manifest["buffers"])
-        return entries
+                for key in state_meta["tensors"] if state_meta else ():
+                    index[("opt", f"{item['name']}.{key}")] = len(index)
+        for item in manifest["buffers"]:
+            index[("buf", item["name"])] = len(index)
+        return index
 
-    def _digests(self, runtime, manifest, params, bufs, *, side_ranks: list[int]) -> torch.Tensor:
-        """Exact per-tensor checksums of the *full* tensors of one side, reduced over that side's mesh."""
-        entries = self._digest_entries(runtime, manifest, params, bufs)
-        acc = torch.zeros(2 * len(entries), dtype=torch.int64, device=self.device)
-        mesh_group = None
-        for index, (tensor, item) in enumerate(entries):
-            slot = acc[2 * index : 2 * index + 2]
-            if item["kind"] == "shard0" and isinstance(tensor, DTensor):
-                mesh = tensor.device_mesh
-                row_offset, _ = compute_1d_shard_range(item["shape"][0], mesh.size(), mesh.get_local_rank())
-                _shard_digest(_local(tensor), row_offset * prod(item["shape"][1:]), slot)
-                mesh_group = mesh.get_group()
-            elif self.rank == side_ranks[0]:  # replicated: count once per side
-                _shard_digest(_local(tensor), 0, slot)
-        if mesh_group is not None:
-            dist.all_reduce(acc, group=mesh_group)
-        return acc
+    def _new_digest_acc(self) -> torch.Tensor:
+        return torch.zeros(2 * len(self._digest_index), dtype=torch.int64, device=self.device)
 
-    def _verify(self, manifest, new_params, new_bufs, old_digest: torch.Tensor | None) -> None:
-        """Compare checksums of every moved tensor on the new side with the old side's (same manifest order)."""
+    def _digest_one(self, acc, slot: int, tensor: torch.Tensor, item: dict[str, Any], side_ranks: list[int]) -> None:
+        view = acc[2 * slot : 2 * slot + 2]
+        if item["kind"] == "shard0" and isinstance(tensor, DTensor):
+            mesh = tensor.device_mesh
+            row_offset, _ = compute_1d_shard_range(item["shape"][0], mesh.size(), mesh.get_local_rank())
+            _shard_digest(_local(tensor), row_offset * prod(item["shape"][1:]), view)
+            if side_ranks is self.old_ranks:
+                self._old_mesh_group = mesh.get_group()
+            else:
+                self._new_mesh_group = mesh.get_group()
+        elif self.rank == side_ranks[0]:  # replicated: count once per side
+            _shard_digest(_local(tensor), 0, view)
+
+    def _digest_param_and_state(self, acc, name: str, runtime, params, side_ranks: list[int]) -> None:
+        item = self._item(name)
+        self._digest_one(acc, self._digest_index[("param", name)], params[name], item, side_ranks)
+        opt_manifest = self.manifest["optimizer"]
+        state_meta = opt_manifest["state"].get(name) if opt_manifest is not None else None
+        if state_meta:
+            state = runtime.optimizer.state[params[name]]
+            for key, tensor_item in state_meta["tensors"].items():
+                self._digest_one(acc, self._digest_index[("opt", f"{name}.{key}")], state[key], tensor_item, side_ranks)
+
+    def _item(self, name: str) -> dict[str, Any]:
+        if not hasattr(self, "_items_by_name"):
+            self._items_by_name = {item["name"]: item for item in self.manifest["params"]}
+        return self._items_by_name[name]
+
+    def _verify(self, new_params, new_bufs, old_acc: torch.Tensor | None) -> None:
+        """Compare checksums of every moved tensor on the new side with the old side's."""
         if self.in_new:
-            entries = self._digest_entries(self.new, manifest, new_params, new_bufs)
-            new_digest = self._digests(self.new, manifest, new_params, new_bufs, side_ranks=self.new_ranks)
-            reference = old_digest.clone() if self.rank == self.src else torch.empty_like(new_digest)
+            self._new_mesh_group = None
+            new_acc = self._new_digest_acc()
+            for item in self.manifest["params"]:
+                self._digest_param_and_state(new_acc, item["name"], self.new, new_params, self.new_ranks)
+            for item in self.manifest["buffers"]:
+                self._digest_one(new_acc, self._digest_index[("buf", item["name"])], new_bufs[item["name"]], item, self.new_ranks)
+            if self._new_mesh_group is not None:
+                dist.all_reduce(new_acc, group=self._new_mesh_group)
+            reference = old_acc.clone() if self.rank == self.src else torch.empty_like(new_acc)
         else:
-            entries, new_digest = None, None
-            reference = old_digest.clone()  # old-only ranks just relay the broadcast
+            new_acc = None
+            reference = old_acc.clone()  # old-only ranks just relay the broadcast
         dist.broadcast(reference, src=self.src, group=self.group)
         error = None
         if self.in_new:
-            bad = (reference.view(-1, 2) != new_digest.view(-1, 2)).any(dim=1).nonzero().flatten().tolist()
+            bad = (reference.view(-1, 2) != new_acc.view(-1, 2)).any(dim=1).nonzero().flatten().tolist()
             if bad:
-                names = [entries[i][1]["name"] for i in bad[:5]]
-                error = f"rank {self.rank}: {len(bad)} tensors differ after transfer, e.g. {names}"
+                slot_names = {slot: key for key, slot in self._digest_index.items()}
+                error = f"rank {self.rank}: {len(bad)} tensors differ after transfer, e.g. {[slot_names[i] for i in bad[:5]]}"
         raise_if_any_failed(error, self.group, self.device)
 
     def _verify_scalar_state(self, old_state: dict[str, str] | None) -> None:
@@ -624,6 +805,7 @@ def transfer_fsdp2_runtime(
     group: dist.ProcessGroup,
     device: torch.device,
     verify: bool = False,
+    pipeline: bool = False,
 ) -> dict[str, int | float]:
     """Move the training state of ``old`` (on ``old_ranks``) into ``new`` (on ``new_ranks``) in place.
 
@@ -635,7 +817,19 @@ def transfer_fsdp2_runtime(
     side's mesh, no all-gather) is compared between the two sides, and so is the state that travels in the
     manifest instead (optimizer scalars such as ``step``, ``param_groups`` hyper-parameters, LR-scheduler
     state), read from the live runtimes entry by entry.  A mismatch raises on every rank.
+
+    With ``pipeline=True`` the new model must still have meta parameters (buffers materialised, see
+    ``materialize_buffers``); shards are allocated, moved and released one FSDP2 unit at a time so the
+    peak device memory is max(old, new) + one unit instead of old + new. The old runtime is hollow
+    afterwards and must be discarded.
     """
     return _Transfer(
-        old=old, new=new, old_ranks=old_ranks, new_ranks=new_ranks, group=group, device=device, verify=verify
+        old=old,
+        new=new,
+        old_ranks=old_ranks,
+        new_ranks=new_ranks,
+        group=group,
+        device=device,
+        verify=verify,
+        pipeline=pipeline,
     ).run()

@@ -134,9 +134,11 @@ No test may fail; one is skipped because it needs an accelerator.
 
 ```bash
 torchrun --standalone --nproc-per-node=6 tests/special_distributed/run_fsdp2_resize_transfer.py
+RESIZE_PIPELINE=1 torchrun --standalone --nproc-per-node=6 tests/special_distributed/run_fsdp2_resize_transfer.py
 ```
 
-Rank 0 prints `FSDP2 GPU-direct resize transfer 4->6->2->6 passed (3 scalar-state faults caught)`.
+Rank 0 prints `FSDP2 GPU-direct resize transfer 4->6->2->6 passed (pipeline=False, 3 scalar-state faults
+caught)`, and `pipeline=True` for the low-memory pipeline that `RESIZE_PIPELINE=1` selects.
 
 ### Optimizer check (6 GPUs)
 
@@ -173,6 +175,8 @@ VERL_RESIZE_VERIFY=1 CKPT_DIR=$RUN/ckpt bash $L $G
 CKPT_DIR=$RUN/ckpt bash $L $G
 # the same with GAE and the critic
 VERL_RESIZE_VERIFY=1 CKPT_DIR=$RUN/ckpt bash $L
+# the same through the low-memory pipeline
+VERL_RESIZE_VERIFY=1 CKPT_DIR=$RUN/ckpt bash $L $G trainer.dynamic_resize.handoff.gpu_direct_low_memory=true
 # back to an earlier topology: [4,4] -> [6,2] -> [4,4]
 VERL_RESIZE_VERIFY=1 SECOND_SPLIT_PLAN="[4,4]" CKPT_DIR=$RUN/ckpt bash $L $G
 # the two default switches through the checkpoint round trip
@@ -233,7 +237,7 @@ runtimes directly on the initial actor subgroup (see *Startup* below).
 | trainer | `one_step_off_policy/ray_trainer.py` | decides the topology; `_resize_actor_runtime_gpu_direct` / `_resize_critic_runtime_gpu_direct` call the workers, check that exactly `actor_target` ranks report `member` with identical tensor counts, aggregate `resize/gpu_direct_*` metrics |
 | worker | `verl/workers/engine_workers.py` | `TrainingWorker.resize_runtime(old_ranks, new_ranks)` runs on *every* physical rank (`ONE_TO_ALL`): group creation, prepare, verdicts, transfer, commit, teardown; `ActorRolloutRefWorker.resize_actor_runtime` wraps it for actor and co-located ref |
 | engine | `verl/workers/engine/fsdp/transformer_impl.py` | `FSDPEngine.prepare_resize_target` / `transfer_resize_state` / `commit_resize` / `abort_resize`; `check_gpu_direct_resize_supported`; `_build_without_weights` branches of `_build_module` / `_build_fsdp_module` |
-| transfer | `verl/utils/fsdp_resize.py` | `FSDPResizePlanner` (row intervals), `transfer_fsdp2_runtime` / `_Transfer` (manifest, `all_to_all_single`, broadcasts, optimizer/scheduler metadata, checksums, scalar-state comparison), `raise_if_any_failed` |
+| transfer | `verl/utils/fsdp_resize.py` | `FSDPResizePlanner` (row intervals), `transfer_fsdp2_runtime` / `_Transfer` (manifest, `all_to_all_single`, broadcasts, optimizer/scheduler metadata, checksums, scalar-state comparison), `raise_if_any_failed`, `fsdp2_units` / `materialize_unit` / `release_unit` (low-memory pipeline) |
 
 ### What moves
 
@@ -306,6 +310,19 @@ Ranks that never joined a training subgroup look like shut-down engines: `module
 `lr_scheduler` and `checkpoint_manager` are `None`. Without `actor_ranks` the behaviour is upstream's,
 so non-resize runs are unaffected. Before this, the actor was built on the whole pool and moved to the
 initial ranks with one extra transfer.
+
+### Low-memory pipeline (`handoff.gpu_direct_low_memory=true`)
+
+The default path holds old and new shards at the same time (peak ~ `12 B/param * (1/old + 1/new)` for
+fp32 parameters plus two Adam moments). With the flag, `prepare_resize_target` leaves the parameters on
+the meta device after `fully_shard` (only buffers are materialised) and `_Transfer` works one FSDP2
+**unit** at a time -- a decoder layer or the root group (`fsdp2_units`): `materialize_unit` allocates the
+unit's new shards (`swap_tensors` + `FSDPParam.reset_sharded_param`), its parameters and optimizer state
+move, `release_unit` frees the old shards (`FSDPParam._sharded_param_data` and optimizer state). Units
+are ordered smallest-first when expanding and largest-first when shrinking, so the peak is
+`max(old, new) + one unit`. Communication is unchanged; checksums accumulate the old side per unit before
+release. Off by default because it relies on FSDP2 internals; the default path keeps the old runtime
+intact until the transfer is verified.
 
 ### Preconditions (`check_gpu_direct_resize_supported`, checked at startup)
 
@@ -410,6 +427,7 @@ catches only gross corruption.
 | Setting | Default | Effect |
 |---|---|---|
 | `trainer.dynamic_resize.handoff.backend` | `gpu_direct` (example yaml) | `gpu_direct`: this document; `disk_fallback`: checkpoint round trip (optimizer state not restored across world sizes) |
+| `trainer.dynamic_resize.handoff.gpu_direct_low_memory` | `false` | one FSDP2 unit at a time, peak `max(old, new) + one unit` |
 | `VERL_RESIZE_VERIFY` | unset | `1`: checksum and scalar-state comparison after every transfer; in the launcher, the verification version |
 | `VERL_LOGGING_LEVEL` | `WARN` (`DEBUG` in the launcher's verification version) | `INFO` shows the resize lines of the trainer (`[one-step-off][resize] ... runtime moved ...`); `DEBUG` adds the transfer statistics of every rank and the workers' memory lines |
 
@@ -432,6 +450,8 @@ Metrics reported on a resize step (`step:N - ... - resize/...` line):
 * Qwen3-0.6B GRPO, 4 -> 6 -> 2 -> 6 with `VERL_RESIZE_VERIFY=1`: every transfer of the whole fp32 training
   state (parameters + two Adam moments, ~6 GB) takes 1.0-1.4 s and verifies; network bytes are exactly at
   the lower bound of the shard layout; training continues normally after each switch.
+* Qwen2.5-3B, 4 -> 6 -> 4: default path 1.70 / 1.53 s, low-memory pipeline 1.70 / 1.77 s; peak device
+  memory for 6 -> 4 drops from 16.6 GB to 10.4 GB with the pipeline.
 * The whole hard switch is about 45 s, of which about 34 s is vLLM engine start-up for the relaunched
   replicas; the training-state move is no longer on the critical path.
 
@@ -439,11 +459,9 @@ Metrics reported on a resize step (`step:N - ... - resize/...` line):
 
 * Validated on one node only. The transfer has no single-node assumption (`old ∪ new` is an arbitrary
   subgroup of WORLD), but multi-node transport and overlap with compute have not been exercised.
-* Peak device memory during a transfer is old + new shards; a model that fits in training may not fit
-  twice.
 * Every switch kills and relaunches all vLLM server actors (~34 s for Qwen3-0.6B).
 * `prepare_resize_target` relies on FSDP2's `FSDPModule._apply` -> `reset_sharded_param()` making the
-  `to_empty`'d storage the sharded parameter's home (the same mechanism as official meta-device init).
+  `to_empty`'d storage the sharded parameter's home (the same mechanism as official meta-device init); the low-memory pipeline additionally uses `FSDPParam._sharded_param_data`, `reset_sharded_param` and `swap_tensors` directly.
 * `clear_dtensor_dispatch_caches` touches private DTensor caches whose names may change between torch
   versions (torch 2.9 verified).
 * `disk_fallback` is kept as the alternative backend; it does not restore optimizer state across a world-size

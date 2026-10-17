@@ -320,7 +320,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         self.engine.check_gpu_direct_resize_supported()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def resize_runtime(self, old_ranks: list[int], new_ranks: list[int]) -> dict:
+    def resize_runtime(self, old_ranks: list[int], new_ranks: list[int], low_memory: bool = False) -> dict:
         """GPU-direct topology change on every physical worker.
 
         Builds the runtime for ``new_ranks`` next to the live one (no checkpoint read), moves parameters,
@@ -359,11 +359,13 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 error = None
                 if in_new:
                     try:
-                        self.engine.prepare_resize_target(new_process_group)
+                        self.engine.prepare_resize_target(new_process_group, low_memory=low_memory)
                     except Exception as exc:  # noqa: BLE001
                         error = f"rank {rank}: {type(exc).__name__}: {exc}"
                 raise_if_any_failed(error, transfer_group, device)
-                stats.update(self.engine.transfer_resize_state(old_ranks, new_ranks, transfer_group))
+                stats.update(
+                    self.engine.transfer_resize_state(old_ranks, new_ranks, transfer_group, low_memory=low_memory)
+                )
                 stats["status"] = "member" if in_new else "sender"
         except Exception:
             self.engine.abort_resize()
@@ -779,14 +781,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 worker.engine.check_gpu_direct_resize_supported()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def resize_actor_runtime(self, old_ranks: list[int], new_ranks: list[int]) -> dict:
+    def resize_actor_runtime(self, old_ranks: list[int], new_ranks: list[int], low_memory: bool = False) -> dict:
         """GPU-direct resize of the actor (and, if colocated, the reference) runtime."""
         if self.actor is None:
             raise RuntimeError("actor runtime shell is unavailable")
-        stats = self.actor.resize_runtime(old_ranks, new_ranks)
+        stats = self.actor.resize_runtime(old_ranks, new_ranks, low_memory=low_memory)
         self._replace_dispatch_collect_info("actor", **self.actor.get_dispatch_collect())
         if self.ref is not None:
-            self.ref.resize_runtime(old_ranks, new_ranks)
+            self.ref.resize_runtime(old_ranks, new_ranks, low_memory=low_memory)
             self._replace_dispatch_collect_info("ref", **self.ref.get_dispatch_collect())
         return stats
 

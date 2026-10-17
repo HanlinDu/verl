@@ -125,6 +125,7 @@ class FSDPEngine(BaseEngine):
         # GPU-direct dynamic resize: runtime prepared for the next topology, see prepare_resize_target.
         self._resize_target: dict[str, Any] | None = None
         self._build_without_weights = False
+        self._resize_low_memory = False
 
         # Apply NPU patches for FSDP backend
         from .utils import apply_npu_fsdp_patches
@@ -242,12 +243,13 @@ class FSDPEngine(BaseEngine):
         elif self.model_config.model_type != "language_model":
             raise NotImplementedError(f"GPU-direct resize does not support model_type={self.model_config.model_type}")
 
-    def prepare_resize_target(self, process_group) -> None:
+    def prepare_resize_target(self, process_group, low_memory: bool = False) -> None:
         """Build module/optimizer/scheduler for ``process_group`` without loading weights.
 
         The live runtime stays untouched; the new one is parked in ``self._resize_target`` until
         ``commit_resize``.  Parameters are allocated on device (meta -> fully_shard -> to_empty) and are
-        filled by ``transfer_resize_state``.
+        filled by ``transfer_resize_state``.  With ``low_memory`` the parameters stay on meta and are
+        allocated one FSDP2 unit at a time during the transfer (peak max(old, new) + one unit).
         """
         if self._resize_target is not None:
             raise RuntimeError("a resize target is already prepared on this rank")
@@ -256,16 +258,20 @@ class FSDPEngine(BaseEngine):
         self.process_group = process_group
         self.device_mesh = None
         self._build_without_weights = True
+        self._resize_low_memory = low_memory
         try:
             self._init_device_mesh()
             self._build_model_optimizer()
             self._resize_target = {name: getattr(self, name) for name in self._RESIZE_RUNTIME_ATTRS}
         finally:
             self._build_without_weights = False
+            self._resize_low_memory = False
             for name, value in live.items():
                 setattr(self, name, value)
 
-    def transfer_resize_state(self, old_ranks: list[int], new_ranks: list[int], transfer_group) -> dict:
+    def transfer_resize_state(
+        self, old_ranks: list[int], new_ranks: list[int], transfer_group, low_memory: bool = False
+    ) -> dict:
         """Move params / optimizer state / buffers / scheduler from the live runtime into the target."""
         from verl.utils.fsdp_resize import ResizeRuntime, transfer_fsdp2_runtime
 
@@ -293,6 +299,7 @@ class FSDPEngine(BaseEngine):
             device=torch.device(device_name, get_device_id()),
             # Exact checksum comparison of every moved tensor; cheap, opt-in for production runs.
             verify=os.environ.get("VERL_RESIZE_VERIFY", "0") == "1",
+            pipeline=low_memory,
         )
 
     def commit_resize(self) -> None:
@@ -653,7 +660,13 @@ class FSDPEngine(BaseEngine):
             if self._build_without_weights:
                 # Allocate only this rank's shards; contents arrive via transfer_resize_state.
                 apply_fsdp2(module, fsdp_kwargs, self.engine_config)
-                module.to_empty(device=get_device_id())
+                if getattr(self, "_resize_low_memory", False):
+                    # Parameters stay on meta; the transfer materialises them one FSDP2 unit at a time.
+                    from verl.utils.fsdp_resize import materialize_buffers
+
+                    materialize_buffers(module, get_device_id())
+                else:
+                    module.to_empty(device=get_device_id())
             else:
                 full_state = module.state_dict()
                 apply_fsdp2(module, fsdp_kwargs, self.engine_config)

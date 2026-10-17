@@ -41,9 +41,12 @@ from torch.distributed.fsdp import fully_shard
 
 import verl.utils.fsdp_resize as fsdp_resize
 from verl.utils.distributed import clear_dtensor_dispatch_caches
-from verl.utils.fsdp_resize import FSDPResizePlanner, ResizeRuntime, transfer_fsdp2_runtime
+from verl.utils.fsdp_resize import FSDPResizePlanner, ResizeRuntime, materialize_buffers, transfer_fsdp2_runtime
 
 VOCAB, D, HID, B, T, LR = 37, 24, 40, 12, 5, 1e-2
+# RESIZE_PIPELINE=1 exercises the low-memory path: new shards are allocated and old shards released one
+# FSDP2 unit at a time instead of whole-model to_empty / whole-model release.
+PIPELINE = os.environ.get("RESIZE_PIPELINE", "0") == "1"
 
 
 class Toy(nn.Module):
@@ -141,8 +144,8 @@ def expect_scalar_faults_caught(cur, cur_ranks, rank, device):
     """Scalar state travels in the manifest, not as tensors, so the checksums cannot vouch for it.
 
     Let the source's manifest lie about one entry at a time while moving ``cur`` to two ranks into a
-    throwaway target (the transfer leaves the old runtime intact): every rank has to raise and name the
-    entry.
+    throwaway target (the default path leaves the old runtime intact): every rank has to raise and name
+    the entry.
     """
     target_ranks = [0, 1]
     target_group, target_mesh = make_group_and_mesh(target_ranks, rank)
@@ -233,7 +236,10 @@ def main():
             with torch.device("meta"):
                 model = Toy()
             shard_model(model, new_mesh)
-            model.to_empty(device=device)
+            if PIPELINE:
+                materialize_buffers(model, device)  # parameters stay on meta until their unit is moved
+            else:
+                model.to_empty(device=device)
             new = make_runtime(model)
 
         transfer_group = dist.new_group(ranks=union)
@@ -248,8 +254,13 @@ def main():
                 group=transfer_group,
                 device=device,
                 verify=True,
+                pipeline=PIPELINE,
             )
             assert stats["verified"] == 1
+            if PIPELINE and rank in old_ranks:
+                # the old runtime has been hollowed out unit by unit
+                assert all(p.is_meta for p in old.module.parameters()), "old shards not released"
+                assert not old.optimizer.state, "old optimizer state not released"
 
         if rank in new_ranks:
             new_full = full_state(new)
@@ -288,7 +299,10 @@ def main():
 
     dist.barrier()
     if rank == 0:
-        print(f"FSDP2 GPU-direct resize transfer 4->6->2->6 passed ({len(SCALAR_FAULTS)} scalar-state faults caught)")
+        print(
+            f"FSDP2 GPU-direct resize transfer 4->6->2->6 passed (pipeline={PIPELINE}, "
+            f"{len(SCALAR_FAULTS)} scalar-state faults caught)"
+        )
     dist.destroy_process_group()
 
 

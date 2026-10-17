@@ -46,6 +46,9 @@ class HostStagingConfig:
     device_preload_threshold: float = 0.9
     cleanup_after_load: bool = True
     preclear_rollout_kv_cache: bool = True
+    # gpu_direct only: move one FSDP2 unit at a time so the peak is max(old, new) + one unit instead
+    # of old + new shards. Touches FSDP2 internals; keep off unless memory is tight.
+    gpu_direct_low_memory: bool = False
 
     @classmethod
     def from_dict(cls, cfg: dict[str, Any] | None) -> HostStagingConfig:
@@ -67,6 +70,7 @@ class HostStagingConfig:
             device_preload_threshold=min(max(float(cfg.get("device_preload_threshold", 0.9)), 0.0), 1.0),
             cleanup_after_load=bool(cfg.get("cleanup_after_load", True)),
             preclear_rollout_kv_cache=bool(cfg.get("preclear_rollout_kv_cache", True)),
+            gpu_direct_low_memory=bool(cfg.get("gpu_direct_low_memory", False)),
         )
 
     def should_restore_optimizer_on_load(self) -> bool:

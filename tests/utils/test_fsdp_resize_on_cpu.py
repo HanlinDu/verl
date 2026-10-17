@@ -18,7 +18,14 @@ import torch.distributed as dist
 
 import verl.utils.fsdp_resize as fsdp_resize
 from verl.utils.distributed import clear_dtensor_dispatch_caches
-from verl.utils.fsdp_resize import FSDPResizePlanner, ResizeRuntime, compute_1d_shard_range, transfer_fsdp2_runtime
+from verl.utils.fsdp_resize import (
+    FSDPResizePlanner,
+    ResizeRuntime,
+    ResizeUnit,
+    compute_1d_shard_range,
+    order_units,
+    transfer_fsdp2_runtime,
+)
 
 
 @pytest.mark.parametrize(
@@ -137,6 +144,16 @@ def test_planner_rejects_empty_or_unsorted_rank_lists(old_ranks, new_ranks):
         FSDPResizePlanner(8, old_ranks, new_ranks)
 
 
+def test_low_memory_pipeline_orders_units_to_minimise_the_peak():
+    units = [ResizeUnit("<root>", ["embed"], []), ResizeUnit("layers.0", ["a"], []), ResizeUnit("layers.1", ["b"], [])]
+    sizes = {"<root>": 100, "layers.0": 10, "layers.1": 20}
+
+    # expanding: memory falls per unit, so the smallest unit goes first (peak = old + smallest new shard)
+    assert [u.name for u in order_units(units, sizes, expanding=True)] == ["layers.0", "layers.1", "<root>"]
+    # shrinking: memory rises per unit, so the largest unit goes first (peak = new + smallest old shard)
+    assert [u.name for u in order_units(units, sizes, expanding=False)] == ["<root>", "layers.1", "layers.0"]
+
+
 @pytest.fixture
 def one_rank_world():
     """A one-rank Gloo world on CPU; nothing is left behind for other tests."""
@@ -150,10 +167,11 @@ def one_rank_world():
         clear_dtensor_dispatch_caches()
 
 
-def _plain_runtime(steps: int) -> ResizeRuntime:
+def _plain_runtime(steps: int, device: str = "cpu") -> ResizeRuntime:
     """An unsharded Linear with AdamW and an LR schedule, after ``steps`` optimizer steps."""
     torch.manual_seed(0)
-    module = torch.nn.Linear(3, 2)
+    with torch.device(device):
+        module = torch.nn.Linear(3, 2)
     optimizer = torch.optim.AdamW(module.parameters(), lr=1e-2, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0 / (1 + 0.1 * step))
     for _ in range(steps):
@@ -199,11 +217,13 @@ def test_scalar_state_is_the_training_state_that_does_not_travel_as_a_tensor():
     assert not any(path.startswith("optimizer.param_groups[0].params") for path in state)
 
 
-def test_verified_transfer_compares_the_scalar_state_of_both_sides(one_rank_transfer):
-    old, new = _plain_runtime(steps=2), _plain_runtime(steps=0)
-    expected = fsdp_resize._scalar_state(old)
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_verified_transfer_compares_the_scalar_state_of_both_sides(one_rank_transfer, pipeline):
+    old = _plain_runtime(steps=2)
+    new = _plain_runtime(steps=0, device="meta" if pipeline else "cpu")
+    expected = fsdp_resize._scalar_state(old)  # the low-memory pipeline hollows the old runtime out
 
-    stats = one_rank_transfer(old, new, verify=True)
+    stats = one_rank_transfer(old, new, verify=True, pipeline=pipeline)
 
     assert fsdp_resize._scalar_state(new) == expected
     assert stats["verified"] == 1

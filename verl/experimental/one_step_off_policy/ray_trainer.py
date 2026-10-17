@@ -870,7 +870,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
     def _resize_actor_runtime_gpu_direct(self, actor_ranks: list[int]) -> dict[str, float | str | int]:
         """Move the live actor runtime to ``actor_ranks`` shard-to-shard; no checkpoint is written or read."""
         old_ranks = self._active_actor_ranks()
-        results = self._physical_actor_rollout_wg.resize_actor_runtime(old_ranks, actor_ranks)
+        results = self._physical_actor_rollout_wg.resize_actor_runtime(
+            old_ranks, actor_ranks, low_memory=self._host_staging_config.gpu_direct_low_memory
+        )
         members = [result for result in results if result.get("status") == "member"]
         if len(members) != len(actor_ranks):
             raise RuntimeError(f"GPU-direct resize produced {len(members)} actor ranks, expected {len(actor_ranks)}")
@@ -912,7 +914,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
     def _resize_critic_runtime_gpu_direct(self, critic_ranks: list[int]) -> dict[str, float | str | int]:
         """Move the critic runtime shard-to-shard onto ``critic_ranks`` (same topology as the actor)."""
         old_ranks = self._active_actor_ranks()
-        results = self._physical_critic_wg.resize_runtime(old_ranks, critic_ranks)
+        results = self._physical_critic_wg.resize_runtime(
+            old_ranks, critic_ranks, low_memory=self._host_staging_config.gpu_direct_low_memory
+        )
         members = [result for result in results if result.get("status") == "member"]
         if len(members) != len(critic_ranks):
             raise RuntimeError(f"GPU-direct critic resize produced {len(members)} ranks, expected {len(critic_ranks)}")
