@@ -17,10 +17,12 @@
 import ast
 import asyncio
 import os
+from contextlib import contextmanager
 from enum import Enum
 from glob import glob
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -102,7 +104,12 @@ def test_separate_rollout_manager_receives_no_actor_worker_group():
     assert create.call_args.kwargs["worker_group"] is None
 
 
-def test_direct_restore_still_loads_scheduler_and_rng():
+def test_checkpoint_restore_always_loads_the_full_actor_state():
+    """The checkpoint fallback has no weights-only mode left.
+
+    GPU-direct resize never reaches this helper: optimizer state and the scheduler travel inside the
+    shard-to-shard transfer, and RNG stays with the persistent worker processes.
+    """
     cls = _load_methods(
         TRAINER,
         "OneStepOffRayTrainer",
@@ -114,10 +121,76 @@ def test_direct_restore_still_loads_scheduler_and_rng():
     trainer.actor_rollout_wg = SimpleNamespace(load_checkpoint=Mock(), load_replicated_state_for_resize=Mock())
     trainer.critic_wg = SimpleNamespace(load_checkpoint=Mock())
     trainer.use_critic = True
-    trainer._load_dynamic_resize_checkpoint("checkpoint", load_actor=False)
-    trainer.actor_rollout_wg.load_checkpoint.assert_not_called()
-    trainer.actor_rollout_wg.load_replicated_state_for_resize.assert_called_once_with("checkpoint/actor")
+    trainer._load_dynamic_resize_checkpoint("checkpoint")
+    trainer.actor_rollout_wg.load_checkpoint.assert_called_once_with("checkpoint/actor", del_local_after_load=False)
+    trainer.actor_rollout_wg.load_replicated_state_for_resize.assert_not_called()
     trainer.critic_wg.load_checkpoint.assert_called_once_with("checkpoint/critic", del_local_after_load=False)
+
+
+def test_gpu_direct_hard_switch_moves_state_without_a_checkpoint_round_trip():
+    """GPU-direct keeps the training state on the devices: nothing is saved, staged or loaded.
+
+    The previous topology stays active until the rollout weights are synchronised; the shard-to-shard
+    move reads its source ranks from it.
+    """
+
+    @contextmanager
+    def marked_timer(*_args, **_kwargs):
+        yield
+
+    cls = _load_methods(
+        TRAINER,
+        "OneStepOffRayTrainer",
+        {"_apply_dynamic_resize_hard_switch"},
+        Any=Any,
+        marked_timer=marked_timer,
+        dynamic_resize_shared_pool_enabled=lambda config: True,
+    )
+    trainer = cls()
+    trainer.config = None
+    trainer.timing_raw = {}
+    trainer.global_steps = 2
+    trainer.hybrid_engine = True
+    trainer._resize_controller = None
+    trainer._active_dynamic_resize_topology = {"actor_size": 4, "rollout_size": 4}
+    trainer._dynamic_resize_target_sizes = lambda item: (6, 2)
+    trainer._gpu_direct_actor_model_resize_enabled = lambda: True
+    checkpoint_round_trip = [
+        "_save_checkpoint",
+        "_load_dynamic_resize_checkpoint",
+        "_dynamic_resize_checkpoint_step_folder",
+        "_prepare_dynamic_resize_handoff_session",
+        "_stage_dynamic_resize_optimizer_handoff",
+        "_complete_dynamic_resize_handoff_session",
+    ]
+    for name in checkpoint_round_trip:
+        setattr(trainer, name, Mock())
+    events = []
+
+    async def destroy():
+        events.append(("destroy", dict(trainer._active_dynamic_resize_topology)))
+
+    async def rebuild(*, actor_size, rollout_size):
+        events.append(("rebuild", actor_size, rollout_size, dict(trainer._active_dynamic_resize_topology)))
+        trainer._latest_gpu_direct_resize_metrics = {"resize/gpu_direct_status": "moved"}
+
+    async def update_weights(step):
+        events.append(("update_weights", step, dict(trainer._active_dynamic_resize_topology)))
+
+    trainer._destroy_dynamic_resize_runtime = destroy
+    trainer._rebuild_hybrid_dynamic_resize_runtime = rebuild
+    trainer.checkpoint_manager = SimpleNamespace(update_weights=update_weights)
+
+    metrics = asyncio.run(trainer._apply_dynamic_resize_hard_switch(item={}, required_action="expand"))
+
+    previous = {"actor_size": 4, "rollout_size": 4}
+    assert events == [("destroy", previous), ("rebuild", 6, 2, previous), ("update_weights", 2, previous)]
+    assert trainer._active_dynamic_resize_topology == {"actor_size": 6, "rollout_size": 2}
+    for name in checkpoint_round_trip:
+        getattr(trainer, name).assert_not_called()
+    assert metrics["resize/hard_switch_success"] == 1.0
+    assert metrics["resize/gpu_direct_status"] == "moved"
+    assert (metrics["resize/active_actor_size"], metrics["resize/active_rollout_size"]) == (6.0, 2.0)
 
 
 def test_replicated_restore_uses_checkpoint_extra_without_touching_optimizer(tmp_path, monkeypatch):

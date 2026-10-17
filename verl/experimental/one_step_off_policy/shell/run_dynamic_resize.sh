@@ -117,6 +117,15 @@ print(f"VAL_FILE={shlex.quote(val)}")
 PY_CONVERT
 )"
 
+# VERL_RESIZE_VERIFY=1 selects the verification version of this launcher, anything else the plain one:
+# every gpu_direct switch compares both sides (the workers read the variable), verl logs at DEBUG level
+# and the resize metrics of every step go to ${CKPT_DIR}/resize_trace.jsonl.
+if [[ "${VERL_RESIZE_VERIFY:-}" == "1" ]]; then
+  export VERL_LOGGING_LEVEL=${VERL_LOGGING_LEVEL:-DEBUG}
+  set -- trainer.dynamic_resize.trace.enable=true \
+    trainer.dynamic_resize.trace.path="${CKPT_DIR}/resize_trace.jsonl" "$@"
+fi
+
 python3 -m verl.experimental.one_step_off_policy.main_ppo \
   --config-path=config \
   --config-name=one_step_off_ppo_trainer_dynamic_resize.yaml \

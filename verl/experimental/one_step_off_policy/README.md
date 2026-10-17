@@ -302,7 +302,8 @@ The hybrid shared-pool mode can move GPUs between rollout and training at schedu
 restarting the worker processes. See [`DYNAMIC_RESIZE.md`](DYNAMIC_RESIZE.md) for the concepts, the
 hard-switch sequence and how the result is verified; `config/one_step_off_ppo_trainer_dynamic_resize.yaml`
 is the configuration and `shell/run_dynamic_resize.sh` a single-node example (environment variables select
-model, data, pool size and the switch schedule; extra command-line arguments are forwarded to hydra).
+model, data, pool size and the switch schedule, and `VERL_RESIZE_VERIFY=1` its verification version; extra
+command-line arguments are forwarded to hydra).
 
 ## Functional Support
 

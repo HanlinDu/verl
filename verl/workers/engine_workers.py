@@ -34,13 +34,14 @@ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_data
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_device_name, get_torch_device, set_expandable_segments
+from verl.utils.device import get_device_id, get_device_name, get_torch_device, set_expandable_segments
 from verl.utils.distributed import (
     clear_dtensor_dispatch_caches,
     initialize_global_process_group_ray,
     set_numa_affinity,
 )
 from verl.utils.flops_counter import FlopsCounter
+from verl.utils.fsdp_resize import raise_if_any_failed
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.metric.utils import Metric
@@ -303,6 +304,69 @@ class TrainingWorker(Worker, DistProfilerExtension):
     def reinitialize_runtime(self):
         """Recreate model/optimizer state on the existing engine shell."""
         self.engine.initialize()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def check_gpu_direct_resize_supported(self):
+        """Raise early (at trainer init) if this engine cannot do shard-to-shard resize."""
+        self.engine.check_gpu_direct_resize_supported()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def resize_runtime(self, old_ranks: list[int], new_ranks: list[int]) -> dict:
+        """GPU-direct topology change on every physical worker.
+
+        Builds the runtime for ``new_ranks`` next to the live one (no checkpoint read), moves parameters,
+        optimizer state, buffers and scheduler shard-to-shard over NCCL, then retires the old runtime and
+        subgroup.  Ranks leaving the training group only send; ranks joining only receive.  Any failure
+        raises: there is no checkpoint fallback.
+        """
+        rank = torch.distributed.get_rank()
+        in_old, in_new = rank in old_ranks, rank in new_ranks
+        transfer_ranks = sorted(set(old_ranks) | set(new_ranks))
+        old_process_group = getattr(self.engine, "process_group", None)
+
+        # Every rank must create the groups in the same order (new_group is collective on WORLD).
+        torch.distributed.barrier()
+        new_process_group = torch.distributed.new_group(ranks=new_ranks)
+        transfer_group = torch.distributed.new_group(ranks=transfer_ranks)
+
+        stats: dict = {"rank": rank, "status": "non_member"}
+        device_module = get_torch_device()
+        device_module.reset_peak_memory_stats()
+        try:
+            # Build the target first on every joining rank, then agree group-wide that all of them succeeded
+            # before any collective of the transfer starts (a lone failure must not hang the others).
+            error = None
+            if in_new:
+                try:
+                    self.engine.prepare_resize_target(new_process_group)
+                except Exception as exc:  # noqa: BLE001
+                    error = f"rank {rank}: {type(exc).__name__}: {exc}"
+            if in_old or in_new:
+                raise_if_any_failed(error, transfer_group, torch.device(get_device_name(), get_device_id()))
+                stats.update(self.engine.transfer_resize_state(old_ranks, new_ranks, transfer_group))
+                stats["status"] = "member" if in_new else "sender"
+        except Exception:
+            self.engine.abort_resize()
+            raise
+        # Peak while old and new runtimes coexist; the main sizing constraint for larger models.
+        stats["peak_alloc_bytes"] = int(device_module.max_memory_allocated())
+        self.engine.commit_resize()
+
+        if in_old and old_process_group is not None:
+            torch.distributed.destroy_process_group(old_process_group)
+        if rank in transfer_ranks:
+            torch.distributed.destroy_process_group(transfer_group)
+        self.engine.set_process_group(new_process_group if in_new else None)
+        # Content-identical meshes recreated later would otherwise hit cached specs of the dead groups.
+        clear_dtensor_dispatch_caches()
+        if in_new:
+            self._replace_dispatch_collect_info(
+                "train",
+                {"train": self.engine.get_data_parallel_rank()},
+                {"train": self.engine.is_mp_src_rank_with_outputs()},
+            )
+        torch.distributed.barrier()
+        return stats
 
     def _postprocess_output(self, output, *, global_token_num, delta_time, forward_only, images_seqlens):
         """
@@ -687,23 +751,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.ref.destroy_process_group()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def stage_actor_model_for_resize(self, old_ranks: list[int], new_ranks: list[int]):
-        """Stage actor model shards for a GPU-direct FSDP2 resize."""
-        if self.actor is None:
-            raise RuntimeError("actor runtime shell is unavailable")
-        return self.actor.engine.stage_model_for_resize(old_ranks, new_ranks)
+    def check_gpu_direct_resize_supported(self):
+        """Raise early (at trainer init) if this worker's engines cannot do shard-to-shard resize."""
+        for worker in (self.actor, self.ref):
+            if worker is not None:
+                worker.engine.check_gpu_direct_resize_supported()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def restore_actor_model_after_resize(self):
-        """Load the staged actor shard into the rebuilt FSDP2 runtime."""
+    def resize_actor_runtime(self, old_ranks: list[int], new_ranks: list[int]) -> dict:
+        """GPU-direct resize of the actor (and, if colocated, the reference) runtime."""
         if self.actor is None:
             raise RuntimeError("actor runtime shell is unavailable")
-        return self.actor.engine.restore_staged_model_after_resize()
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def clear_staged_actor_model_resize_state(self):
-        if self.actor is not None:
-            self.actor.engine.clear_staged_model_resize_state()
+        stats = self.actor.resize_runtime(old_ranks, new_ranks)
+        self._replace_dispatch_collect_info("actor", **self.actor.get_dispatch_collect())
+        if self.ref is not None:
+            self.ref.resize_runtime(old_ranks, new_ranks)
+            self._replace_dispatch_collect_info("ref", **self.ref.get_dispatch_collect())
+        return stats
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_replicated_state_for_resize(self, local_path: str):

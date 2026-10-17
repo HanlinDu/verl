@@ -20,7 +20,7 @@ import logging
 import os
 import warnings
 from contextlib import nullcontext
-from typing import Callable, ContextManager, Optional
+from typing import Any, Callable, ContextManager, Optional
 
 import torch
 import torch.distributed
@@ -39,7 +39,6 @@ from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_id, get_device_name
-from verl.utils.fsdp_resize import restore_fsdp2_model_state, stage_fsdp2_model_state
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     FSDPModule,
@@ -117,7 +116,9 @@ class FSDPEngine(BaseEngine):
 
         self.rank = torch.distributed.get_rank()
         self.process_group = None
-        self._resize_model_state: dict[str, torch.Tensor] | None = None
+        # GPU-direct dynamic resize: runtime prepared for the next topology, see prepare_resize_target.
+        self._resize_target: dict[str, Any] | None = None
+        self._build_without_weights = False
 
         # Apply NPU patches for FSDP backend
         from .utils import apply_npu_fsdp_patches
@@ -203,74 +204,108 @@ class FSDPEngine(BaseEngine):
         gc.collect()
         aggressive_empty_cache(force_sync=True)
 
-    def stage_model_for_resize(self, old_ranks: list[int], new_ranks: list[int]) -> dict[str, int | str]:
-        """Stage this rank's target FSDP2 shard through a temporary NCCL group."""
-        import socket
-
+    # ------------------------------------------------------------------------------------------------
+    # GPU-direct dynamic resize: build the runtime for the new topology next to the live one, move the
+    # training state shard-to-shard, then swap.  See verl/utils/fsdp_resize.py for the transfer itself.
+    # ------------------------------------------------------------------------------------------------
+    def check_gpu_direct_resize_supported(self) -> None:
+        """Fail fast on configurations the shard-to-shard transfer does not cover."""
         if device_name != "cuda":
-            raise NotImplementedError("GPU-direct model resize phase 1 supports CUDA only")
+            raise NotImplementedError("GPU-direct resize supports CUDA only")
         if self.engine_config.strategy != "fsdp2":
-            raise NotImplementedError("GPU-direct model resize currently supports FSDP2 only")
+            raise NotImplementedError("GPU-direct resize supports FSDP2 only")
         if (
             self._is_lora
             or int(self.model_config.lora.get("rank", 0) or 0) > 0
             or self.model_config.lora_adapter_path is not None
         ):
-            raise NotImplementedError("GPU-direct model resize does not support LoRA")
+            raise NotImplementedError("GPU-direct resize does not support LoRA")
         if self.engine_config.ulysses_sequence_parallel_size != 1:
-            raise NotImplementedError("GPU-direct model resize does not support Ulysses sequence parallelism")
+            raise NotImplementedError("GPU-direct resize does not support Ulysses sequence parallelism")
         if self.engine_config.fsdp_size >= 0:
-            raise NotImplementedError("GPU-direct model resize currently requires fsdp_size=-1")
-        if old_ranks != list(range(len(old_ranks))) or new_ranks != list(range(len(new_ranks))):
-            raise NotImplementedError("GPU-direct model resize currently requires contiguous actor ranks from zero")
-        if len(new_ranks) <= len(old_ranks):
-            raise NotImplementedError("GPU-direct model resize phase 1 supports actor expansion only")
+            raise NotImplementedError("GPU-direct resize requires fsdp_size=-1 (one-dimensional mesh)")
+        if self._is_offload_param or self._is_offload_optimizer or self._uses_fsdp2_cpu_offload_policy:
+            raise NotImplementedError("GPU-direct resize requires parameters and optimizer state to stay on GPU")
+        if self.model_config.model_type != "language_model":
+            raise NotImplementedError("GPU-direct resize currently supports language models only")
 
-        hostnames: list[str | None] = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(hostnames, socket.gethostname())
-        if len(set(hostnames)) != 1:
-            raise NotImplementedError("GPU-direct model resize phase 1 supports a single node only")
+    def prepare_resize_target(self, process_group) -> None:
+        """Build module/optimizer/scheduler for ``process_group`` without loading weights.
 
-        global_rank = torch.distributed.get_rank()
-        transfer_ranks = sorted(set(old_ranks) | set(new_ranks))
-        torch.distributed.barrier()
-        transfer_group = torch.distributed.new_group(ranks=transfer_ranks)
+        The live runtime stays untouched; the new one is parked in ``self._resize_target`` until
+        ``commit_resize``.  Parameters are allocated on device (meta -> fully_shard -> to_empty) and are
+        filled by ``transfer_resize_state``.
+        """
+        if self._resize_target is not None:
+            raise RuntimeError("a resize target is already prepared on this rank")
+        self.check_gpu_direct_resize_supported()
+        live = {name: getattr(self, name) for name in self._RESIZE_RUNTIME_ATTRS}
+        self.process_group = process_group
+        self.device_mesh = None
+        self._build_without_weights = True
         try:
-            if global_rank not in transfer_ranks:
-                self._resize_model_state = None
-                result = {"status": "non_member", "tensor_count": 0, "staged_bytes": 0}
-            else:
-                model = self.module if global_rank in old_ranks else None
-                staged_state, stats = stage_fsdp2_model_state(
-                    model,
-                    old_ranks=old_ranks,
-                    new_ranks=new_ranks,
-                    transfer_group=transfer_group,
-                    device=torch.device(device_name, get_device_id()),
-                )
-                self._resize_model_state = staged_state
-                result = {"status": "staged" if staged_state is not None else "source_only", **stats}
-            if global_rank in transfer_ranks:
-                torch.distributed.barrier(group=transfer_group)
+            self._init_device_mesh()
+            self._build_model_optimizer()
+            self._resize_target = {name: getattr(self, name) for name in self._RESIZE_RUNTIME_ATTRS}
         finally:
-            if global_rank in transfer_ranks:
-                torch.distributed.destroy_process_group(transfer_group)
-            torch.distributed.barrier()
-        return result
+            self._build_without_weights = False
+            for name, value in live.items():
+                setattr(self, name, value)
 
-    def restore_staged_model_after_resize(self) -> dict[str, int | str]:
-        """Commit a staged local model shard into the rebuilt FSDP2 runtime."""
-        if self._resize_model_state is None:
-            raise RuntimeError("no GPU-direct model state is staged on this actor rank")
-        if self.module is None:
-            raise RuntimeError("cannot restore GPU-direct model state before rebuilding the FSDP runtime")
-        stats = restore_fsdp2_model_state(self.module, self._resize_model_state)
-        self._resize_model_state = None
+    def transfer_resize_state(self, old_ranks: list[int], new_ranks: list[int], transfer_group) -> dict:
+        """Move params / optimizer state / buffers / scheduler from the live runtime into the target."""
+        from verl.utils.fsdp_resize import ResizeRuntime, transfer_fsdp2_runtime
+
+        rank = torch.distributed.get_rank()
+        old = None
+        if rank in old_ranks:
+            if self.module is None:
+                raise RuntimeError(f"rank {rank} is an old actor rank but has no live FSDP runtime")
+            old = ResizeRuntime(module=self.module, optimizer=self.optimizer, lr_scheduler=self.lr_scheduler)
+        new = None
+        if rank in new_ranks:
+            if self._resize_target is None:
+                raise RuntimeError(f"rank {rank} is a new actor rank but has no prepared resize target")
+            new = ResizeRuntime(
+                module=self._resize_target["module"],
+                optimizer=self._resize_target["optimizer"],
+                lr_scheduler=self._resize_target["lr_scheduler"],
+            )
+        return transfer_fsdp2_runtime(
+            old=old,
+            new=new,
+            old_ranks=old_ranks,
+            new_ranks=new_ranks,
+            group=transfer_group,
+            device=torch.device(device_name, get_device_id()),
+            # Exact checksum comparison of every moved tensor; cheap, opt-in for production runs.
+            verify=os.environ.get("VERL_RESIZE_VERIFY", "0") == "1",
+        )
+
+    def commit_resize(self) -> None:
+        """Release the live runtime and install the prepared target (if this rank has one)."""
+        target = self._resize_target
+        self._resize_target = None
+        self.shutdown()
+        if target is None:
+            return
+        for name, value in target.items():
+            setattr(self, name, value)
+        self.checkpoint_manager = FSDPCheckpointManager(
+            model=self.module,
+            optimizer=self.optimizer,
+            lr_scheduler=self.lr_scheduler,
+            processing_class=self.model_config.get_processor(),
+            checkpoint_config=self.checkpoint_config,
+            trust_remote_code=self.model_config.trust_remote_code,
+            process_group=self.process_group,
+        )
         aggressive_empty_cache(force_sync=True)
-        return {"status": "restored", **stats}
 
-    def clear_staged_model_resize_state(self) -> None:
-        self._resize_model_state = None
+    def abort_resize(self) -> None:
+        """Drop a prepared target without touching the live runtime."""
+        self._resize_target = None
+        gc.collect()
         aggressive_empty_cache(force_sync=True)
 
     def is_mp_src_rank_with_outputs(self):
@@ -279,6 +314,17 @@ class FSDPEngine(BaseEngine):
         else:
             is_collect = True
         return is_collect
+
+    # Attributes that make up one runtime instance; prepare_resize_target builds a second set of them.
+    _RESIZE_RUNTIME_ATTRS = (
+        "module",
+        "optimizer",
+        "lr_scheduler",
+        "device_mesh",
+        "process_group",
+        "ulysses_device_mesh",
+        "ulysses_parallel_group",
+    )
 
     def initialize(self):
         """
@@ -352,9 +398,14 @@ class FSDPEngine(BaseEngine):
 
         torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
-        init_context = get_init_weight_context_manager(
-            use_meta_tensor=not self.model_config.hf_config.tie_word_embeddings, mesh=self.device_mesh
-        )
+        if self._build_without_weights:
+            # GPU-direct resize target: only the module structure is needed; every tensor is
+            # filled shard-to-shard from the live runtime, so skip reading the checkpoint entirely.
+            init_context = lambda: torch.device("meta")  # noqa: E731
+        else:
+            init_context = get_init_weight_context_manager(
+                use_meta_tensor=not self.model_config.hf_config.tie_word_embeddings, mesh=self.device_mesh
+            )
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -362,12 +413,19 @@ class FSDPEngine(BaseEngine):
             if self.model_config.model_type == "language_model":
                 auto_class = get_hf_auto_model_class(hf_config=self.model_config.hf_config)
 
-                module = auto_class.from_pretrained(
-                    pretrained_model_name_or_path=self.model_config.local_path,
-                    torch_dtype=torch_dtype,
-                    config=self.model_config.hf_config,
-                    trust_remote_code=self.model_config.trust_remote_code,
-                )
+                if self._build_without_weights:
+                    module = auto_class.from_config(
+                        self.model_config.hf_config,
+                        torch_dtype=torch_dtype,
+                        trust_remote_code=self.model_config.trust_remote_code,
+                    )
+                else:
+                    module = auto_class.from_pretrained(
+                        pretrained_model_name_or_path=self.model_config.local_path,
+                        torch_dtype=torch_dtype,
+                        config=self.model_config.hf_config,
+                        trust_remote_code=self.model_config.trust_remote_code,
+                    )
 
                 # Strip sub-modules listed in _verl_strip_modules (e.g.
                 # talker / code2wav for Qwen3-Omni Thinker-only training).
@@ -557,11 +615,16 @@ class FSDPEngine(BaseEngine):
                 "offload_policy": offload_policy,
                 "reshard_after_forward": self.engine_config.reshard_after_forward,
             }
-            full_state = module.state_dict()
-            apply_fsdp2(module, fsdp_kwargs, self.engine_config)
-            fsdp2_load_full_state_dict(
-                module, full_state, fsdp_mesh, offload_policy, process_group=getattr(self, "process_group", None)
-            )
+            if self._build_without_weights:
+                # Allocate only this rank's shards; contents arrive via transfer_resize_state.
+                apply_fsdp2(module, fsdp_kwargs, self.engine_config)
+                module.to_empty(device=get_device_id())
+            else:
+                full_state = module.state_dict()
+                apply_fsdp2(module, fsdp_kwargs, self.engine_config)
+                fsdp2_load_full_state_dict(
+                    module, full_state, fsdp_mesh, offload_policy, process_group=getattr(self, "process_group", None)
+                )
         else:
             raise NotImplementedError(f"Unknown strategy {self.engine_config.strategy}")
 
