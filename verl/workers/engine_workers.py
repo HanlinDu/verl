@@ -36,6 +36,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_device_name, get_torch_device, set_expandable_segments
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
+from verl.utils.dtensor_cache import clear_dtensor_dispatch_caches
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
@@ -284,12 +285,18 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def destroy_process_group(self):
-        """Destroy the engine subgroup after all engine collectives quiesce."""
+        """Destroy the engine subgroup after all engine collectives quiesce.
+
+        DTensor caches key on mesh content, which ignores the process group, so
+        a later resize that recreates an equal-content mesh can hit specs that
+        still reference the group destroyed here.
+        """
         torch.distributed.barrier()
         process_group = getattr(self.engine, "process_group", None)
         if process_group is not None:
             torch.distributed.destroy_process_group(process_group)
         self.engine.set_process_group(None)
+        clear_dtensor_dispatch_caches()
         torch.distributed.barrier()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
