@@ -17,6 +17,65 @@ import pytest
 from verl.utils.fsdp_resize import FSDPResizeOverlapPlanner, ShardOverlap, compute_1d_shard_range
 
 
+def test_stage_model_for_resize_does_not_reject_multiple_hostnames(monkeypatch):
+    import ast
+    import types
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import torch
+
+    path = Path(__file__).resolve().parents[2] / "verl/workers/engine/fsdp/transformer_impl.py"
+    source = ast.parse(path.read_text())
+    engine_class = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == "FSDPEngine")
+    engine_class = ast.ClassDef(
+        name=engine_class.name,
+        bases=[],
+        keywords=[],
+        body=[node for node in engine_class.body if getattr(node, "name", None) == "stage_model_for_resize"],
+        decorator_list=[],
+    )
+    module = types.ModuleType("_multi_node_resize_staging")
+    module.__dict__.update(
+        torch=torch,
+        device_name="cuda",
+        get_device_id=lambda: 0,
+        stage_fsdp2_model_state=lambda *args, **kwargs: ({}, {"tensor_count": 0, "staged_bytes": 0}),
+    )
+    exec(
+        compile(ast.fix_missing_locations(ast.Module(body=[engine_class], type_ignores=[])), str(path), "exec"),
+        module.__dict__,
+    )
+    engine = object.__new__(module.FSDPEngine)
+    engine.engine_config = SimpleNamespace(strategy="fsdp2", ulysses_sequence_parallel_size=1, fsdp_size=-1)
+    engine.model_config = SimpleNamespace(lora={"rank": 0}, lora_adapter_path=None)
+    engine.module = object()
+    engine._is_lora = False
+
+    def gather_hosts(values, value):
+        values[:] = ["node-a", "node-b"]
+
+    calls = []
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.distributed, "new_group", lambda **kwargs: calls.append(kwargs) or "transfer-group")
+    monkeypatch.setattr(torch.distributed, "destroy_process_group", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather_hosts)
+    result = engine.stage_model_for_resize([0], [0, 1])
+
+    assert result["status"] == "staged"
+    assert calls == [{"ranks": [0, 1]}]
+    assert engine._resize_model_state == {}
+
+
+def test_staging_regression_restores_distributed_api_spies():
+    import torch
+
+    with pytest.raises((RuntimeError, ValueError), match="Default process group has not been initialized"):
+        torch.distributed.get_world_size()
+
+
 @pytest.mark.parametrize(
     ("dim_size", "world_size", "expected"),
     [

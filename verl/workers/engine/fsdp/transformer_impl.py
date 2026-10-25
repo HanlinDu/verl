@@ -204,8 +204,7 @@ class FSDPEngine(BaseEngine):
         aggressive_empty_cache(force_sync=True)
 
     def stage_model_for_resize(self, old_ranks: list[int], new_ranks: list[int]) -> dict[str, int | str]:
-        """Stage this rank's target FSDP2 shard through a temporary NCCL group."""
-        import socket
+        """Stage target FSDP2 shards through the physical WORLD's temporary NCCL subgroup."""
 
         if device_name != "cuda":
             raise NotImplementedError("GPU-direct model resize phase 1 supports CUDA only")
@@ -226,10 +225,6 @@ class FSDPEngine(BaseEngine):
         if len(new_ranks) <= len(old_ranks):
             raise NotImplementedError("GPU-direct model resize phase 1 supports actor expansion only")
 
-        hostnames: list[str | None] = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(hostnames, socket.gethostname())
-        if len(set(hostnames)) != 1:
-            raise NotImplementedError("GPU-direct model resize phase 1 supports a single node only")
 
         global_rank = torch.distributed.get_rank()
         transfer_ranks = sorted(set(old_ranks) | set(new_ranks))
