@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Real trainer/Ray/engine acceptance: two consecutive actor expansions with a
-# weight sync between them.
+# Real trainer/Ray/engine acceptance: two consecutive actor expansions with
+# several training steps between and after them.
 #
 #   stage0 actor/rollout = 2/6   (initial split, overrides the config's 4/4)
-#   stage1 at step 2      = 4/4
-#   stage2 at step 4      = 6/2
+#   stage1 at step 2      = 4/4    -> steps 3-6 run under 4/4
+#   stage2 at step 6      = 6/2    -> steps 7-12 run under 6/2
 #
 # Both steps are expansions, because the 4d branch rejects actor shrink. The
-# run reaches step 6, so at least one weight sync happens after each resize.
+# run reaches step 12, so multiple weight syncs happen after each resize.
 # GPU execution requires approval of the enclosing command.
 set -euo pipefail
 
@@ -19,7 +19,7 @@ command=(
   --config-path=config --config-name=one_step_off_ppo_trainer_dynamic_resize.yaml
   hydra.run.dir=/results/hydra hydra.sweep.dir=/results/hydra_sweep
   data.train_files=/dataset/train.parquet data.val_files=/dataset/test.parquet
-  data.train_batch_size=96 data.train_max_samples=384 data.val_max_samples=16
+  data.train_batch_size=96 data.train_max_samples=1152 data.val_max_samples=16
   data.max_prompt_length=512 data.max_response_length=64
   data.filter_overlong_prompts=true data.truncation=error
   actor_rollout_ref.model.path=/model actor_rollout_ref.model.use_shm=false
@@ -52,7 +52,7 @@ command=(
   actor_rollout_ref.rollout.agent.num_workers=1
   actor_rollout_ref.rollout.checkpoint_engine.backend=nccl
   trainer.nnodes=1 trainer.n_gpus_per_node=2 rollout.nnodes=1 rollout.n_gpus_per_node=6
-  trainer.total_training_steps=6 trainer.total_epochs=1
+  trainer.total_training_steps=12 trainer.total_epochs=1
   trainer.save_freq=-1 trainer.test_freq=-1 trainer.val_before_train=false
   trainer.resume_mode=disable trainer.logger='[console]'
   trainer.default_local_dir=/results/checkpoints
@@ -80,7 +80,7 @@ command=(
   +trainer.dynamic_resize.schedule.stage1.rollout_pool.index=1
   '+trainer.dynamic_resize.schedule.stage1.rollout_pool.size=[4,4]'
   +trainer.dynamic_resize.schedule.stage1.release_old=false
-  +trainer.dynamic_resize.schedule.stage2.step=4
+  +trainer.dynamic_resize.schedule.stage2.step=6
   +trainer.dynamic_resize.schedule.stage2.actor_pool.mode=split
   +trainer.dynamic_resize.schedule.stage2.actor_pool.from_pool=shared_pool
   +trainer.dynamic_resize.schedule.stage2.actor_pool.index=0
