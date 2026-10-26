@@ -17,6 +17,7 @@
 import ast
 import asyncio
 import os
+import time
 from contextlib import contextmanager
 from enum import Enum
 from glob import glob
@@ -143,6 +144,7 @@ def test_gpu_direct_hard_switch_moves_state_without_a_checkpoint_round_trip():
         "OneStepOffRayTrainer",
         {"_apply_dynamic_resize_hard_switch"},
         Any=Any,
+        time=time,
         marked_timer=marked_timer,
         dynamic_resize_shared_pool_enabled=lambda config: True,
     )
@@ -167,12 +169,13 @@ def test_gpu_direct_hard_switch_moves_state_without_a_checkpoint_round_trip():
         setattr(trainer, name, Mock())
     events = []
 
-    async def destroy():
-        events.append(("destroy", dict(trainer._active_dynamic_resize_topology)))
+    async def destroy(*, actor_target):
+        events.append(("destroy", actor_target, dict(trainer._active_dynamic_resize_topology)))
 
     async def rebuild(*, actor_size, rollout_size):
         events.append(("rebuild", actor_size, rollout_size, dict(trainer._active_dynamic_resize_topology)))
         trainer._latest_gpu_direct_resize_metrics = {"resize/gpu_direct_status": "moved"}
+        trainer._latest_rollout_rebuild_metrics = {"resize/rollout_replicas_kept": 1.0}
 
     async def update_weights(step):
         events.append(("update_weights", step, dict(trainer._active_dynamic_resize_topology)))
@@ -184,12 +187,13 @@ def test_gpu_direct_hard_switch_moves_state_without_a_checkpoint_round_trip():
     metrics = asyncio.run(trainer._apply_dynamic_resize_hard_switch(item={}, required_action="expand"))
 
     previous = {"actor_size": 4, "rollout_size": 4}
-    assert events == [("destroy", previous), ("rebuild", 6, 2, previous), ("update_weights", 2, previous)]
+    assert events == [("destroy", 6, previous), ("rebuild", 6, 2, previous), ("update_weights", 2, previous)]
     assert trainer._active_dynamic_resize_topology == {"actor_size": 6, "rollout_size": 2}
     for name in checkpoint_round_trip:
         getattr(trainer, name).assert_not_called()
     assert metrics["resize/hard_switch_success"] == 1.0
     assert metrics["resize/gpu_direct_status"] == "moved"
+    assert metrics["resize/rollout_replicas_kept"] == 1.0
     assert (metrics["resize/active_actor_size"], metrics["resize/active_rollout_size"]) == (6.0, 2.0)
 
 

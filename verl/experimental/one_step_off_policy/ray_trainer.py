@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from contextlib import nullcontext
 from pprint import pprint
@@ -286,6 +287,11 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/gpu_direct_self_copy_bytes": 0.0,
             "resize/gpu_direct_transfer_seconds": 0.0,
             "resize/gpu_direct_peak_alloc_bytes": 0.0,
+            "resize/rollout_replicas_kept": 0.0,
+            "resize/rollout_replicas_retired": 0.0,
+            "resize/rollout_replicas_launched": 0.0,
+            "resize/rollout_rebuild_seconds": 0.0,
+            "resize/hard_switch_seconds": 0.0,
         }
 
     def _build_resize_control_metrics(self, snapshot: dict[str, float | str | int]) -> dict[str, float | str | int]:
@@ -969,12 +975,13 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             except Exception as exc:
                 logger.debug("[one-step-off][resize] ignoring Ray actor kill failure: %s", exc)
 
-    async def _destroy_dynamic_resize_runtime(self) -> None:
+    async def _destroy_dynamic_resize_runtime(self, *, actor_target: int | None = None) -> None:
         checkpoint_manager = getattr(self, "checkpoint_manager", None)
         if checkpoint_manager is not None:
             try:
                 await checkpoint_manager.abort_replicas()
-                await checkpoint_manager.sleep_replicas()
+                if not self.hybrid_engine:
+                    await checkpoint_manager.sleep_replicas()
             except Exception as exc:
                 raise RuntimeError("Cannot resize before rollout replicas are quiescent") from exc
 
@@ -983,6 +990,16 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             self._kill_ray_actors(getattr(async_rollout_manager, "agent_loop_workers", []))
 
         llm_server_manager = getattr(self, "llm_server_manager", None)
+        self._latest_rollout_rebuild_metrics = {}
+        if llm_server_manager is not None and self.hybrid_engine and actor_target is not None:
+            # Hybrid: only the replicas whose GPUs become training ranks go away, and they go away now so
+            # the training side finds the memory free. The remaining replicas keep their engines, weights
+            # and KV cache (they are paused by abort_replicas and resumed by the final update_weights).
+            retired = await llm_server_manager.retire_hybrid_replicas_below(actor_target)
+            if retired:
+                logger.info("[one-step-off][resize] retired rollout replicas %s ahead of the training rebuild", retired)
+            self._latest_rollout_rebuild_metrics["resize/rollout_replicas_retired"] = float(len(retired))
+
         if llm_server_manager is not None:
             if not self.hybrid_engine:
                 for replica in getattr(llm_server_manager, "rollout_replicas", []) or []:
@@ -1140,10 +1157,23 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         )
         self._set_hybrid_rollout_subgroup(actor_size=actor_size)
         physical_worker_group.reset_rollout_server_handle()
-        await self.llm_server_manager.rebuild_hybrid_runtime(
+        rollout_rebuild_start = time.perf_counter()
+        rebuild = await self.llm_server_manager.rebuild_hybrid_runtime(
             self._runtime_rollout_worker_group,
             start_rank=actor_size // rollout_world_size,
         )
+        rollout_metrics = getattr(self, "_latest_rollout_rebuild_metrics", None) or {}
+        rollout_metrics.update(
+            {
+                "resize/rollout_replicas_kept": float(len(rebuild.get("kept", []))),
+                "resize/rollout_replicas_launched": float(len(rebuild.get("launched", []))),
+                "resize/rollout_replicas_retired": float(
+                    rollout_metrics.get("resize/rollout_replicas_retired", 0.0) + len(rebuild.get("retired", []))
+                ),
+                "resize/rollout_rebuild_seconds": time.perf_counter() - rollout_rebuild_start,
+            }
+        )
+        self._latest_rollout_rebuild_metrics = rollout_metrics
         self._init_agent_loop_manager()
         self._refresh_dynamic_resize_checkpoint_group_name()
         checkpoint_engine_config = self.config.actor_rollout_ref.rollout.checkpoint_engine
@@ -1185,6 +1215,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             metrics.update({"resize/unsupported_reason": reason, "resize/pending_resource_switch": 1.0})
             return metrics
 
+        switch_start = time.perf_counter()
         gpu_direct = self._gpu_direct_actor_model_resize_enabled()
         if gpu_direct:
             # The training state moves GPU-to-GPU inside the rebuild; nothing is written to or read from
@@ -1199,7 +1230,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 optimizer_stage_metrics = self._stage_dynamic_resize_optimizer_handoff(checkpoint_step_folder)
                 metrics.update(optimizer_stage_metrics)
 
-        await self._destroy_dynamic_resize_runtime()
+        await self._destroy_dynamic_resize_runtime(actor_target=actor_target)
 
         with marked_timer("dynamic_resize_rebuild_runtime", self.timing_raw, color="green"):
             self._latest_gpu_direct_resize_metrics = {}
@@ -1230,8 +1261,11 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             await self.checkpoint_manager.update_weights(self.global_steps)
 
         self._active_dynamic_resize_topology = {"actor_size": actor_target, "rollout_size": rollout_target}
+        # After the handoff-session metrics, which carry defaults for these keys.
+        metrics.update(getattr(self, "_latest_rollout_rebuild_metrics", None) or {})
         metrics.update(
             {
+                "resize/hard_switch_seconds": time.perf_counter() - switch_start,
                 "resize/schedule_applied": 1.0,
                 "resize/pending_resource_switch": 0.0,
                 "resize/hard_switch_success": 1.0,
