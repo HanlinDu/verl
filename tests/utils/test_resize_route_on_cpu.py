@@ -44,6 +44,13 @@ def test_cross_node_accepts_mixed_intra_node_p2p_and_rdma():
     assert "mixed" in reason
 
 
+def test_cross_node_with_only_intra_node_p2p_is_unknown():
+    """No inter-node link observed: do not claim the payload crossed hosts."""
+    verdict, reason = route_verdict(["P2P/CUMEM"], cross_node=True)
+    assert verdict == UNKNOWN
+    assert "no inter-node payload evidence" in reason
+
+
 def test_cross_node_rejects_host_socket_fallback():
     verdict, reason = route_verdict(["NET/Socket"], cross_node=True)
     assert verdict == FAIL

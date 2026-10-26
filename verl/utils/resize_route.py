@@ -75,9 +75,15 @@ def route_verdict(transports: list[str], *, cross_node: bool) -> tuple[str, str]
             return FAIL, f"cross-node transfer fell back to host transport: {sorted(set(cross_node_bad_net))}"
         if bad_shm:
             return FAIL, f"cross-node transfer used shared memory: {sorted(set(bad_shm))}"
-        if all(kind == "net_rdma" for kind in kinds):
+        rdma = [token for token, kind in zip(transports, kinds, strict=True) if kind == "net_rdma"]
+        p2p = [token for token, kind in zip(transports, kinds, strict=True) if kind == "p2p"]
+        if rdma and p2p:
+            return PASS, "mixed intra-node P2P and cross-node RDMA transport"
+        if rdma:
             return PASS, "cross-node transfer used RDMA transport"
-        return PASS, "mixed intra-node P2P and cross-node RDMA transport"
+        # A cross-node pool that only ever shows intra-node links gives no
+        # evidence that payload crossed hosts; do not call that a pass.
+        return UNKNOWN, "cross-node pool but only intra-node P2P observed; no inter-node payload evidence"
     if bad_shm:
         return FAIL, f"single-node transfer used shared memory: {sorted(set(bad_shm))}"
     if single_node_bad_net:
