@@ -64,6 +64,11 @@ trainer:
       # Move one FSDP2 unit (decoder layer) at a time: peak device memory max(old, new) + one unit instead
       # of old + new shards. Same communication; relies on FSDP2 internals, so off by default.
       gpu_direct_low_memory: false
+      # Hybrid resize: one vLLM replica per GPU pair is launched at start-up (before the training runtimes,
+      # so the actor GPUs are still empty); replicas on training GPUs sleep (weights + KV cache freed,
+      # processes and NCCL communicators kept) and a switch only sleeps / wakes them in seconds. Leaves ~1 GB
+      # of CUDA context per training GPU; set false to launch / kill replicas per switch instead.
+      dormant_rollout_replicas: true
       chunk_mb: 256
       stage_optimizer: false
       optimizer_restore_policy: deferred

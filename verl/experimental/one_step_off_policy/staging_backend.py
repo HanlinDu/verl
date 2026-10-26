@@ -49,6 +49,10 @@ class HostStagingConfig:
     # gpu_direct only: move one FSDP2 unit at a time so the peak is max(old, new) + one unit instead
     # of old + new shards. Touches FSDP2 internals; keep off unless memory is tight.
     gpu_direct_low_memory: bool = False
+    # Hybrid resize: launch one vLLM replica per GPU pair at start-up and keep the ones on training GPUs asleep
+    # (weights + KV cache freed, server processes and communicators kept), so a switch only sleeps / wakes
+    # replicas instead of killing / relaunching them. Costs about a CUDA context (~1 GB) per training GPU.
+    dormant_rollout_replicas: bool = True
 
     @classmethod
     def from_dict(cls, cfg: dict[str, Any] | None) -> HostStagingConfig:
@@ -71,6 +75,7 @@ class HostStagingConfig:
             cleanup_after_load=bool(cfg.get("cleanup_after_load", True)),
             preclear_rollout_kv_cache=bool(cfg.get("preclear_rollout_kv_cache", True)),
             gpu_direct_low_memory=bool(cfg.get("gpu_direct_low_memory", False)),
+            dormant_rollout_replicas=bool(cfg.get("dormant_rollout_replicas", True)),
         )
 
     def should_restore_optimizer_on_load(self) -> bool:

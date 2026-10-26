@@ -289,6 +289,8 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/gpu_direct_peak_alloc_bytes": 0.0,
             "resize/rollout_replicas_kept": 0.0,
             "resize/rollout_replicas_retired": 0.0,
+            "resize/rollout_replicas_slept": 0.0,
+            "resize/rollout_replicas_woken": 0.0,
             "resize/rollout_replicas_launched": 0.0,
             "resize/rollout_rebuild_seconds": 0.0,
             "resize/hard_switch_seconds": 0.0,
@@ -993,12 +995,20 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         self._latest_rollout_rebuild_metrics = {}
         if llm_server_manager is not None and self.hybrid_engine and actor_target is not None:
             # Hybrid: only the replicas whose GPUs become training ranks go away, and they go away now so
-            # the training side finds the memory free. The remaining replicas keep their engines, weights
-            # and KV cache (they are paused by abort_replicas and resumed by the final update_weights).
-            retired = await llm_server_manager.retire_hybrid_replicas_below(actor_target)
-            if retired:
-                logger.info("[one-step-off][resize] retired rollout replicas %s ahead of the training rebuild", retired)
-            self._latest_rollout_rebuild_metrics["resize/rollout_replicas_retired"] = float(len(retired))
+            # the training side finds the memory free -- killed, or (dormant_rollout_replicas) put to sleep so
+            # they can be woken instead of relaunched when the GPUs come back. The remaining replicas keep
+            # their engines, weights and KV cache (paused by abort_replicas, resumed by the final update_weights).
+            retired = await llm_server_manager.retire_hybrid_replicas_below(
+                actor_target, dormant=self._host_staging_config.dormant_rollout_replicas
+            )
+            if retired["shutdown"] or retired["slept"]:
+                logger.info(
+                    "[one-step-off][resize] rollout replicas ahead of the training rebuild: shut down %s, parked %s",
+                    retired["shutdown"],
+                    retired["slept"],
+                )
+            self._latest_rollout_rebuild_metrics["resize/rollout_replicas_retired"] = float(len(retired["shutdown"]))
+            self._latest_rollout_rebuild_metrics["resize/rollout_replicas_slept"] = float(len(retired["slept"]))
 
         if llm_server_manager is not None:
             if not self.hybrid_engine:
@@ -1166,6 +1176,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         rollout_metrics.update(
             {
                 "resize/rollout_replicas_kept": float(len(rebuild.get("kept", []))),
+                "resize/rollout_replicas_woken": float(len(rebuild.get("woken", []))),
                 "resize/rollout_replicas_launched": float(len(rebuild.get("launched", []))),
                 "resize/rollout_replicas_retired": float(
                     rollout_metrics.get("resize/rollout_replicas_retired", 0.0) + len(rebuild.get("retired", []))
@@ -1408,11 +1419,14 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         if dynamic_resize_shared_pool_enabled(self.config) and self.hybrid_engine:
             topology = self.resource_pool_manager.dynamic_resize_topology
             self._physical_actor_rollout_wg = self.all_wg[str(self.actor_role)]  # needed by the split check
-            self._validate_hybrid_split(
+            rollout_world_size = self._validate_hybrid_split(
                 actor_size=topology.initial_actor_size,
                 rollout_size=topology.initial_rollout_size,
             )
             initial_actor_ranks = list(range(topology.initial_actor_size))
+            # Before any training runtime exists: vLLM sizes its memory budget against the free memory it
+            # sees at start-up, so the replicas on the initial actor GPUs can only be launched now.
+            self._prelaunch_hybrid_rollout_pool(dormant_below=topology.initial_actor_size // rollout_world_size)
 
         if self.use_critic:
             self.critic_wg = self.all_wg[str(Role.Critic)]
@@ -1486,14 +1500,38 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             )
             rollout_start_rank = int(active_topology["actor_size"]) // rollout_world_size
 
-        self.llm_server_manager = LLMServerManager.create(
-            config=self.config,
-            worker_group=rollout_worker_group,
-            rollout_resource_pool=getattr(self, "_dynamic_resize_rollout_resource_pool", None),
-            start_rank=rollout_start_rank,
-        )
+        prelaunched = getattr(self, "_prelaunched_llm_server_manager", None)
+        if prelaunched is not None:
+            self.llm_server_manager = prelaunched
+            self._prelaunched_llm_server_manager = None
+        else:
+            self.llm_server_manager = LLMServerManager.create(
+                config=self.config,
+                worker_group=rollout_worker_group,
+                rollout_resource_pool=getattr(self, "_dynamic_resize_rollout_resource_pool", None),
+                start_rank=rollout_start_rank,
+            )
         self.async_rollout_mode = True
         self._init_agent_loop_manager()
+
+    def _prelaunch_hybrid_rollout_pool(self, *, dormant_below: int) -> None:
+        """Launch one vLLM replica on every GPU pair of the shared pool, parking those on the actor GPUs.
+
+        With ``handoff.dormant_rollout_replicas`` every pair gets its replica once, at start-up: the ones on
+        the initial actor GPUs (``replica_rank < dormant_below``) go to sleep right away and are woken by the
+        first switch that hands their GPUs to rollout, so no switch ever launches a replica. Launching all
+        pairs concurrently costs the same wall time as launching the rollout pairs alone.
+        ``_init_async_rollout_manager`` adopts the manager built here.
+        """
+        self._prelaunched_llm_server_manager = None
+        if not self._host_staging_config.dormant_rollout_replicas:
+            return
+        self._prelaunched_llm_server_manager = LLMServerManager.create(
+            config=self.config,
+            worker_group=self._physical_actor_rollout_wg,
+            rollout_resource_pool=getattr(self, "_dynamic_resize_rollout_resource_pool", None),
+            dormant_below=dormant_below,
+        )
 
     def _init_agent_loop_manager(self):
         """Create agent-loop workers for the current rollout server client."""

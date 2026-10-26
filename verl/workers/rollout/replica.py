@@ -271,8 +271,15 @@ class RolloutReplica(ABC):
         """Wake up each rollout server."""
         await asyncio.gather(*[server.wake_up.remote() for server in self.servers])
 
-    async def sleep(self):
-        """Sleep each rollout server."""
+    async def sleep(self, force: bool = False):
+        """Sleep each rollout server.
+
+        ``force`` frees the memory even when ``free_cache_engine`` is off (dynamic resize parks a replica whose
+        GPUs become training ranks); backends that cannot do that must say so instead of silently keeping the
+        memory.
+        """
+        if force:
+            raise NotImplementedError(f"{type(self).__name__} cannot sleep with free_cache_engine=False")
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
 
     async def abort_all_requests(self):
