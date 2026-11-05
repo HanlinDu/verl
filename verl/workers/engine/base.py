@@ -43,6 +43,21 @@ class BaseEngine:
         """
         raise NotImplementedError
 
+    def shutdown(self):
+        """Release model execution state while keeping the engine shell alive.
+
+        Distributed process groups are owned by the runtime coordinator and are
+        intentionally not destroyed here. All ranks must quiesce before those
+        groups can be rebuilt for a new topology.
+        """
+        for name in ("module", "optimizer", "lr_scheduler", "checkpoint_manager"):
+            if hasattr(self, name):
+                setattr(self, name, None)
+
+    def set_process_group(self, process_group):
+        """Set the runtime process group used by a rebuildable engine."""
+        self.process_group = process_group
+
     @property
     @abstractmethod
     def is_param_offload_enabled(self) -> bool:
