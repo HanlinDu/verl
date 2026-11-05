@@ -36,6 +36,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_device_name, get_torch_device, set_expandable_segments
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
+from verl.utils.dtensor_cache import clear_dtensor_dispatch_caches
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
@@ -253,6 +254,54 @@ class TrainingWorker(Worker, DistProfilerExtension):
         Reset the model engine to the initial state. If the engine is not initialized,
         we initialize it. Otherwise, reload ckpt and reset states
         """
+        self.engine.initialize()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def shutdown_runtime(self):
+        """Release the engine runtime while keeping this worker object alive."""
+        self.engine.shutdown()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def prepare_process_group(self, ranks: list[int]):
+        """Create an engine subgroup on every physical worker.
+
+        ``new_group`` must be called in the same order by every member of the
+        existing global group, including ranks that are not in ``ranks``.
+        """
+        # The previous runtime may have issued collectives on WORLD. Ensure
+        # every physical worker has reached this transition before creating a
+        # new communicator in a deterministic order.
+        torch.distributed.barrier()
+        process_group = torch.distributed.new_group(ranks=ranks)
+        is_member = torch.distributed.get_rank() in ranks
+        self.engine.set_process_group(process_group if is_member else None)
+        if is_member:
+            self._replace_dispatch_collect_info(
+                "train",
+                {"train": self.engine.get_data_parallel_rank()},
+                {"train": self.engine.is_mp_src_rank_with_outputs()},
+            )
+        return is_member
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def destroy_process_group(self):
+        """Destroy the engine subgroup after all engine collectives quiesce.
+
+        DTensor caches key on mesh content, which ignores the process group, so
+        a later resize that recreates an equal-content mesh can hit specs that
+        still reference the group destroyed here.
+        """
+        torch.distributed.barrier()
+        process_group = getattr(self.engine, "process_group", None)
+        if process_group is not None:
+            torch.distributed.destroy_process_group(process_group)
+        self.engine.set_process_group(None)
+        clear_dtensor_dispatch_caches()
+        torch.distributed.barrier()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reinitialize_runtime(self):
+        """Recreate model/optimizer state on the existing engine shell."""
         self.engine.initialize()
 
     def _postprocess_output(self, output, *, global_token_num, delta_time, forward_only, images_seqlens):
@@ -600,6 +649,137 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.actor.to(device=device, model=model, optimizer=optimizer, grad=grad)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def shutdown_actor_runtime(self):
+        """Release actor engine state without destroying this hybrid worker."""
+        if self.actor is not None:
+            self.actor.shutdown_runtime()
+        if self.ref is not None:
+            self.ref.shutdown_runtime()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reinitialize_actor_runtime(self):
+        """Recreate actor engine state on this hybrid worker."""
+        if self.actor is not None:
+            self.actor.reinitialize_runtime()
+            dispatch_collect = self.actor.get_dispatch_collect()
+            self._replace_dispatch_collect_info("actor", **dispatch_collect)
+        if self.ref is not None:
+            self.ref.reinitialize_runtime()
+            dispatch_collect = self.ref.get_dispatch_collect()
+            self._replace_dispatch_collect_info("ref", **dispatch_collect)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def prepare_actor_process_group(self, ranks: list[int]):
+        """Create the actor subgroup on every hybrid worker."""
+        is_member = False
+        if self.actor is not None:
+            is_member = self.actor.prepare_process_group(ranks)
+        if self.ref is not None:
+            self.ref.prepare_process_group(ranks)
+        return is_member
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def destroy_actor_process_group(self):
+        """Destroy the actor subgroup after actor runtime shutdown."""
+        if self.actor is not None:
+            self.actor.destroy_process_group()
+        if self.ref is not None:
+            self.ref.destroy_process_group()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def stage_actor_model_for_resize(self, old_ranks: list[int], new_ranks: list[int]):
+        """Stage actor model shards for a GPU-direct FSDP2 resize."""
+        if self.actor is None:
+            raise RuntimeError("actor runtime shell is unavailable")
+        return self.actor.engine.stage_model_for_resize(old_ranks, new_ranks)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def restore_actor_model_after_resize(self):
+        """Load the staged actor shard into the rebuilt FSDP2 runtime."""
+        if self.actor is None:
+            raise RuntimeError("actor runtime shell is unavailable")
+        return self.actor.engine.restore_staged_model_after_resize()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def clear_staged_actor_model_resize_state(self):
+        if self.actor is not None:
+            self.actor.engine.clear_staged_model_resize_state()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_replicated_state_for_resize(self, local_path: str):
+        """Restore scheduler and RNG after a weights-only direct model handoff."""
+        self.actor.engine.checkpoint_manager.load_replicated_state(local_path)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reconfigure_checkpoint_engine(self, group_name: str | None = None, rebuild_group: bool = True):
+        """Recreate checkpoint-engine state without replacing this Ray worker.
+
+        The checkpoint communication topology is owned by the checkpoint
+        engine, rather than by the actor/FSDP engine.  A hybrid worker can
+        therefore keep its Ray actor and model worker shells while replacing
+        this small runtime object when a resize changes the actor/rollout
+        split.  Model parameters and optimizer state are intentionally not
+        handled here.
+        """
+        if not hasattr(self, "checkpoint_engine"):
+            raise RuntimeError("checkpoint engine is not initialized on this hybrid worker")
+
+        old_engine = self.checkpoint_engine
+        if hasattr(old_engine, "rebuild_group"):
+            # Make finalize release a backend communicator that was created
+            # with the previous topology, even when the original config used
+            # rebuild_group=False for steady-state training.
+            old_engine.rebuild_group = True
+        try:
+            old_engine.finalize()
+        except NotImplementedError:
+            # The colocated ``naive`` backend has no communication group to
+            # tear down.  Other backends use finalize() to release their old
+            # communicator and temporary buffers.
+            pass
+        finally:
+            backend = self.config.rollout.checkpoint_engine.backend
+            bucket_size = self.config.rollout.checkpoint_engine.update_weights_bucket_megabytes << 20
+            engine_kwargs = dict(self.config.rollout.checkpoint_engine.engine_kwargs.get(backend, {}))
+            if group_name is not None and hasattr(old_engine, "group_name"):
+                engine_kwargs["group_name"] = group_name
+            if hasattr(old_engine, "rebuild_group"):
+                engine_kwargs["rebuild_group"] = rebuild_group
+            import_external_libs(self.config.rollout.checkpoint_engine.custom_backend_module or None)
+            self.checkpoint_engine = CheckpointEngineRegistry.new(
+                backend,
+                is_master=(torch.distributed.get_rank() == 0),
+                bucket_size=bucket_size,
+                **engine_kwargs,
+            )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def release_rollout_runtime(self):
+        """Release rollout weights/KV cache while keeping its server handle."""
+        if self.rollout is not None:
+            await self.rollout.release()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def resume_rollout_runtime(self):
+        """Resume rollout weights/KV cache after a runtime transition."""
+        if self.rollout is not None:
+            await self.rollout.resume(tags=["weights", "kv_cache"])
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reset_rollout_server_handle(self):
+        """Forget server handles invalidated by a rollout topology rebuild.
+
+        The rollout adapter remains resident in the hybrid worker, but its
+        HTTP/RPC handle belongs to the server actors that are being replaced.
+        Adapters lazily resolve the handle again on the next operation.
+        """
+        if self.rollout is None:
+            return
+        for attribute in ("server_handle", "server_actor", "_engine"):
+            if hasattr(self.rollout, attribute):
+                setattr(self.rollout, attribute, None)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
 
@@ -810,6 +990,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                   transfer via checkpoint engine, suitable for disaggregated
                   trainer/rollout deployments.
         """
+
+        if mode == "receive":
+            weights = self.checkpoint_engine.receive_weights(global_steps=global_steps)
+            await self.rollout.update_weights(weights, global_steps=global_steps)
+            return
 
         # Resolve mode: "auto" falls back to config, explicit values take precedence
         effective_mode = mode if mode != "auto" else self.config.rollout.checkpoint_engine.backend

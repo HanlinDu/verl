@@ -1,3 +1,17 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Simplified memory budget protection for dynamic resize."""
 
 from __future__ import annotations
@@ -11,7 +25,7 @@ class ResizeBudgetConfig:
     memory_budget_ratio: float = 0.85
 
     @classmethod
-    def from_dict(cls, cfg: dict | None) -> "ResizeBudgetConfig":
+    def from_dict(cls, cfg: dict | None) -> ResizeBudgetConfig:
         cfg = cfg or {}
         ratio = float(cfg.get("memory_budget_ratio", 0.85))
         return cls(enable=bool(cfg.get("enable", False)), memory_budget_ratio=min(max(ratio, 0.1), 0.99))
@@ -24,7 +38,7 @@ class ResizeBudgetSnapshot:
     gpu_free_bytes: int | None = None
 
     @classmethod
-    def from_dict(cls, data: dict | None) -> "ResizeBudgetSnapshot":
+    def from_dict(cls, data: dict | None) -> ResizeBudgetSnapshot:
         data = data or {}
         return cls(
             host_free_bytes=_to_optional_int(data.get("host_free_bytes")),

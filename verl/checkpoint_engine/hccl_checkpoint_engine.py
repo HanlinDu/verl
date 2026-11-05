@@ -141,7 +141,8 @@ class HCCLCheckpointEngine(CheckpointEngine):
     def finalize(self):
         """Destroy the HCCL process group if rebuild_group is True."""
         if self.rebuild_group:
-            if self.rank >= 0:
+            rank = getattr(self, "rank", None)
+            if rank is not None and rank >= 0:
                 self.pyhccl.destroyComm(self.pyhccl.comm)
                 self.pyhccl = None
             self.rank = None

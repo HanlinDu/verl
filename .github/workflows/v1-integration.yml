@@ -1,0 +1,74 @@
+name: v1 integration
+
+on:
+  pull_request:
+  push:
+    branches: [v1]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v1-integration-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  base-policy:
+    if: github.repository == 'HanlinDu/verl'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require v1 as the integration target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [[ "$EVENT_NAME" == pull_request && "$BASE_REF" != v1 ]]; then
+            echo 'Research integration pull requests must target v1.' >&2
+            exit 1
+          fi
+
+  cpu:
+    if: github.repository == 'HanlinDu/verl'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.12'
+      - name: Prepare CPU environment with uv
+        run: |
+          python -m pip install uv==0.9.5
+          uv venv --python 3.12
+          uv pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
+          uv pip install pytest pytest-asyncio hydra-core numpy packaging \
+            tensordict==0.10.0 transformers==4.57.1 ray==2.49.2 psutil
+      - name: Run migration regression suites
+        run: |
+          .venv/bin/python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          tests = [
+              'tests/utils/test_fsdp_resize_on_cpu.py',
+              'tests/utils/test_fsdp_load_scope_on_cpu.py',
+              'tests/experimental/one_step_off_policy/test_dynamic_resize_migration_on_cpu.py',
+          ]
+          follow_up = [
+              'tests/utils/test_resize_route_on_cpu.py',
+              'tests/workers/test_engine_lazy_import_on_cpu.py',
+              'tests/workers/test_engine_resize_teardown_on_cpu.py',
+              'tests/checkpoint_engine/test_nccl_finalize_idempotent_on_cpu.py',
+              'tests/checkpoint_engine/test_hccl_finalize_idempotent_on_cpu.py',
+              'tests/special_distributed/test_dtensor_cache_invalidation_on_cpu.py',
+              'tests/special_distributed/test_analyze_two_resize_trace_on_cpu.py',
+          ]
+          tests.extend(path for path in follow_up if Path(path).is_file())
+          subprocess.run([sys.executable, '-m', 'pytest', '-q', *tests], check=True)
+          PY
+      - name: Verify two local Gloo DTensor transfers
+        run: |
+          PYTHONPATH=. .venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=4 \
+            tests/special_distributed/run_fsdp2_resize_transfer_on_cpu.py

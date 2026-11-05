@@ -39,6 +39,7 @@ from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_id, get_device_name
+from verl.utils.fsdp_resize import restore_fsdp2_model_state, stage_fsdp2_model_state
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     FSDPModule,
@@ -59,6 +60,7 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_optimizer,
     replace_lora_wrapper,
 )
+from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.torch_functional import logprobs_from_logits
@@ -114,6 +116,8 @@ class FSDPEngine(BaseEngine):
         self.mode = None
 
         self.rank = torch.distributed.get_rank()
+        self.process_group = None
+        self._resize_model_state: dict[str, torch.Tensor] | None = None
 
         # Apply NPU patches for FSDP backend
         from .utils import apply_npu_fsdp_patches
@@ -173,6 +177,96 @@ class FSDPEngine(BaseEngine):
     def is_optimizer_offload_enabled(self) -> bool:
         return self._is_offload_optimizer
 
+    def shutdown(self):
+        """Release the FSDP model runtime without touching distributed groups.
+
+        The process-group/device-mesh teardown must be coordinated across all
+        workers by the resize controller. Keeping that responsibility outside
+        the engine prevents one rank from destroying a collective while other
+        ranks are still using it.
+        """
+        module = getattr(self, "module", None)
+        optimizer = getattr(self, "optimizer", None)
+        if optimizer is not None:
+            optimizer.zero_grad(set_to_none=True)
+
+        self.module = None
+        self.optimizer = None
+        self.lr_scheduler = None
+        self.checkpoint_manager = None
+        self.ulysses_device_mesh = None
+        self.ulysses_parallel_group = None
+        self.device_mesh = None
+
+        del module
+        del optimizer
+        gc.collect()
+        aggressive_empty_cache(force_sync=True)
+
+    def stage_model_for_resize(self, old_ranks: list[int], new_ranks: list[int]) -> dict[str, int | str]:
+        """Stage target FSDP2 shards through the physical WORLD's temporary NCCL subgroup."""
+
+        if device_name != "cuda":
+            raise NotImplementedError("GPU-direct model resize phase 1 supports CUDA only")
+        if self.engine_config.strategy != "fsdp2":
+            raise NotImplementedError("GPU-direct model resize currently supports FSDP2 only")
+        if (
+            self._is_lora
+            or int(self.model_config.lora.get("rank", 0) or 0) > 0
+            or self.model_config.lora_adapter_path is not None
+        ):
+            raise NotImplementedError("GPU-direct model resize does not support LoRA")
+        if self.engine_config.ulysses_sequence_parallel_size != 1:
+            raise NotImplementedError("GPU-direct model resize does not support Ulysses sequence parallelism")
+        if self.engine_config.fsdp_size >= 0:
+            raise NotImplementedError("GPU-direct model resize currently requires fsdp_size=-1")
+        if old_ranks != list(range(len(old_ranks))) or new_ranks != list(range(len(new_ranks))):
+            raise NotImplementedError("GPU-direct model resize currently requires contiguous actor ranks from zero")
+        if len(new_ranks) <= len(old_ranks):
+            raise NotImplementedError("GPU-direct model resize phase 1 supports actor expansion only")
+
+        global_rank = torch.distributed.get_rank()
+        transfer_ranks = sorted(set(old_ranks) | set(new_ranks))
+        torch.distributed.barrier()
+        transfer_group = torch.distributed.new_group(ranks=transfer_ranks)
+        try:
+            if global_rank not in transfer_ranks:
+                self._resize_model_state = None
+                result = {"status": "non_member", "tensor_count": 0, "staged_bytes": 0}
+            else:
+                model = self.module if global_rank in old_ranks else None
+                staged_state, stats = stage_fsdp2_model_state(
+                    model,
+                    old_ranks=old_ranks,
+                    new_ranks=new_ranks,
+                    transfer_group=transfer_group,
+                    device=torch.device(device_name, get_device_id()),
+                )
+                self._resize_model_state = staged_state
+                result = {"status": "staged" if staged_state is not None else "source_only", **stats}
+            if global_rank in transfer_ranks:
+                torch.distributed.barrier(group=transfer_group)
+        finally:
+            if global_rank in transfer_ranks:
+                torch.distributed.destroy_process_group(transfer_group)
+            torch.distributed.barrier()
+        return result
+
+    def restore_staged_model_after_resize(self) -> dict[str, int | str]:
+        """Commit a staged local model shard into the rebuilt FSDP2 runtime."""
+        if self._resize_model_state is None:
+            raise RuntimeError("no GPU-direct model state is staged on this actor rank")
+        if self.module is None:
+            raise RuntimeError("cannot restore GPU-direct model state before rebuilding the FSDP runtime")
+        stats = restore_fsdp2_model_state(self.module, self._resize_model_state)
+        self._resize_model_state = None
+        aggressive_empty_cache(force_sync=True)
+        return {"status": "restored", **stats}
+
+    def clear_staged_model_resize_state(self) -> None:
+        self._resize_model_state = None
+        aggressive_empty_cache(force_sync=True)
+
     def is_mp_src_rank_with_outputs(self):
         if self.ulysses_device_mesh is not None:
             is_collect = self.ulysses_device_mesh["sp"].get_local_rank() == 0
@@ -187,6 +281,11 @@ class FSDPEngine(BaseEngine):
         Applies device, dtype, and precision configurations, including mixed precision.
         Sets up checkpoint manager and FLOPs counter.
         """
+        # Rebuild the mesh after a runtime shutdown. The resize coordinator is
+        # responsible for installing any new process-group topology first.
+        if self.device_mesh is None:
+            self._init_device_mesh()
+
         # This is used to import external_lib into the huggingface systems
         self._build_model_optimizer()
 
@@ -197,6 +296,7 @@ class FSDPEngine(BaseEngine):
             processing_class=self.model_config.get_processor(),
             checkpoint_config=self.checkpoint_config,
             trust_remote_code=self.model_config.trust_remote_code,
+            process_group=getattr(self, "process_group", None),
         )
 
         self.to(
@@ -209,15 +309,22 @@ class FSDPEngine(BaseEngine):
         log_gpu_memory_usage("After offload model/optimizer/grad during init", logger=logger)
 
     def _init_device_mesh(self):
-        world_size = torch.distributed.get_world_size()
+        process_group = getattr(self, "process_group", None)
+        world_size = torch.distributed.get_world_size(group=process_group)
         from torch.distributed.device_mesh import init_device_mesh
 
         fsdp_size = self.engine_config.fsdp_size
 
-        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=fsdp_size)
+        self.device_mesh = create_device_mesh(
+            world_size=world_size,
+            fsdp_size=fsdp_size,
+            process_group=process_group,
+        )
         self.ulysses_device_mesh = None
         self.ulysses_parallel_group = None
         self.ulysses_sequence_parallel_size = self.engine_config.ulysses_sequence_parallel_size
+        if process_group is not None and self.ulysses_sequence_parallel_size > 1:
+            raise NotImplementedError("custom FSDP process groups do not yet support Ulysses sequence parallelism")
         dp_size = self.get_data_parallel_size()
         if self.ulysses_sequence_parallel_size > 1:
             self.ulysses_device_mesh = init_device_mesh(
@@ -446,7 +553,9 @@ class FSDPEngine(BaseEngine):
             }
             full_state = module.state_dict()
             apply_fsdp2(module, fsdp_kwargs, self.engine_config)
-            fsdp2_load_full_state_dict(module, full_state, fsdp_mesh, offload_policy)
+            fsdp2_load_full_state_dict(
+                module, full_state, fsdp_mesh, offload_policy, process_group=getattr(self, "process_group", None)
+            )
         else:
             raise NotImplementedError(f"Unknown strategy {self.engine_config.strategy}")
 
@@ -575,7 +684,7 @@ class FSDPEngine(BaseEngine):
             module = self._apply_qat(module)
 
         # Synchronize all distributed processes before proceeding
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=getattr(self, "process_group", None))
         if self.rank == 0:
             print_model_size(module)
         log_gpu_memory_usage("After init model from HF AutoModel", logger=logger)
@@ -618,16 +727,19 @@ class FSDPEngine(BaseEngine):
         if self.ulysses_device_mesh is not None:
             return self.ulysses_device_mesh["dp"].get_local_rank()
         else:
-            return torch.distributed.get_rank()
+            return torch.distributed.get_rank(group=getattr(self, "process_group", None))
 
     def get_data_parallel_size(self):
-        return torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
+        return (
+            torch.distributed.get_world_size(group=getattr(self, "process_group", None))
+            // self.ulysses_sequence_parallel_size
+        )
 
     def get_data_parallel_group(self):
         if self.ulysses_device_mesh is not None:
             return self.ulysses_device_mesh.get_group(mesh_dim="dp")
         else:
-            return torch.distributed.group.WORLD
+            return getattr(self, "process_group", None) or torch.distributed.group.WORLD
 
     def get_model_parallel_group(self):
         raise NotImplementedError
@@ -796,7 +908,7 @@ class FSDPEngine(BaseEngine):
             save_full_model_for_dynamic_resize=save_full_model_for_dynamic_resize,
         )
 
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=getattr(self, "process_group", None))
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.module)
 
@@ -815,7 +927,7 @@ class FSDPEngine(BaseEngine):
             local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
         )
 
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=getattr(self, "process_group", None))
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.module)
 
