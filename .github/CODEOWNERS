@@ -25,5 +25,5 @@
 /tests/trainer @eric-haibin-lin @vermouth1992 @tongyx361 @PeterSH6
 /tests/workers/rollout/vllm_rollout @wuxibin89 @PeterSH6 @chenhaiq
 
-# Research-fork ownership. Add domain reviewers after confirming write access.
-* @HanlinDu
+# Research-fork maintainers with confirmed repository write access.
+* @HanlinDu @Jetteyc @Knight-of-Thunder @LeonardW-sl
