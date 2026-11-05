@@ -113,6 +113,18 @@ esac
 [[ ! -e /results/checkpoints ]] || {
   printf '%s\n' 'Fresh checkpoint directory required.' >&2; exit 1;
 }
+shopt -s nullglob
+previous_nccl_logs=(/results/nccl.*.log)
+[[ ${#previous_nccl_logs[@]} -eq 0 ]] || {
+  printf '%s\n' 'Fresh NCCL log paths required.' >&2; exit 1;
+}
 mkdir -p /results/checkpoints
 
-exec "${command[@]}"
+"${command[@]}"
+nccl_logs=(/results/nccl.*.log)
+[[ ${#nccl_logs[@]} -gt 0 ]] || {
+  printf '%s\n' 'NCCL transport logs are required for acceptance.' >&2; exit 1;
+}
+python3 tests/special_distributed/analyze_two_resize_trace.py "${RESIZE_TRACE}" \
+  --expected-resizes 2 --final-actor 6 --final-rollout 2 --expected-final-step 12 \
+  --nccl-log "${nccl_logs[@]}" --output "${RESIZE_SUMMARY}"

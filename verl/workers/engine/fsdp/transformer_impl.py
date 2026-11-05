@@ -225,7 +225,6 @@ class FSDPEngine(BaseEngine):
         if len(new_ranks) <= len(old_ranks):
             raise NotImplementedError("GPU-direct model resize phase 1 supports actor expansion only")
 
-
         global_rank = torch.distributed.get_rank()
         transfer_ranks = sorted(set(old_ranks) | set(new_ranks))
         torch.distributed.barrier()

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import socket
 from dataclasses import dataclass
 from math import prod
 from typing import Any
@@ -172,6 +173,7 @@ class FSDPResizeStateTransferManager:
         self.device = device
         self.global_rank = dist.get_rank()
         self.source_rank = old_ranks[0]
+        self.inter_node_sent_bytes = 0
 
     @torch.no_grad()
     def stage(self, model: torch.nn.Module | None) -> tuple[dict[str, torch.Tensor], dict[str, int]]:
@@ -179,6 +181,8 @@ class FSDPResizeStateTransferManager:
         if is_old_rank and model is None:
             raise RuntimeError(f"old actor rank {self.global_rank} has no active FSDP model")
 
+        self.hostnames = [None] * len(self.new_ranks)
+        dist.all_gather_object(self.hostnames, socket.gethostname(), group=self.transfer_group)
         source_state = model.state_dict() if is_old_rank else None
         object_list = [_build_manifest(model) if self.global_rank == self.source_rank else None]
         dist.broadcast_object_list(
@@ -212,6 +216,8 @@ class FSDPResizeStateTransferManager:
             "sharded_tensor_count": sharded_tensor_count,
             "replicated_tensor_count": replicated_tensor_count,
             "staged_bytes": staged_bytes,
+            "inter_node_sent_bytes": self.inter_node_sent_bytes,
+            "transfer_host_count": len(set(self.hostnames)),
         }
 
     def _transfer_sharded_tensor(
@@ -263,6 +269,11 @@ class FSDPResizeStateTransferManager:
             output_split_sizes=recv_splits,
             input_split_sizes=send_splits,
             group=self.transfer_group,
+        )
+        self.inter_node_sent_bytes += sum(
+            split * send_tensor.element_size()
+            for target_rank, split in enumerate(send_splits)
+            if self.hostnames[target_rank] != self.hostnames[self.global_rank]
         )
 
         target_interval = planner.target_intervals[target_rank]

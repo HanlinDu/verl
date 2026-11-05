@@ -42,13 +42,24 @@ remain gated on a verified hard-switch baseline under the existing area rules.
 ## Review and verification
 
 Use `uv` with Python 3.12. Run the `v1 integration` CPU workflow and the applicable
-repository pre-commit checks. CPU checks validate control and teardown contracts;
-they do not certify CUDA or cross-node transport.
+repository pre-commit checks. CPU checks validate control and teardown contracts.
+The follow-up workflow also runs four local Gloo ranks through two real DTensor
+transfers, `2 -> 3 -> 4`, comparing uneven shards and a replicated buffer. Only
+the accelerator synchronization adapter is replaced for that CPU test. These
+checks do not certify the CUDA FSDP runtime or cross-node NCCL transport.
 
 Before merging, record a real hard-switch smoke run, a disabled-resize regression,
 and direct-transfer state comparisons. The cross-node batch also needs actual
 cross-host payload evidence, post-resize weight synchronization and training,
 and a clean terminal event after both scheduled expansions.
+
+The acceptance script runs the trace analyzer after training. The analyzer
+requires NCCL logs, explicit `resize_weight_sync`, `training_step_end`, and
+`training_run_end` events. `--cross-node` also requires positive completed
+actor-transfer bytes between distinct hosts; unrelated cross-node checkpoint
+traffic is insufficient. NCCL channel tokens classify transport without
+certifying GPUDirect RDMA. The supplied eight-GPU acceptance script remains
+single-node; cross-node acceptance needs a real multi-host launch.
 
 The human submitter must review every changed line and run relevant tests under
 the repository contribution policy. Record AI assistance and source SHAs in both

@@ -68,3 +68,7 @@ jobs:
           tests.extend(path for path in follow_up if Path(path).is_file())
           subprocess.run([sys.executable, '-m', 'pytest', '-q', *tests], check=True)
           PY
+      - name: Verify two local Gloo DTensor transfers
+        run: |
+          PYTHONPATH=. .venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=4 \
+            tests/special_distributed/run_fsdp2_resize_transfer_on_cpu.py

@@ -876,6 +876,8 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         if len(tensor_counts) != 1:
             raise RuntimeError(f"GPU-direct model resize returned inconsistent tensor counts: {tensor_counts}")
         total_bytes = sum(int(result.get("staged_bytes", 0)) for result in target_results)
+        inter_node_bytes = sum(int(result.get("inter_node_sent_bytes", 0)) for result in target_results)
+        transfer_host_count = max(int(result.get("transfer_host_count", 1)) for result in target_results)
         logger.info(
             "[one-step-off][resize] staged actor model directly on %s ranks: tensors=%s bytes=%s",
             actor_target,
@@ -887,6 +889,8 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/handoff_model_transfer_success": 0.0,
             "resize/handoff_model_transfer_tensor_count": float(next(iter(tensor_counts))),
             "resize/handoff_model_transfer_bytes": float(total_bytes),
+            "resize/handoff_model_transfer_inter_node_bytes": float(inter_node_bytes),
+            "resize/handoff_model_transfer_host_count": float(transfer_host_count),
             "resize/handoff_model_transfer_fallback_reason": "",
         }
 
@@ -1229,6 +1233,15 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         with marked_timer("dynamic_resize_update_weights", self.timing_raw, color="green"):
             await self.checkpoint_manager.update_weights(self.global_steps)
 
+        append_resize_trace(
+            self._resize_trace_config,
+            {
+                "event": "resize_weight_sync",
+                "step": self.global_steps,
+                "actor_size": actor_target,
+                "rollout_size": rollout_target,
+            },
+        )
         self._active_dynamic_resize_topology = {"actor_size": actor_target, "rollout_size": rollout_target}
         metrics.update(
             {
@@ -1644,7 +1657,18 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         if batch_data_future is None and not self.is_last_step:
             batch_data_future = asyncio.create_task(self._async_gen_next_batch(continuous_iterator))
             await asyncio.sleep(0)
+        completed_step = self.global_steps
         self._fit_postprocess_step()
+        topology = getattr(self, "_active_dynamic_resize_topology", None) or {}
+        append_resize_trace(
+            self._resize_trace_config,
+            {"event": "training_step_end", "step": completed_step, **topology},
+        )
+        if self.is_last_step:
+            append_resize_trace(
+                self._resize_trace_config,
+                {"event": "training_run_end", "step": completed_step},
+            )
 
         return batch_data_future
 
