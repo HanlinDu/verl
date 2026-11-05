@@ -699,6 +699,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.actor.engine.clear_staged_model_resize_state()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_replicated_state_for_resize(self, local_path: str):
+        """Restore scheduler and RNG after a weights-only direct model handoff."""
+        self.actor.engine.checkpoint_manager.load_replicated_state(local_path)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def reconfigure_checkpoint_engine(self, group_name: str | None = None, rebuild_group: bool = True):
         """Recreate checkpoint-engine state without replacing this Ray worker.
 
@@ -729,9 +734,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             backend = self.config.rollout.checkpoint_engine.backend
             bucket_size = self.config.rollout.checkpoint_engine.update_weights_bucket_megabytes << 20
             engine_kwargs = dict(self.config.rollout.checkpoint_engine.engine_kwargs.get(backend, {}))
-            if group_name is not None and backend in {"nccl", "hccl"}:
+            if group_name is not None and hasattr(old_engine, "group_name"):
                 engine_kwargs["group_name"] = group_name
-            if backend in {"nccl", "hccl", "kimi_ckpt_engine", "mooncake"}:
+            if hasattr(old_engine, "rebuild_group"):
                 engine_kwargs["rebuild_group"] = rebuild_group
             import_external_libs(self.config.rollout.checkpoint_engine.custom_backend_module or None)
             self.checkpoint_engine = CheckpointEngineRegistry.new(

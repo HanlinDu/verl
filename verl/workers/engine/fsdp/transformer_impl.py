@@ -559,7 +559,9 @@ class FSDPEngine(BaseEngine):
             }
             full_state = module.state_dict()
             apply_fsdp2(module, fsdp_kwargs, self.engine_config)
-            fsdp2_load_full_state_dict(module, full_state, fsdp_mesh, offload_policy)
+            fsdp2_load_full_state_dict(
+                module, full_state, fsdp_mesh, offload_policy, process_group=getattr(self, "process_group", None)
+            )
         else:
             raise NotImplementedError(f"Unknown strategy {self.engine_config.strategy}")
 

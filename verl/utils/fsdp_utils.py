@@ -496,16 +496,17 @@ def fsdp2_load_full_state_dict(
         # use torch 2.7.0 copy from verl/third_party/torch/distributed/checkpoint
         from verl.third_party.torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
-    # ``full_state`` is materialized on every rank while building the model.
-    # Avoid ``broadcast_from_rank0`` here: PyTorch 2.6's state-dict helper
-    # hardcodes WORLD for its rank checks and broadcasts, which deadlocks when
-    # FSDP2 is attached to a dynamic subgroup.
-    if device_mesh is not None:
-        process_group = device_mesh.get_group()
-    model = model.to(device=get_device_id(), non_blocking=True)
+    # Preserve rank-zero-only loading for the ordinary WORLD runtime. The
+    # state-dict helper broadcasts on WORLD, so a resize subgroup instead
+    # supplies full_state on every member and disables that broadcast.
+    broadcast_from_rank0 = process_group is None
+    if not broadcast_from_rank0 or dist.get_rank() == 0:
+        model = model.to(device=get_device_id(), non_blocking=True)
+    else:
+        model = model.to_empty(device=get_device_id())
 
     cpu_offload = cpu_offload is not None
-    options = StateDictOptions(full_state_dict=True, cpu_offload=cpu_offload, broadcast_from_rank0=False)
+    options = StateDictOptions(full_state_dict=True, cpu_offload=cpu_offload, broadcast_from_rank0=broadcast_from_rank0)
     set_model_state_dict(model, full_state, options=options)
 
     # rotary_emb is not in state_dict, so we need to broadcast it manually
@@ -515,7 +516,8 @@ def fsdp2_load_full_state_dict(
     # mismatch on the same broadcast collective = NCCL deadlock.
     bufs = sorted(model.named_buffers(), key=lambda x: x[0])
     for name, buf in bufs:
-        dist.broadcast(buf, src=0, group=process_group)
+        source_rank = dist.get_global_rank(process_group, 0) if process_group is not None else 0
+        dist.broadcast(buf, src=source_rank, group=process_group)
 
     if cpu_offload:
         model.to("cpu", non_blocking=True)

@@ -176,6 +176,35 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         )
         return lora_meta_path
 
+    def _load_extra_state(self, local_path: str) -> str | None:
+        if not self.should_load_extra:
+            return
+        remote_extra_state_path = os.path.join(
+            local_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt"
+        )
+        if not os.path.exists(remote_extra_state_path):
+            extra_candidates = sorted(glob(os.path.join(local_path, "extra_state_world_size_*_rank_0.pt")))
+            if extra_candidates:
+                remote_extra_state_path = extra_candidates[0]
+        local_extra_state_path = copy_to_local(remote_extra_state_path)
+        extra_state_dict = torch.load(local_extra_state_path, weights_only=False)
+        # recover random state
+        if "rng" in extra_state_dict:
+            # 'rng' may not exist for backward compatibility
+            self.load_rng_state(extra_state_dict["rng"])
+            log_with_rank(f"Loaded rng from {remote_extra_state_path}", rank=self.rank, logger=logger)
+
+        lr_scheduler_state_dict = extra_state_dict["lr_scheduler"]
+        if lr_scheduler_state_dict is not None and self.lr_scheduler is not None:
+            self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)
+            log_with_rank(f"Loaded lr_scheduler from {remote_extra_state_path}", rank=self.rank, logger=logger)
+        return local_extra_state_path
+
+    def load_replicated_state(self, local_path: str) -> None:
+        """Restore scheduler and RNG after direct model transfer, retaining a fresh optimizer."""
+        self._load_extra_state(local_path)
+        torch.distributed.barrier(group=self.process_group)
+
     def load_checkpoint(self, local_path: str, hdfs_path: str = None, del_local_after_load=False):
         """
         Load an FSDP checkpoint for this rank.
@@ -279,32 +308,14 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     self.optimizer.load_state_dict(optimizer_state_dict)
                     log_with_rank(f"Loaded optimizer from {remote_optim_path}", rank=self.rank, logger=logger)
 
-        if self.should_load_extra:
-            remote_extra_state_path = os.path.join(
-                local_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt"
-            )
-            if not os.path.exists(remote_extra_state_path):
-                extra_candidates = sorted(glob(os.path.join(local_path, "extra_state_world_size_*_rank_0.pt")))
-                if extra_candidates:
-                    remote_extra_state_path = extra_candidates[0]
-            local_extra_state_path = copy_to_local(remote_extra_state_path)
-            extra_state_dict = torch.load(local_extra_state_path, weights_only=False)
-            # recover random state
-            if "rng" in extra_state_dict:
-                # 'rng' may not exist for backward compatibility
-                self.load_rng_state(extra_state_dict["rng"])
-                log_with_rank(f"Loaded rng from {remote_extra_state_path}", rank=self.rank, logger=logger)
-
-            lr_scheduler_state_dict = extra_state_dict["lr_scheduler"]
-            if lr_scheduler_state_dict is not None and self.lr_scheduler is not None:
-                self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)
-                log_with_rank(f"Loaded lr_scheduler from {remote_extra_state_path}", rank=self.rank, logger=logger)
+        local_extra_state_path = self._load_extra_state(local_path)
 
         if self.rank == 0 and del_local_after_load:
             try:
                 os.remove(local_model_path) if is_non_local(local_model_path) else None
                 os.remove(local_optim_path) if is_non_local(local_optim_path) else None
-                os.remove(local_extra_state_path) if is_non_local(local_extra_state_path) else None
+                if local_extra_state_path is not None and is_non_local(local_extra_state_path):
+                    os.remove(local_extra_state_path)
             except Exception as e:
                 log_with_rank(
                     f"remove local resume ckpt file after loading failed, exception {e} will be ignored",

@@ -22,7 +22,6 @@ from omegaconf import OmegaConf
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role, need_reference_policy
 
-
 SHARED_DYNAMIC_RESIZE_POOL = "dynamic_resize_shared_pool"
 
 
@@ -78,7 +77,7 @@ def _pool_target_size(spec: Any) -> int | None:
     size = spec["size"]
     if isinstance(size, int):
         return size
-    if isinstance(size, (list, tuple)):
+    if isinstance(size, list | tuple):
         index = int(spec.get("index", 0))
         if index < 0 or index >= len(size):
             raise ValueError(f"dynamic resize pool index {index} out of range for size={size}")

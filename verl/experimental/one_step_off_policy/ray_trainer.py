@@ -118,7 +118,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         self.config = config
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
-        assert self.hybrid_engine, "one-step-off dynamic resize requires the hybrid ActorRolloutRefWorker"
+        if self.hybrid_engine and not OmegaConf.select(config, "trainer.dynamic_resize.enable", default=False):
+            raise ValueError("one-step-off hybrid workers require trainer.dynamic_resize.enable=true")
+        if not self.hybrid_engine:
+            role_worker_mapping.pop(Role.Rollout, None)
 
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
@@ -843,6 +846,8 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         critic_path = os.path.join(global_step_folder, str(Role.Critic))
         if load_actor:
             self.actor_rollout_wg.load_checkpoint(actor_path, del_local_after_load=False)
+        else:
+            self.actor_rollout_wg.load_replicated_state_for_resize(actor_path)
         if self.use_critic:
             self.critic_wg.load_checkpoint(critic_path, del_local_after_load=False)
 
@@ -950,7 +955,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 await checkpoint_manager.abort_replicas()
                 await checkpoint_manager.sleep_replicas()
             except Exception as exc:
-                logger.warning("[one-step-off][resize] failed to quiesce rollout replicas before rebuild: %s", exc)
+                raise RuntimeError("Cannot resize before rollout replicas are quiescent") from exc
 
         async_rollout_manager = getattr(self, "async_rollout_manager", None)
         if async_rollout_manager is not None:
@@ -1109,10 +1114,6 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             rebuild_group=True,
         )
         self._build_dynamic_resize_checkpoint_manager()
-        self._active_dynamic_resize_topology = {
-            "actor_size": actor_size,
-            "rollout_size": rollout_size,
-        }
 
     def _rebuild_dynamic_resize_runtime(self, *, actor_size: int, rollout_size: int) -> None:
         if not self.hybrid_engine:
@@ -1144,6 +1145,13 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             reason = "shared_pool_required_for_hard_switch"
             metrics.update({"resize/unsupported_reason": reason, "resize/pending_resource_switch": 1.0})
             return metrics
+
+        if self._gpu_direct_actor_model_resize_enabled() and (
+            self._host_staging_config.stage_optimizer or self._host_staging_config.optimizer_full_state_restore
+        ):
+            raise NotImplementedError(
+                "GPU-direct resize supports weights-only handoff; optimizer migration is unavailable"
+            )
 
         checkpoint_step_folder = self._dynamic_resize_checkpoint_step_folder()
         with marked_timer("dynamic_resize_save_checkpoint", self.timing_raw, color="green"):
@@ -1221,6 +1229,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         with marked_timer("dynamic_resize_update_weights", self.timing_raw, color="green"):
             await self.checkpoint_manager.update_weights(self.global_steps)
 
+        self._active_dynamic_resize_topology = {"actor_size": actor_target, "rollout_size": rollout_target}
         metrics.update(
             {
                 "resize/schedule_applied": 1.0,
@@ -1344,7 +1353,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         }
 
     def _create_actor_rollout_classes(self):
-        actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
+        if not self.hybrid_engine:
+            actor_role = Role.Actor
+        else:
+            actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
         self.actor_role = actor_role
         for role in [actor_role]:
             resource_pool = self.resource_pool_manager.get_resource_pool(role)
@@ -1404,7 +1416,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
     def _init_async_rollout_manager(self):
         # create async rollout manager and request scheduler
         assert self.config.actor_rollout_ref.rollout.mode == "async"
-        rollout_worker_group = getattr(self, "_runtime_rollout_worker_group", self.actor_rollout_wg)
+        rollout_worker_group = (
+            getattr(self, "_runtime_rollout_worker_group", self.actor_rollout_wg) if self.hybrid_engine else None
+        )
         rollout_start_rank = 0
         active_topology = getattr(self, "_active_dynamic_resize_topology", None)
         if self.hybrid_engine and active_topology is not None and rollout_worker_group is not self.actor_rollout_wg:

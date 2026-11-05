@@ -1,3 +1,17 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 from types import SimpleNamespace
 
@@ -133,9 +147,13 @@ def test_dynamic_resize_checkpoint_load_can_skip_actor_for_gpu_direct_restore():
     class _WorkerGroup:
         def __init__(self):
             self.calls = []
+            self.replicated_calls = []
 
         def load_checkpoint(self, path, del_local_after_load):
             self.calls.append((path, del_local_after_load))
+
+        def load_replicated_state_for_resize(self, path):
+            self.replicated_calls.append(path)
 
     trainer = object.__new__(OneStepOffRayTrainer)
     trainer.actor_rollout_wg = _WorkerGroup()
@@ -145,6 +163,7 @@ def test_dynamic_resize_checkpoint_load_can_skip_actor_for_gpu_direct_restore():
     trainer._load_dynamic_resize_checkpoint("/tmp/global_step_1", load_actor=False)
 
     assert trainer.actor_rollout_wg.calls == []
+    assert trainer.actor_rollout_wg.replicated_calls == ["/tmp/global_step_1/actor"]
     assert trainer.critic_wg.calls == [("/tmp/global_step_1/critic", False)]
 
 
