@@ -103,7 +103,7 @@ torchrun --standalone --nproc-per-node=8 \
 
 复制 `plan.example.json` 到仓库外，把三个 argv 数组换为本集群真实训练命令（通常为你自己的三个 shell adapter）；模型/数据路径、checkpoint 和日志都使用本次运行的新目录。单机/双机分别一份计划。示例中占位路径有意无法执行，未配置时不能得到通过结果。
 
-三个 adapter 从候选 checkout 启动训练：使用现有 `python -m verl.experimental.one_step_off_policy.main_ppo` 入口，传入模型、parquet、实际 trainer/rollout nnodes、GPU 数、步数及各 case 配置。`disabled` 明确设置 `trainer.dynamic_resize.enable=false`；`resize` 使用经过人工确认的两次切换 schedule；`checkpoint-resume` 应包含保存和新进程恢复两个阶段，并传播任一阶段的非零返回值。仅在 driver 容器启动训练，Ray workers 使用另一节点的同一候选代码。
+三个 adapter 从候选 checkout 启动训练：使用现有 `python -m verl.experimental.one_step_off_policy.main_ppo` 入口，传入模型、parquet、实际 trainer/rollout nnodes、GPU 数、步数及各 case 配置。`disabled` 明确设置 `trainer.dynamic_resize.enable=false`；`resize` 使用经过人工确认的两次切换 schedule；`checkpoint-resume` 应包含保存和新进程恢复两个阶段，并传播任一阶段的非零返回值。工具将候选 checkout 放在子进程 `PYTHONPATH` 首位；adapter 保持这个路径和工作目录，不能切回旧代码目录。仅在 driver 容器启动训练，Ray workers 使用另一节点的同一候选代码。
 
 先运行下列命令收集日志，阅读日志后复制 `observations.example.json` 到私有目录，填写操作者、证据位置和真实观察，再用新输出目录重跑或将已审查的 observations 填入该次 `report.json`。人工观察字段明确属于操作者声明，工具校验日志 hash 并不构成对训练正确性的独立证明。
 

@@ -203,6 +203,16 @@ def test_training_child_does_not_inherit_github_credentials(tmp_path, monkeypatc
     assert "synthetic-secret" not in log.read_text()
 
 
+def test_child_import_path_starts_with_candidate_checkout(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", "/another/editable/checkout")
+    log = tmp_path / "path.log"
+    result = verify.run_command(
+        [sys.executable, "-c", "import os; print(os.environ['PYTHONPATH'].split(os.pathsep)[0])"], log, 10
+    )
+    assert result["exit_code"] == 0
+    assert log.read_text().strip() == verify.git("rev-parse", "--show-toplevel")
+
+
 def test_runtime_gate_blocks_missing_gpu_profiles(evidence, monkeypatch, capsys):
     candidate, cpu, directory = evidence
     verify.save(directory / "candidate.json", candidate)

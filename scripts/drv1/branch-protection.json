@@ -1,7 +1,11 @@
 {
   "required_status_checks": {
     "strict": true,
-    "contexts": ["drv1-policy", "drv1-cpu", "drv1/acceptance"]
+    "checks": [
+      {"context": "drv1-policy", "app_id": 15368},
+      {"context": "drv1-cpu", "app_id": 15368},
+      {"context": "drv1/acceptance", "app_id": -1}
+    ]
   },
   "enforce_admins": true,
   "required_pull_request_reviews": {

@@ -172,6 +172,10 @@ def run_command(argv, log, timeout):
         and k != "GIT_CURL_VERBOSE"
     }
     env["GIT_TERMINAL_PROMPT"] = "0"
+    # The trusted tool may live in another checkout with an editable install.
+    # Put the candidate first so tests and driver imports use the tested tree.
+    candidate_root = git("rev-parse", "--show-toplevel")
+    env["PYTHONPATH"] = candidate_root + os.pathsep + env.get("PYTHONPATH", "")
     with log.open("w") as stream:
         try:
             process = subprocess.Popen(argv, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True, env=env)
