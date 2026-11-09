@@ -1,0 +1,79 @@
+name: drv1 verification
+
+on:
+  pull_request:
+    branches: [v1]
+  push:
+    branches: [v1]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: drv1-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  drv1-policy:
+    if: github.repository == 'HanlinDu/verl'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify target, ancestry, and patch whitespace
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            test "$BASE_REF" = v1
+            git diff --check "$BASE_SHA" HEAD
+          fi
+          git merge-base --is-ancestor a91542dc59686d243843040dac4390c29a68c873 HEAD
+      - name: Check licenses on added or modified Python files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          compare="${BASE_SHA:-HEAD^}"
+          mapfile -d '' -t files < <(git diff --name-only --diff-filter=AM -z "$compare" HEAD -- '*.py')
+          if (( ${#files[@]} )); then
+            python3 tests/special_sanity/check_license.py --directories "${files[@]}"
+          fi
+
+  drv1-cpu:
+    if: github.repository == 'HanlinDu/verl'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.12'
+      - name: Install declared CPU environment using uv
+        run: |
+          python -m pip install uv==0.9.5
+          uv venv --python 3.12
+          uv pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
+          uv pip install -r scripts/drv1/requirements-cpu.txt
+          uv pip install --no-deps -e .
+      - name: Lint the integration tooling
+        run: |
+          .venv/bin/ruff check scripts/drv1 tests/special_sanity/test_drv1_gate_on_cpu.py
+          .venv/bin/ruff format --check scripts/drv1 tests/special_sanity/test_drv1_gate_on_cpu.py
+      - name: Test the merge candidate (or actual v1 after a merge)
+        run: .venv/bin/python scripts/drv1/verify.py cpu --output "$RUNNER_TEMP/drv1-cpu-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Retain evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: drv1-cpu-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/drv1-cpu-*
+          retention-days: 30
+          if-no-files-found: warn

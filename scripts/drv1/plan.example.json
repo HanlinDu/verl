@@ -1,0 +1,5 @@
+{
+  "disabled": ["bash", "/REPLACE_WITH_PRIVATE_CONFIG/disabled-smoke.sh"],
+  "resize": ["bash", "/REPLACE_WITH_PRIVATE_CONFIG/two-resize-smoke.sh"],
+  "checkpoint-resume": ["bash", "/REPLACE_WITH_PRIVATE_CONFIG/checkpoint-resume-smoke.sh"]
+}

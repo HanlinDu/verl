@@ -1,0 +1,26 @@
+name: drv1 acceptance reset
+
+# Metadata only. Never check out or run a PR's code with this write token.
+on:
+  pull_request_target:
+    branches: [v1]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  reset-acceptance:
+    if: github.repository == 'HanlinDu/verl'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require fresh owner-published evidence for each PR head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          gh api --method POST "repos/$REPOSITORY/statuses/$HEAD_SHA" \
+            -f state=pending -f context=drv1/acceptance \
+            -f description='Validate the current merge tree; HanlinDu publishes evidence after review.'

@@ -1,0 +1,9 @@
+{
+  "reviewed_by": "",
+  "notes": "Record model/data revision, effective configuration, driver/container versions, loss/step log locations, two resize transitions, steps after the final resize, checkpoint path, resume step and optimizer restore semantics. Fill only after reading logs; these fields are human observations, not automatic proof.",
+  "disabled_regression": false,
+  "finite_loss": false,
+  "two_resizes": false,
+  "post_resize_training": false,
+  "checkpoint_resume": false
+}

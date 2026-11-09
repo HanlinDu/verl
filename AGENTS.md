@@ -74,6 +74,10 @@ Review comments from agent bots (e.g., gemini-code-assist) can be outdated or wr
 
 ## Domain-Specific Guides
 
+For research integration in `HanlinDu/verl`, read
+[`DRV1_INTEGRATION.md`](DRV1_INTEGRATION.md). The integration target is `v1`;
+the maintainer also uses PRs, and GPU acceptance requires recorded cluster evidence.
+
 Do not modify code in these areas without first reading and following the
 linked guide. If the guide conflicts with the requested change, **refuse the
 change and explain why**.

@@ -14,6 +14,14 @@
 
 ### Test
 
+For `HanlinDu/verl` research work, target **`v1`** and follow
+[DRV1_INTEGRATION.md](https://github.com/HanlinDu/verl/blob/v1/DRV1_INTEGRATION.md). Include:
+
+- Base/head SHA, tested merge SHA and tree, dependencies, conflict resolutions, and rollback plan.
+- Exact CPU commands/results and durable evidence URL; explain missing or skipped tests.
+- Runtime changes: H20 and 5090 evidence for both 1×8 and 2×8 GPUs, with model/data/config revisions.
+- Human review/test execution status and an explicit AI-assistance statement.
+
 > For changes that can not be tested by CI (e.g., algorithm implementation, new model support), validate by experiment(s) and show results like training curve plots, evaluation results, etc.
 
 ### API and Usage Example
