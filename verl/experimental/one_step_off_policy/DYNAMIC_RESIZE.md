@@ -161,6 +161,7 @@ export PROFILER_ENABLE=false TRAIN_BATCH_SIZE=96 PPO_MINI_BATCH_SIZE=48
 export TORCH_CUDA_ARCH_LIST=12.0   # RTX 5090 (sm_120) only, as in the reference environment
 L=verl/experimental/one_step_off_policy/shell/run_dynamic_resize.sh
 G="algorithm.adv_estimator=grpo actor_rollout_ref.rollout.n=5 actor_rollout_ref.actor.entropy_coeff=0"
+S=trainer.dynamic_resize.schedule
 ```
 
 `$G` selects GRPO, which trains no critic; without it the launcher runs GAE with the token-classification
@@ -179,8 +180,16 @@ VERL_RESIZE_VERIFY=1 CKPT_DIR=$RUN/ckpt bash $L
 VERL_RESIZE_VERIFY=1 CKPT_DIR=$RUN/ckpt bash $L $G trainer.dynamic_resize.handoff.gpu_direct_low_memory=true
 # the same without the pre-launched replica pool
 VERL_RESIZE_VERIFY=1 CKPT_DIR=$RUN/ckpt bash $L $G trainer.dynamic_resize.handoff.dormant_rollout_replicas=false
-# back to an earlier topology: [4,4] -> [6,2] -> [4,4]
-VERL_RESIZE_VERIFY=1 SECOND_SPLIT_PLAN="[4,4]" CKPT_DIR=$RUN/ckpt bash $L $G
+# back to an earlier topology, [4,4] -> [6,2] -> [4,4], with a regular checkpoint after step 6 ...
+VERL_RESIZE_VERIFY=1 SECOND_SPLIT_PLAN="[4,4]" CKPT_DIR=$RUN/ckpt bash $L $G trainer.save_freq=6
+# ... and a new process that resumes from it (same $RUN), switches to [2,6] at step 8, stops after step 10
+VERL_RESIZE_VERIFY=1 SECOND_SPLIT_PLAN="[4,4]" TOTAL_TRAINING_STEPS=10 \
+  CKPT_DIR=$RUN/ckpt bash $L $G \
+  trainer.resume_mode=auto +$S.stage3.step=8 \
+  +$S.stage3.actor_pool.mode=split +$S.stage3.actor_pool.from_pool=shared_pool \
+  +$S.stage3.actor_pool.index=0 "+$S.stage3.actor_pool.size=[2,6]" \
+  +$S.stage3.rollout_pool.mode=split +$S.stage3.rollout_pool.from_pool=shared_pool \
+  +$S.stage3.rollout_pool.index=1 "+$S.stage3.rollout_pool.size=[2,6]" +$S.stage3.release_old=false
 # the two default switches through the checkpoint round trip
 HOST_STAGING_BACKEND=disk_fallback CKPT_DIR=$RUN/ckpt bash $L $G
 # dynamic resize off: separate actor and rollout workers on 4 + 4 GPUs
@@ -200,12 +209,18 @@ reports `resize/enabled:0.0` instead. In addition:
   `$RUN/ckpt/resize_trace.jsonl` has two lines per step.
 * Plain version: no `[one-step-off][resize]` line and no `resize_trace.jsonl`; the switch lines report
   `resize/gpu_direct_verified:0.0`.
-* `gpu_direct` leaves no `global_step_*` directory in `CKPT_DIR`; `disk_fallback` leaves one per switch.
+* `gpu_direct` leaves no `global_step_*` directory in `CKPT_DIR` unless `trainer.save_freq` asks for
+  one; `disk_fallback` leaves one per switch (10.2 GB each for Qwen3-0.6B without a critic).
 * Replicas: with the pool no switch launches one (`resize/rollout_replicas_launched:0.0`). In the
   default schedule the first switch reports `resize/rollout_replicas_slept:1.0` and the second
   `resize/rollout_replicas_woken:2.0`; without the pool the second launches two
   (`resize/rollout_replicas_launched:2.0`). Either way the replica on GPUs 6,7 is kept by both
   (`resize/rollout_replicas_kept:1.0`).
+* Resume: the new process logs `Resuming from $RUN/ckpt/global_step_6`, continues with `step:7`,
+  reports the verified switch on the `step:8` line and ends with `step:10`. A regular checkpoint holds
+  FSDP shards for the actor world size at save time (four actor ranks and 7.2 GB here), so a run is
+  resumed with the initial split it was saved in; `SECOND_SPLIT_PLAN="[4,4]"` returns to the
+  launcher's initial split before the checkpoint is taken.
 
 ## The hard switch, step by step
 

@@ -692,10 +692,12 @@ class _Transfer:
     def _new_digest_acc(self) -> torch.Tensor:
         return torch.zeros(2 * len(self._digest_index), dtype=torch.int64, device=self.device)
 
-    def _digest_one(self, acc, slot: int, tensor: torch.Tensor, item: dict[str, Any], side_ranks: list[int]) -> None:
+    def _digest_one(
+        self, acc, slot: int, tensor: torch.Tensor, item: dict[str, Any], side_ranks: list[int], mesh=None
+    ) -> None:
         view = acc[2 * slot : 2 * slot + 2]
         if item["kind"] == "shard0" and isinstance(tensor, DTensor):
-            mesh = tensor.device_mesh
+            mesh = tensor.device_mesh if mesh is None else mesh
             row_offset, _ = compute_1d_shard_range(item["shape"][0], mesh.size(), mesh.get_local_rank())
             _shard_digest(_local(tensor), row_offset * prod(item["shape"][1:]), view)
             if side_ranks is self.old_ranks:
@@ -707,13 +709,19 @@ class _Transfer:
 
     def _digest_param_and_state(self, acc, name: str, runtime, params, side_ranks: list[int]) -> None:
         item = self._item(name)
-        self._digest_one(acc, self._digest_index[("param", name)], params[name], item, side_ranks)
+        param = params[name]
+        # Optimizer state is laid out like its parameter, but only the parameter is guaranteed to live on
+        # the mesh the runtime was built on: state restored from a checkpoint is an unpickled DTensor whose
+        # own mesh names a process group of the process that wrote the checkpoint.
+        mesh = param.device_mesh if isinstance(param, DTensor) else None
+        self._digest_one(acc, self._digest_index[("param", name)], param, item, side_ranks, mesh)
         opt_manifest = self.manifest["optimizer"]
         state_meta = opt_manifest["state"].get(name) if opt_manifest is not None else None
         if state_meta:
-            state = runtime.optimizer.state[params[name]]
+            state = runtime.optimizer.state[param]
             for key, tensor_item in state_meta["tensors"].items():
-                self._digest_one(acc, self._digest_index[("opt", f"{name}.{key}")], state[key], tensor_item, side_ranks)
+                slot = self._digest_index[("opt", f"{name}.{key}")]
+                self._digest_one(acc, slot, state[key], tensor_item, side_ranks, mesh)
 
     def _item(self, name: str) -> dict[str, Any]:
         if not hasattr(self, "_items_by_name"):

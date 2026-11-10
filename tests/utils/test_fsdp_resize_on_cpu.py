@@ -12,9 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Shard
 
 import verl.utils.fsdp_resize as fsdp_resize
 from verl.utils.distributed import clear_dtensor_dispatch_caches
@@ -22,6 +27,7 @@ from verl.utils.fsdp_resize import (
     FSDPResizePlanner,
     ResizeRuntime,
     ResizeUnit,
+    _Transfer,
     compute_1d_shard_range,
     order_units,
     transfer_fsdp2_runtime,
@@ -156,7 +162,7 @@ def test_low_memory_pipeline_orders_units_to_minimise_the_peak():
 
 @pytest.fixture
 def one_rank_world():
-    """A one-rank Gloo world on CPU; nothing is left behind for other tests."""
+    """A one-rank Gloo world for DTensors on CPU; nothing is left behind for other tests."""
     if dist.is_initialized():
         pytest.skip("needs to own the default process group")
     dist.init_process_group("gloo", store=dist.HashStore(), rank=0, world_size=1)
@@ -165,6 +171,53 @@ def one_rank_world():
     finally:
         dist.destroy_process_group()
         clear_dtensor_dispatch_caches()
+
+
+def _one_rank_mesh(group):
+    return DeviceMesh.from_group(group, "cpu", mesh=torch.tensor([0]), mesh_dim_names=("fsdp",))
+
+
+def test_checksum_does_not_use_the_mesh_of_optimizer_state_restored_from_a_checkpoint(one_rank_world):
+    """A checkpoint stores optimizer state as pickled DTensors, and ``Optimizer.load_state_dict`` adopts them.
+
+    Their mesh names a process group of the process that wrote the checkpoint, which does not exist after
+    a resume.  The checksum has to take the shard position and the reduction group from the runtime's own
+    side, otherwise the first verified resize after a resume fails with "Could not resolve the process group".
+    """
+    live_group = dist.new_group([0])
+    param = DTensor.from_local(
+        torch.arange(12, dtype=torch.float32).reshape(6, 2), _one_rank_mesh(live_group), [Shard(0)]
+    )
+    moments = torch.arange(12, 24, dtype=torch.float32).reshape(6, 2)
+    live_state = DTensor.from_local(moments.clone(), _one_rank_mesh(live_group), [Shard(0)])
+
+    saving_group = dist.new_group([0])
+    checkpoint = io.BytesIO()
+    torch.save(DTensor.from_local(moments.clone(), _one_rank_mesh(saving_group), [Shard(0)]), checkpoint)
+    dist.destroy_process_group(saving_group)  # the process that wrote the checkpoint is gone
+    checkpoint.seek(0)
+    restored_state = torch.load(checkpoint, weights_only=False)
+    with pytest.raises(RuntimeError, match="Could not resolve the process group"):
+        restored_state.device_mesh.get_group()
+
+    item = {"name": "weight", "shape": (6, 2), "dtype": "float32", "kind": "shard0"}
+    state_meta = {"tensors": {"exp_avg": {**item, "name": "weight.exp_avg"}}, "scalars": {}}
+    transfer = object.__new__(_Transfer)  # the checksum helpers only need the rank lists and the manifest
+    transfer.rank, transfer.old_ranks, transfer.new_ranks = 0, [0], [0]
+    transfer.manifest = {"params": [item], "buffers": [], "optimizer": {"state": {"weight": state_meta}}}
+    transfer._digest_index = transfer._build_digest_index(transfer.manifest)
+
+    def digest(state):
+        transfer._old_mesh_group = None
+        acc = torch.zeros(2 * len(transfer._digest_index), dtype=torch.int64)
+        runtime = SimpleNamespace(optimizer=SimpleNamespace(state={param: {"exp_avg": state}}))
+        transfer._digest_param_and_state(acc, "weight", runtime, {"weight": param}, transfer.old_ranks)
+        return acc
+
+    expected = digest(live_state)
+    assert expected.view(-1, 2).ne(0).any(dim=1).all()  # both the parameter and its state were digested
+    assert torch.equal(digest(restored_state), expected)
+    assert transfer._old_mesh_group.group_name == live_group.group_name
 
 
 def _plain_runtime(steps: int, device: str = "cpu") -> ResizeRuntime:
