@@ -94,7 +94,7 @@ class FSDPResizePlanner:
         if not old_ranks or not new_ranks:
             raise ValueError("old_ranks and new_ranks must be non-empty")
         for name, ranks in (("old_ranks", old_ranks), ("new_ranks", new_ranks)):
-            if any(b <= a for a, b in zip(ranks, ranks[1:])):
+            if any(b <= a for a, b in zip(ranks, ranks[1:], strict=False)):
                 raise ValueError(f"{name} must be strictly increasing, got {ranks}")
         self.dim_size = dim_size
         self.old_ranks = old_ranks
@@ -115,16 +115,12 @@ class FSDPResizePlanner:
     def send_row_splits(self, source_rank: int) -> list[int]:
         """Rows ``source_rank`` sends to each member of the transfer group (group order)."""
         s = self.old_ranks.index(source_rank)
-        return [
-            self.overlap_rows(s, self.new_ranks.index(r)) if r in self.new_ranks else 0 for r in self.group_ranks
-        ]
+        return [self.overlap_rows(s, self.new_ranks.index(r)) if r in self.new_ranks else 0 for r in self.group_ranks]
 
     def recv_row_splits(self, target_rank: int) -> list[int]:
         """Rows ``target_rank`` receives from each member of the transfer group (group order)."""
         t = self.new_ranks.index(target_rank)
-        return [
-            self.overlap_rows(self.old_ranks.index(r), t) if r in self.old_ranks else 0 for r in self.group_ranks
-        ]
+        return [self.overlap_rows(self.old_ranks.index(r), t) if r in self.old_ranks else 0 for r in self.group_ranks]
 
     def network_recv_rows(self, target_rank: int) -> int:
         """Rows ``target_rank`` must actually receive from other ranks (excludes its own overlap)."""
@@ -171,7 +167,9 @@ def _shard_digest(local: torch.Tensor, global_offset_elems: int, acc: torch.Tens
     for start in range(0, words.numel(), _DIGEST_CHUNK):
         chunk = words[start : start + _DIGEST_CHUNK].to(torch.int64)
         weights = (
-            torch.arange(word_offset + start, word_offset + start + chunk.numel(), device=chunk.device, dtype=torch.int64)
+            torch.arange(
+                word_offset + start, word_offset + start + chunk.numel(), device=chunk.device, dtype=torch.int64
+            )
             % _DIGEST_MODULUS
             + 1
         )
@@ -359,7 +357,7 @@ def _build_manifest(runtime: ResizeRuntime, *, with_units: bool = False) -> dict
                     scalars[key] = {
                         "value": value.item(),
                         "dtype": _dtype_name(value.dtype),
-                        "cuda": value.is_cuda,
+                        "on_accelerator": value.is_cuda,
                     }
                 else:
                     tensors[key] = _describe(f"{name}.{key}", value)
@@ -630,7 +628,7 @@ class _Transfer:
                 raise RuntimeError(
                     f"optimizer param_groups differ: source {len(opt_manifest['param_groups'])}, target {len(groups)}"
                 )
-            for group, hyper in zip(groups, opt_manifest["param_groups"]):
+            for group, hyper in zip(groups, opt_manifest["param_groups"], strict=False):
                 group.update(hyper)
         if self.in_new and manifest["lr_scheduler"] is not None:
             if self.new.lr_scheduler is None:
@@ -640,7 +638,9 @@ class _Transfer:
         # 3. buffers (not sharded by FSDP2; includes non-persistent ones such as rotary inv_freq)
         if old_acc is not None:
             for item in manifest["buffers"]:
-                self._digest_one(old_acc, self._digest_index[("buf", item["name"])], old_bufs[item["name"]], item, self.old_ranks)
+                self._digest_one(
+                    old_acc, self._digest_index[("buf", item["name"])], old_bufs[item["name"]], item, self.old_ranks
+                )
         for item in manifest["buffers"]:
             self._broadcast_replicated(item, old_bufs.get(item["name"]), new_bufs.get(item["name"]))
             self.stats["buffer_count"] += 1
@@ -728,7 +728,9 @@ class _Transfer:
             for item in self.manifest["params"]:
                 self._digest_param_and_state(new_acc, item["name"], self.new, new_params, self.new_ranks)
             for item in self.manifest["buffers"]:
-                self._digest_one(new_acc, self._digest_index[("buf", item["name"])], new_bufs[item["name"]], item, self.new_ranks)
+                self._digest_one(
+                    new_acc, self._digest_index[("buf", item["name"])], new_bufs[item["name"]], item, self.new_ranks
+                )
             if self._new_mesh_group is not None:
                 dist.all_reduce(new_acc, group=self._new_mesh_group)
             reference = old_acc.clone() if self.rank == self.src else torch.empty_like(new_acc)
@@ -741,7 +743,8 @@ class _Transfer:
             bad = (reference.view(-1, 2) != new_acc.view(-1, 2)).any(dim=1).nonzero().flatten().tolist()
             if bad:
                 slot_names = {slot: key for key, slot in self._digest_index.items()}
-                error = f"rank {self.rank}: {len(bad)} tensors differ after transfer, e.g. {[slot_names[i] for i in bad[:5]]}"
+                examples = [slot_names[i] for i in bad[:5]]
+                error = f"rank {self.rank}: {len(bad)} tensors differ after transfer, e.g. {examples}"
         raise_if_any_failed(error, self.group, self.device)
 
     def _verify_scalar_state(self, old_state: dict[str, str] | None) -> None:
@@ -791,7 +794,7 @@ class _Transfer:
             state[key] = torch.tensor(
                 scalar["value"],
                 dtype=_resolve_dtype(scalar["dtype"]),
-                device=self.device if scalar["cuda"] else "cpu",
+                device=self.device if scalar["on_accelerator"] else "cpu",
             )
 
 

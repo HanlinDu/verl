@@ -1,6 +1,6 @@
 # Research v1 integration
 
-Last updated: 11/05/2026.
+Last updated: 11/10/2026.
 
 `HanlinDu/verl:v1` is the research integration branch. All research pull requests
 target `v1`. Upstream updates enter through a separately reviewed pull request.
@@ -21,23 +21,36 @@ The second batch depends on the first. Use merge commits so the first batch's
 ancestry is preserved and the second PR's diff narrows after the first merges.
 Both PRs target `v1`; neither batch merges into the source branch.
 
+A further batch replays the eight commits in `4d4189a0..f3ef6ba3`
+(shard-to-shard resize of the training runtime, rollout replica reuse) onto the
+first batch. It does not contain the second batch and overlaps it; their
+relative order is the maintainer's decision.
+
 ## Supported handoff contract
 
 Ordinary one-step-off configurations retain their separate worker and NCCL
 defaults. Hybrid workers require dynamic resize to be explicitly enabled.
 
-The direct path supports CUDA FSDP2, a one-dimensional full-shard mesh,
-contiguous actor ranks starting at zero, and actor expansion. It transfers model
-weights and restores scheduler/RNG checkpoint extras. The optimizer is rebuilt;
-this is weights-only continuation, not exact training-state continuation.
-Optimizer migration requests fail before teardown. The existing rank-zero RNG
-fallback across world-size changes is retained; bitwise reproducibility is not
-guaranteed.
+The direct path (`handoff.backend=gpu_direct`) supports CUDA FSDP2, a
+one-dimensional full-shard mesh, contiguous actor ranks starting at zero, and
+both actor expansion and shrink. It moves parameters, per-parameter optimizer
+state, module buffers, optimizer hyper-parameters and the LR-scheduler state
+shard to shard from the old ranks to the new ones; a token-classification
+critic follows the actor. No checkpoint is written or read for the switch, and
+a failed switch aborts the run instead of falling back to disk. RNG state is
+neither saved nor restored by a switch: every worker process keeps its own
+stream, so bitwise reproducibility is not guaranteed. `VERL_RESIZE_VERIFY=1`
+compares checksums of every moved tensor. Unsupported configurations are
+listed under "Preconditions" in
+`verl/experimental/one_step_off_policy/DYNAMIC_RESIZE.md`.
 
-A full-model disk checkpoint is still written before transfer. Direct transfer
-does not establish bounded staging memory or eliminate full-model aggregation.
-Pinned staging, optimizer async/deferred restore, and communicator-cache work
-remain gated on a verified hard-switch baseline under the existing area rules.
+The checkpoint round trip (`handoff.backend=disk_fallback`) is unchanged: it
+writes a full-model disk checkpoint, keeps a freshly built optimizer after a
+world-size change, and restores scheduler/RNG extras with the rank-zero
+fallback. It is weights-only continuation, not exact training-state
+continuation. Pinned staging, optimizer async/deferred restore, and
+communicator-cache work remain gated on a verified hard-switch baseline under
+the existing area rules.
 
 ## Review and verification
 

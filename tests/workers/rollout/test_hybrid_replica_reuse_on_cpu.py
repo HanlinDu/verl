@@ -140,9 +140,7 @@ def test_replica_with_dead_servers_or_foreign_workers_is_relaunched():
     plan = plan_hybrid_replica_reuse([dead], physical[6:8], start_rank=3, world_size=2)
     assert plan.keep == [] and _ranks(plan.retire) == [3] and plan.launch == [(0, 3)]
 
-    foreign = SimpleNamespace(
-        replica_rank=3, workers=[_Handle("other-6"), _Handle("other-7")], servers=["server"]
-    )
+    foreign = SimpleNamespace(replica_rank=3, workers=[_Handle("other-6"), _Handle("other-7")], servers=["server"])
     plan = plan_hybrid_replica_reuse([foreign], physical[6:8], start_rank=3, world_size=2)
     assert plan.keep == [] and _ranks(plan.retire) == [3] and plan.launch == [(0, 3)]
 

@@ -1477,7 +1477,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             if getattr(self, "_physical_critic_wg", None) is not None:
                 self.critic_wg = self._physical_critic_wg.subgroup(initial_actor_ranks, name_prefix="hybrid_critic")
             if getattr(self, "_physical_ref_policy_wg", None) is not None:
-                self.ref_policy_wg = self._physical_ref_policy_wg.subgroup(initial_actor_ranks, name_prefix="hybrid_ref")
+                self.ref_policy_wg = self._physical_ref_policy_wg.subgroup(
+                    initial_actor_ranks, name_prefix="hybrid_ref"
+                )
             self._set_hybrid_rollout_subgroup(actor_size=len(initial_actor_ranks))
             self._active_dynamic_resize_topology = {
                 "actor_size": topology.initial_actor_size,

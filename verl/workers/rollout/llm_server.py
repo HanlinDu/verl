@@ -746,7 +746,7 @@ class HybridReplicaPlan:
 
 def _same_actor_handles(left, right) -> bool:
     key = lambda handle: getattr(handle, "_actor_id", None) or id(handle)  # noqa: E731
-    return len(left) == len(right) and all(key(a) == key(b) for a, b in zip(left, right))
+    return len(left) == len(right) and all(key(a) == key(b) for a, b in zip(left, right, strict=False))
 
 
 def _owns_slice(replica, slice_workers) -> bool:

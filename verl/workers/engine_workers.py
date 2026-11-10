@@ -41,7 +41,6 @@ from verl.utils.distributed import (
     set_numa_affinity,
 )
 from verl.utils.flops_counter import FlopsCounter
-from verl.utils.fsdp_resize import raise_if_any_failed
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.metric.utils import Metric
@@ -328,6 +327,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
         subgroup.  Ranks leaving the training group only send; ranks joining only receive.  Any failure
         raises: there is no checkpoint fallback.
         """
+        # Imported here so that workers of recipes that never resize do not load the FSDP2 resize module.
+        from verl.utils.fsdp_resize import raise_if_any_failed
+
         rank = torch.distributed.get_rank()
         in_old, in_new = rank in old_ranks, rank in new_ranks
         transfer_ranks = sorted(set(old_ranks) | set(new_ranks))
