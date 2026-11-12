@@ -23,6 +23,9 @@ shared_pool_gpus=${SHARED_POOL_GPUS:-${NUM_GPUS}}
 first_split_plan=${FIRST_SPLIT_PLAN:-${SPLIT_PLAN:-"[6,2]"}}
 second_split_plan=${SECOND_SPLIT_PLAN:-"[2,6]"}
 total_training_steps=${TOTAL_TRAINING_STEPS:-$((second_resize_step + 2))}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-960}
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-240}
+USE_KL_LOSS=${USE_KL_LOSS:-false}
 RESIZE_MODE=${RESIZE_MODE:-schedule}
 HYSTERESIS_ENABLE=${HYSTERESIS_ENABLE:-false}
 HYSTERESIS_WINDOW=${HYSTERESIS_WINDOW:-2}
@@ -33,9 +36,10 @@ HYSTERESIS_COOLDOWN=${HYSTERESIS_COOLDOWN:-0}
 HYSTERESIS_CONSECUTIVE=${HYSTERESIS_CONSECUTIVE:-1}
 HYSTERESIS_MIN_OBSERVATIONS=${HYSTERESIS_MIN_OBSERVATIONS:-1}
 HOST_STAGING_ENABLE=${HOST_STAGING_ENABLE:-true}
-HOST_STAGING_BACKEND=${HOST_STAGING_BACKEND:-disk_fallback}
+HARD_SWITCH_ENABLE=${HARD_SWITCH_ENABLE:-true}
+HOST_STAGING_BACKEND=${HOST_STAGING_BACKEND:-gpu_direct}
 HOST_STAGING_CHUNK_MB=${HOST_STAGING_CHUNK_MB:-256}
-HOST_STAGING_STAGE_OPTIMIZER=${HOST_STAGING_STAGE_OPTIMIZER:-true}
+HOST_STAGING_STAGE_OPTIMIZER=${HOST_STAGING_STAGE_OPTIMIZER:-false}
 HOST_STAGING_OPTIMIZER_RESTORE_POLICY=${HOST_STAGING_OPTIMIZER_RESTORE_POLICY:-deferred}
 HOST_STAGING_PROGRESSIVE_SWAP=${HOST_STAGING_PROGRESSIVE_SWAP:-true}
 HOST_STAGING_HOST_PRELOAD_THRESHOLD=${HOST_STAGING_HOST_PRELOAD_THRESHOLD:-0.85}
@@ -46,6 +50,7 @@ COMM_CACHE_RESERVE_SCHEDULE=${COMM_CACHE_RESERVE_SCHEDULE:-true}
 BUDGET_PROTECTION_ENABLE=${BUDGET_PROTECTION_ENABLE:-false}
 MEMORY_BUDGET_RATIO=${MEMORY_BUDGET_RATIO:-0.85}
 CKPT_DIR=${CKPT_DIR:-/file_system/dhl/save_ckpt/dynamic-resize}
+PROFILER_ENABLE=${PROFILER_ENABLE:-true}
 RAY_TMPDIR=${RAY_TMPDIR:-}
 
 if [[ -n "${RAY_TMPDIR}" ]]; then
@@ -67,6 +72,7 @@ import os
 import shlex
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 
@@ -75,7 +81,7 @@ def convert(src: str, dst_name: str) -> str:
     needs_conversion = (
         "data_source" not in df.columns
         or "reward_model" not in df.columns
-        or not df["prompt"].map(lambda x: isinstance(x, list)).all()
+        or not df["prompt"].map(lambda x: isinstance(x, (list, tuple, np.ndarray))).all()
     )
     if not needs_conversion:
         return src
@@ -111,6 +117,15 @@ print(f"VAL_FILE={shlex.quote(val)}")
 PY_CONVERT
 )"
 
+# VERL_RESIZE_VERIFY=1 selects the verification version of this launcher, anything else the plain one:
+# every gpu_direct switch compares both sides (the workers read the variable), verl logs at DEBUG level
+# and the resize metrics of every step go to ${CKPT_DIR}/resize_trace.jsonl.
+if [[ "${VERL_RESIZE_VERIFY:-}" == "1" ]]; then
+  export VERL_LOGGING_LEVEL=${VERL_LOGGING_LEVEL:-DEBUG}
+  set -- trainer.dynamic_resize.trace.enable=true \
+    trainer.dynamic_resize.trace.path="${CKPT_DIR}/resize_trace.jsonl" "$@"
+fi
+
 python3 -m verl.experimental.one_step_off_policy.main_ppo \
   --config-path=config \
   --config-name=one_step_off_ppo_trainer_dynamic_resize.yaml \
@@ -122,9 +137,11 @@ python3 -m verl.experimental.one_step_off_policy.main_ppo \
   rollout.nnodes=1 \
   rollout.n_gpus_per_node=${n_gpus_rollout} \
   trainer.default_local_dir="${CKPT_DIR}" \
+  data.train_batch_size=${TRAIN_BATCH_SIZE} \
   trainer.total_training_steps=${total_training_steps} \
   trainer.save_freq=-1 \
   trainer.dynamic_resize.mode=${RESIZE_MODE} \
+  +trainer.dynamic_resize.hard_switch.enable=${HARD_SWITCH_ENABLE} \
   trainer.dynamic_resize.hysteresis.enable=${HYSTERESIS_ENABLE} \
   trainer.dynamic_resize.hysteresis.window_size=${HYSTERESIS_WINDOW} \
   trainer.dynamic_resize.hysteresis.up_threshold=${HYSTERESIS_UP_THRESHOLD} \
@@ -170,12 +187,16 @@ python3 -m verl.experimental.one_step_off_policy.main_ppo \
   trainer.test_freq=-1 \
   trainer.resume_mode=disable \
   trainer.logger='["console"]' \
-  actor_rollout_ref.hybrid_engine=false \
+  actor_rollout_ref.hybrid_engine=true \
   actor_rollout_ref.actor.use_torch_compile=false \
   actor_rollout_ref.actor.strategy=${ACTOR_STRATEGY} \
+  actor_rollout_ref.actor.use_kl_loss=${USE_KL_LOSS} \
   critic.strategy=${ACTOR_STRATEGY} \
+  actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE} \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+  critic.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE} \
   critic.ppo_micro_batch_size_per_gpu=4 \
+  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.enforce_eager=true \
@@ -184,6 +205,7 @@ python3 -m verl.experimental.one_step_off_policy.main_ppo \
   actor_rollout_ref.rollout.gpu_memory_utilization=0.3 \
   critic.model.path="${RESOLVED_MODEL_PATH}" \
   critic.model.tokenizer_path="${RESOLVED_MODEL_PATH}" \
-  +global_profiler.enabled=true \
+  +global_profiler.enabled=${PROFILER_ENABLE} \
   +global_profiler.tool=torch_profiler \
-  +global_profiler.save_dir="${CKPT_DIR}/profiler"
+  +global_profiler.save_dir="${CKPT_DIR}/profiler" \
+  "$@"

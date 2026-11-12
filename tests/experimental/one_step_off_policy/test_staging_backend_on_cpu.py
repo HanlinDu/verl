@@ -1,12 +1,22 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from pathlib import Path
 
 import pytest
 import torch
 
-from verl.utils.checkpoint.fsdp_checkpoint_manager import (
-    dynamic_resize_optimizer_status_path,
-    write_dynamic_resize_optimizer_restore_status,
-)
 from verl.experimental.one_step_off_policy.staging_backend import (
     HostStagingConfig,
     build_checkpoint_artifact_manifest,
@@ -25,6 +35,10 @@ from verl.experimental.one_step_off_policy.staging_backend import (
     save_paged_state_dict,
     update_restore_session_manifest,
     write_host_staging_manifest,
+)
+from verl.utils.checkpoint.fsdp_checkpoint_manager import (
+    dynamic_resize_optimizer_status_path,
+    write_dynamic_resize_optimizer_restore_status,
 )
 
 

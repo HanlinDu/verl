@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from contextlib import nullcontext
 from pprint import pprint
@@ -55,8 +56,8 @@ from verl.experimental.one_step_off_policy.staging_backend import (
     has_restore_session_manifest,
     read_restore_session_manifest,
     update_restore_session_manifest,
-    write_paged_state_manifest,
     write_host_staging_manifest,
+    write_paged_state_manifest,
 )
 from verl.experimental.one_step_off_policy.trace_utils import append_resize_trace, build_resize_trace_config
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
@@ -70,14 +71,14 @@ from verl.trainer.ppo.ray_trainer import (
 )
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
-from verl.utils.debug import marked_timer
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.debug import marked_timer
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import LLMServerManager
 
-
 logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class OneStepOffRayTrainer(SeparateRayPPOTrainer):
@@ -119,10 +120,11 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         self.config = config
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
-        assert not self.hybrid_engine
+        if self.hybrid_engine and not OmegaConf.select(config, "trainer.dynamic_resize.enable", default=False):
+            raise ValueError("one-step-off hybrid workers require trainer.dynamic_resize.enable=true")
+        if not self.hybrid_engine:
+            role_worker_mapping.pop(Role.Rollout, None)
 
-        # Skip rollout worker mapping and let agentloop create it.
-        role_worker_mapping.pop(Role.Rollout, None)
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = need_reference_policy(self.config)
@@ -184,6 +186,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         self._latest_resize_control_metrics: dict[str, float | str | int] = self._default_resize_control_metrics()
         self._latest_resize_budget_metrics: dict[str, float | str | int] = self._default_resize_budget_metrics()
         self._latest_resize_handoff_metrics: dict[str, float | str | int] = self._default_resize_handoff_metrics()
+        self._latest_gpu_direct_resize_metrics: dict[str, float | str | int] = {}
 
     @staticmethod
     def _cfg_to_plain_dict(cfg) -> dict[str, Any]:
@@ -276,6 +279,21 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/handoff_optimizer_stage_rank_count": 0.0,
             "resize/handoff_optimizer_stage_page_count": 0.0,
             "resize/handoff_optimizer_stage_bytes": 0.0,
+            "resize/gpu_direct_status": "disabled",
+            "resize/gpu_direct_verified": 0.0,
+            "resize/gpu_direct_tensor_count": 0.0,
+            "resize/gpu_direct_optimizer_tensor_count": 0.0,
+            "resize/gpu_direct_net_recv_bytes": 0.0,
+            "resize/gpu_direct_self_copy_bytes": 0.0,
+            "resize/gpu_direct_transfer_seconds": 0.0,
+            "resize/gpu_direct_peak_alloc_bytes": 0.0,
+            "resize/rollout_replicas_kept": 0.0,
+            "resize/rollout_replicas_retired": 0.0,
+            "resize/rollout_replicas_slept": 0.0,
+            "resize/rollout_replicas_woken": 0.0,
+            "resize/rollout_replicas_launched": 0.0,
+            "resize/rollout_rebuild_seconds": 0.0,
+            "resize/hard_switch_seconds": 0.0,
         }
 
     def _build_resize_control_metrics(self, snapshot: dict[str, float | str | int]) -> dict[str, float | str | int]:
@@ -349,8 +367,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         for item in schedule:
             if not isinstance(item, dict):
                 raise TypeError(
-                    "Each trainer.dynamic_resize.schedule item must be a dict, "
-                    f"got {type(item).__name__}: {item!r}"
+                    f"Each trainer.dynamic_resize.schedule item must be a dict, got {type(item).__name__}: {item!r}"
                 )
             normalized.append(item)
         return normalized
@@ -372,7 +389,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         size = spec["size"]
         if isinstance(size, int):
             return size
-        if isinstance(size, (list, tuple)):
+        if isinstance(size, list | tuple):
             index = int(spec.get("index", 0))
             if index < 0 or index >= len(size):
                 raise ValueError(f"dynamic resize pool index {index} out of range for size={size}")
@@ -442,7 +459,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                         pass
         return int(total)
 
-    def _get_dynamic_resize_resource_snapshot(self, worker_group, staging_path: str | None = None) -> ResizeBudgetSnapshot:
+    def _get_dynamic_resize_resource_snapshot(
+        self, worker_group, staging_path: str | None = None
+    ) -> ResizeBudgetSnapshot:
         if worker_group is None:
             return ResizeBudgetSnapshot()
         try:
@@ -460,7 +479,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         model_bytes = self._estimate_dynamic_resize_model_bytes(item)
         stage_bytes = model_bytes
         stage_optimizer = bool(getattr(self._host_staging_config, "stage_optimizer", False))
-        estimated_host_peak_bytes = int(item.get("estimated_host_peak_bytes") or model_bytes * (3.0 if stage_optimizer else 1.25))
+        estimated_host_peak_bytes = int(
+            item.get("estimated_host_peak_bytes") or model_bytes * (3.0 if stage_optimizer else 1.25)
+        )
         estimated_gpu_peak_bytes = int(item.get("estimated_gpu_peak_bytes") or model_bytes)
         metrics.update(
             {
@@ -608,7 +629,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 with open(path, encoding="utf-8") as f:
                     statuses.append(json.load(f))
             except Exception as exc:
-                logger.warning("[one-step-off][resize][handoff] failed to read optimizer restore status %s: %s", path, exc)
+                logger.warning(
+                    "[one-step-off][resize][handoff] failed to read optimizer restore status %s: %s", path, exc
+                )
         if not statuses:
             return {}
 
@@ -838,13 +861,102 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         if self.use_critic:
             self.critic_wg.load_checkpoint(critic_path, del_local_after_load=False)
 
+    def _gpu_direct_actor_model_resize_enabled(self) -> bool:
+        return bool(
+            self.hybrid_engine
+            and self._host_staging_config.enable
+            and self._host_staging_config.effective_backend() == "gpu_direct"
+        )
+
+    def _active_actor_ranks(self) -> list[int]:
+        active_topology = getattr(self, "_active_dynamic_resize_topology", None) or {}
+        actor_source = int(active_topology.get("actor_size", 0) or 0)
+        if actor_source <= 0:
+            raise RuntimeError("active actor topology is unavailable for GPU-direct resize")
+        return list(range(actor_source))
+
+    def _resize_actor_runtime_gpu_direct(self, actor_ranks: list[int]) -> dict[str, float | str | int]:
+        """Move the live actor runtime to ``actor_ranks`` shard-to-shard; no checkpoint is written or read."""
+        old_ranks = self._active_actor_ranks()
+        results = self._physical_actor_rollout_wg.resize_actor_runtime(
+            old_ranks, actor_ranks, low_memory=self._host_staging_config.gpu_direct_low_memory
+        )
+        members = [result for result in results if result.get("status") == "member"]
+        if len(members) != len(actor_ranks):
+            raise RuntimeError(f"GPU-direct resize produced {len(members)} actor ranks, expected {len(actor_ranks)}")
+        tensor_counts = {int(result.get("tensor_count", 0)) for result in members}
+        if len(tensor_counts) != 1:
+            raise RuntimeError(f"GPU-direct resize returned inconsistent tensor counts: {tensor_counts}")
+        net_recv = sum(int(result.get("net_recv_bytes", 0)) for result in members)
+        self_copy = sum(int(result.get("self_copy_bytes", 0)) for result in members)
+        seconds = max(float(result.get("transfer_seconds", 0.0)) for result in members)
+        verified = min(int(result.get("verified", 0)) for result in members)
+        logger.info(
+            "[one-step-off][resize] actor runtime moved %s -> %s ranks on GPU: tensors=%s optimizer_tensors=%s "
+            "net_recv_bytes=%s self_copy_bytes=%s seconds=%.2f verified=%s verified_scalars=%s",
+            old_ranks,
+            actor_ranks,
+            next(iter(tensor_counts)),
+            max(int(result.get("optimizer_tensor_count", 0)) for result in members),
+            net_recv,
+            self_copy,
+            seconds,
+            verified,
+            min(int(result.get("verified_scalar_count", 0)) for result in members),
+        )
+        for result in results:
+            logger.debug("[one-step-off][resize] actor rank %s: %s", result.get("rank"), result)
+        return {
+            "resize/gpu_direct_status": "moved",
+            "resize/gpu_direct_verified": float(verified),
+            "resize/gpu_direct_tensor_count": float(next(iter(tensor_counts))),
+            "resize/gpu_direct_optimizer_tensor_count": float(
+                max(int(result.get("optimizer_tensor_count", 0)) for result in members)
+            ),
+            "resize/gpu_direct_net_recv_bytes": float(net_recv),
+            "resize/gpu_direct_self_copy_bytes": float(self_copy),
+            "resize/gpu_direct_transfer_seconds": seconds,
+            "resize/gpu_direct_peak_alloc_bytes": float(max(int(r.get("peak_alloc_bytes", 0)) for r in members)),
+        }
+
+    def _resize_critic_runtime_gpu_direct(self, critic_ranks: list[int]) -> dict[str, float | str | int]:
+        """Move the critic runtime shard-to-shard onto ``critic_ranks`` (same topology as the actor)."""
+        old_ranks = self._active_actor_ranks()
+        results = self._physical_critic_wg.resize_runtime(
+            old_ranks, critic_ranks, low_memory=self._host_staging_config.gpu_direct_low_memory
+        )
+        members = [result for result in results if result.get("status") == "member"]
+        if len(members) != len(critic_ranks):
+            raise RuntimeError(f"GPU-direct critic resize produced {len(members)} ranks, expected {len(critic_ranks)}")
+        seconds = max(float(result.get("transfer_seconds", 0.0)) for result in members)
+        verified = min(int(result.get("verified", 0)) for result in members)
+        logger.info(
+            "[one-step-off][resize] critic runtime moved %s -> %s ranks on GPU: tensors=%s net_recv_bytes=%s "
+            "seconds=%.2f verified=%s verified_scalars=%s",
+            old_ranks,
+            critic_ranks,
+            max(int(result.get("tensor_count", 0)) for result in members),
+            sum(int(result.get("net_recv_bytes", 0)) for result in members),
+            seconds,
+            verified,
+            min(int(result.get("verified_scalar_count", 0)) for result in members),
+        )
+        for result in results:
+            logger.debug("[one-step-off][resize] critic rank %s: %s", result.get("rank"), result)
+        return {
+            "resize/gpu_direct_critic_net_recv_bytes": float(sum(int(r.get("net_recv_bytes", 0)) for r in members)),
+            "resize/gpu_direct_critic_transfer_seconds": seconds,
+            "resize/gpu_direct_critic_verified": float(verified),
+        }
+
     def _split_dynamic_resize_resource_pools(self, *, actor_size: int, rollout_size: int) -> None:
         topology = getattr(self.resource_pool_manager, "dynamic_resize_topology", None)
         if topology is None:
             raise ValueError("dynamic resize hard switch requires shared pool topology")
         if actor_size + rollout_size != topology.total_size:
             raise ValueError(
-                f"dynamic resize split must sum to {topology.total_size}, got actor={actor_size}, rollout={rollout_size}"
+                f"dynamic resize split must sum to {topology.total_size}, "
+                f"got actor={actor_size}, rollout={rollout_size}"
             )
 
         shared_pool = self.resource_pool_manager.resource_pool_dict[topology.shared_pool_name]
@@ -865,30 +977,51 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             except Exception as exc:
                 logger.debug("[one-step-off][resize] ignoring Ray actor kill failure: %s", exc)
 
-    async def _destroy_dynamic_resize_runtime(self) -> None:
+    async def _destroy_dynamic_resize_runtime(self, *, actor_target: int | None = None) -> None:
         checkpoint_manager = getattr(self, "checkpoint_manager", None)
         if checkpoint_manager is not None:
             try:
                 await checkpoint_manager.abort_replicas()
-                await checkpoint_manager.sleep_replicas()
+                if not self.hybrid_engine:
+                    await checkpoint_manager.sleep_replicas()
             except Exception as exc:
-                logger.warning("[one-step-off][resize] failed to quiesce rollout replicas before rebuild: %s", exc)
+                raise RuntimeError("Cannot resize before rollout replicas are quiescent") from exc
 
         async_rollout_manager = getattr(self, "async_rollout_manager", None)
         if async_rollout_manager is not None:
             self._kill_ray_actors(getattr(async_rollout_manager, "agent_loop_workers", []))
 
         llm_server_manager = getattr(self, "llm_server_manager", None)
-        if llm_server_manager is not None:
-            for replica in getattr(llm_server_manager, "rollout_replicas", []) or []:
-                self._kill_ray_actors(getattr(replica, "workers", []))
-            self._kill_ray_actors(getattr(llm_server_manager, "server_handles", []))
-            load_balancer = getattr(llm_server_manager, "global_load_balancer", None)
-            if load_balancer is not None:
-                self._kill_ray_actors([load_balancer])
+        self._latest_rollout_rebuild_metrics = {}
+        if llm_server_manager is not None and self.hybrid_engine and actor_target is not None:
+            # Hybrid: only the replicas whose GPUs become training ranks go away, and they go away now so
+            # the training side finds the memory free -- killed, or (dormant_rollout_replicas) put to sleep so
+            # they can be woken instead of relaunched when the GPUs come back. The remaining replicas keep
+            # their engines, weights and KV cache (paused by abort_replicas, resumed by the final update_weights).
+            retired = await llm_server_manager.retire_hybrid_replicas_below(
+                actor_target, dormant=self._host_staging_config.dormant_rollout_replicas
+            )
+            if retired["shutdown"] or retired["slept"]:
+                logger.info(
+                    "[one-step-off][resize] rollout replicas ahead of the training rebuild: shut down %s, parked %s",
+                    retired["shutdown"],
+                    retired["slept"],
+                )
+            self._latest_rollout_rebuild_metrics["resize/rollout_replicas_retired"] = float(len(retired["shutdown"]))
+            self._latest_rollout_rebuild_metrics["resize/rollout_replicas_slept"] = float(len(retired["slept"]))
 
-        for worker_group in getattr(self, "all_wg", {}).values():
-            self._kill_ray_actors(getattr(worker_group, "workers", []))
+        if llm_server_manager is not None:
+            if not self.hybrid_engine:
+                for replica in getattr(llm_server_manager, "rollout_replicas", []) or []:
+                    self._kill_ray_actors(getattr(replica, "workers", []))
+                self._kill_ray_actors(getattr(llm_server_manager, "server_handles", []))
+                load_balancer = getattr(llm_server_manager, "global_load_balancer", None)
+                if load_balancer is not None:
+                    self._kill_ray_actors([load_balancer])
+
+        if not self.hybrid_engine:
+            for worker_group in getattr(self, "all_wg", {}).values():
+                self._kill_ray_actors(getattr(worker_group, "workers", []))
 
     def _build_dynamic_resize_checkpoint_manager(self) -> None:
         checkpoint_manager_class_fqn = self.config.actor_rollout_ref.rollout.get("checkpoint_manager_class")
@@ -897,10 +1030,110 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         else:
             from verl.checkpoint_engine import CheckpointEngineManager
 
-        self.checkpoint_manager = CheckpointEngineManager(
+        checkpoint_manager_kwargs = dict(
             config=omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine),
             actor_wg=self.actor_rollout_wg,
             replicas=self.llm_server_manager.get_replicas(),
+        )
+        if not checkpoint_manager_class_fqn:
+            checkpoint_manager_kwargs["rollout_wg"] = getattr(self, "_runtime_rollout_worker_group", None)
+        self.checkpoint_manager = CheckpointEngineManager(**checkpoint_manager_kwargs)
+
+    def _rebuild_hybrid_training_runtime(self, actor_size: int, *, gpu_direct: bool = False) -> None:
+        """Rebuild training subgroups while retaining the physical Ray actors.
+
+        With ``gpu_direct`` the live actor runtime is moved shard-to-shard onto the new subgroup instead of
+        being shut down and re-read from disk.
+        """
+        physical_actor_wg = self._physical_actor_rollout_wg
+        physical_world_size = physical_actor_wg.world_size
+        if actor_size <= 0 or actor_size > physical_world_size:
+            raise ValueError(f"actor_size must be in [1, {physical_world_size}], got {actor_size}")
+
+        actor_ranks = list(range(actor_size))
+        physical_critic_wg = getattr(self, "_physical_critic_wg", None)
+        physical_ref_wg = getattr(self, "_physical_ref_policy_wg", None)
+        if gpu_direct and physical_ref_wg is not None:
+            raise NotImplementedError("GPU-direct resize does not cover a separate reference worker group")
+
+        if gpu_direct:
+            # Build the new runtimes beside the old ones, move the state shard-to-shard, then retire the old
+            # ones. Groups are created/destroyed inside the workers in a deterministic order.
+            self._latest_gpu_direct_resize_metrics = self._resize_actor_runtime_gpu_direct(actor_ranks)
+            if physical_critic_wg is not None:
+                self._latest_gpu_direct_resize_metrics.update(self._resize_critic_runtime_gpu_direct(actor_ranks))
+        else:
+            physical_actor_wg.shutdown_actor_runtime()
+            physical_actor_wg.destroy_actor_process_group()
+
+            if physical_critic_wg is not None:
+                physical_critic_wg.shutdown_runtime()
+                physical_critic_wg.destroy_process_group()
+
+            if physical_ref_wg is not None:
+                physical_ref_wg.shutdown_runtime()
+                physical_ref_wg.destroy_process_group()
+
+            # Every physical rank must create groups in the same order, including
+            # ranks which become rollout-only after this transition.
+            physical_actor_wg.prepare_actor_process_group(actor_ranks)
+            if physical_critic_wg is not None:
+                physical_critic_wg.prepare_process_group(actor_ranks)
+            if physical_ref_wg is not None:
+                physical_ref_wg.prepare_process_group(actor_ranks)
+
+        self.actor_wg = physical_actor_wg.subgroup(actor_ranks, name_prefix="hybrid_actor")
+        self.actor_rollout_wg = self.actor_wg
+        if not gpu_direct:
+            self.actor_wg.reinitialize_actor_runtime()
+
+        if physical_critic_wg is not None:
+            self.critic_wg = physical_critic_wg.subgroup(actor_ranks, name_prefix="hybrid_critic")
+            if not gpu_direct:
+                self.critic_wg.reinitialize_runtime()
+
+        if physical_ref_wg is not None:
+            self.ref_policy_wg = physical_ref_wg.subgroup(actor_ranks, name_prefix="hybrid_ref")
+            self.ref_policy_wg.reinitialize_runtime()
+        elif self.actor_role == Role.ActorRolloutRef:
+            self.ref_policy_wg = self.actor_wg
+
+    def _validate_hybrid_split(self, *, actor_size: int, rollout_size: int) -> int:
+        physical_world_size = self._physical_actor_rollout_wg.world_size
+        if actor_size <= 0 or rollout_size <= 0:
+            raise ValueError(f"hybrid split sizes must be positive, got actor={actor_size}, rollout={rollout_size}")
+        if actor_size + rollout_size != physical_world_size:
+            raise ValueError(
+                f"hybrid resize split must sum to the physical worker size {physical_world_size}, "
+                f"got actor={actor_size}, rollout={rollout_size}"
+            )
+
+        rollout_world_size = (
+            self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
+            * self.config.actor_rollout_ref.rollout.data_parallel_size
+            * self.config.actor_rollout_ref.rollout.pipeline_model_parallel_size
+        )
+        if actor_size % rollout_world_size != 0 or rollout_size % rollout_world_size != 0:
+            raise ValueError(
+                f"hybrid split sizes must be divisible by rollout world size {rollout_world_size}, "
+                f"got actor={actor_size}, rollout={rollout_size}"
+            )
+        data_config = self.config.get("data")
+        if data_config is not None and data_config.get("train_batch_size") is not None:
+            effective_batch_size = int(data_config.train_batch_size) * int(
+                self.config.actor_rollout_ref.rollout.get("n", 1)
+            )
+            if effective_batch_size % actor_size != 0:
+                raise ValueError(
+                    f"effective train batch size {effective_batch_size} must be divisible by actor_size {actor_size}"
+                )
+        return rollout_world_size
+
+    def _set_hybrid_rollout_subgroup(self, *, actor_size: int) -> None:
+        physical_worker_group = self._physical_actor_rollout_wg
+        self._runtime_rollout_worker_group = physical_worker_group.subgroup(
+            list(range(actor_size, physical_worker_group.world_size)),
+            name_prefix="hybrid_rollout",
         )
 
     def _refresh_dynamic_resize_checkpoint_group_name(self) -> None:
@@ -917,13 +1150,54 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             if backend_kwargs is None:
                 backend_kwargs = {}
                 engine_kwargs[backend] = backend_kwargs
-            backend_kwargs_context = open_dict(backend_kwargs) if isinstance(backend_kwargs, DictConfig) else nullcontext()
+            backend_kwargs_context = (
+                open_dict(backend_kwargs) if isinstance(backend_kwargs, DictConfig) else nullcontext()
+            )
             with backend_kwargs_context:
                 backend_kwargs["group_name"] = f"dynamic_resize_{self.global_steps}_{uuid.uuid4().hex}"
+                backend_kwargs["rebuild_group"] = True
             engine_kwargs[backend] = backend_kwargs
 
+    async def _rebuild_hybrid_dynamic_resize_runtime(self, *, actor_size: int, rollout_size: int) -> None:
+        rollout_world_size = self._validate_hybrid_split(actor_size=actor_size, rollout_size=rollout_size)
+        physical_worker_group = self._physical_actor_rollout_wg
+
+        self._rebuild_hybrid_training_runtime(
+            actor_size=actor_size, gpu_direct=self._gpu_direct_actor_model_resize_enabled()
+        )
+        self._set_hybrid_rollout_subgroup(actor_size=actor_size)
+        physical_worker_group.reset_rollout_server_handle()
+        rollout_rebuild_start = time.perf_counter()
+        rebuild = await self.llm_server_manager.rebuild_hybrid_runtime(
+            self._runtime_rollout_worker_group,
+            start_rank=actor_size // rollout_world_size,
+        )
+        rollout_metrics = getattr(self, "_latest_rollout_rebuild_metrics", None) or {}
+        rollout_metrics.update(
+            {
+                "resize/rollout_replicas_kept": float(len(rebuild.get("kept", []))),
+                "resize/rollout_replicas_woken": float(len(rebuild.get("woken", []))),
+                "resize/rollout_replicas_launched": float(len(rebuild.get("launched", []))),
+                "resize/rollout_replicas_retired": float(
+                    rollout_metrics.get("resize/rollout_replicas_retired", 0.0) + len(rebuild.get("retired", []))
+                ),
+                "resize/rollout_rebuild_seconds": time.perf_counter() - rollout_rebuild_start,
+            }
+        )
+        self._latest_rollout_rebuild_metrics = rollout_metrics
+        self._init_agent_loop_manager()
+        self._refresh_dynamic_resize_checkpoint_group_name()
+        checkpoint_engine_config = self.config.actor_rollout_ref.rollout.checkpoint_engine
+        backend_kwargs = checkpoint_engine_config.engine_kwargs[checkpoint_engine_config.backend]
+        physical_worker_group.reconfigure_checkpoint_engine(
+            group_name=backend_kwargs.group_name,
+            rebuild_group=True,
+        )
+        self._build_dynamic_resize_checkpoint_manager()
+
     def _rebuild_dynamic_resize_runtime(self, *, actor_size: int, rollout_size: int) -> None:
-        self._split_dynamic_resize_resource_pools(actor_size=actor_size, rollout_size=rollout_size)
+        if not self.hybrid_engine:
+            self._split_dynamic_resize_resource_pools(actor_size=actor_size, rollout_size=rollout_size)
         self._refresh_dynamic_resize_checkpoint_group_name()
         mapped_pool_names = set(self.resource_pool_manager.mapping.values())
         self.resource_pool_to_cls = {
@@ -952,33 +1226,57 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             metrics.update({"resize/unsupported_reason": reason, "resize/pending_resource_switch": 1.0})
             return metrics
 
-        checkpoint_step_folder = self._dynamic_resize_checkpoint_step_folder()
-        with marked_timer("dynamic_resize_save_checkpoint", self.timing_raw, color="green"):
-            self._save_checkpoint(save_full_model_for_dynamic_resize=True)
-            metrics.update(self._prepare_dynamic_resize_handoff_session(checkpoint_step_folder))
-            optimizer_stage_metrics = self._stage_dynamic_resize_optimizer_handoff(checkpoint_step_folder)
-            metrics.update(optimizer_stage_metrics)
+        switch_start = time.perf_counter()
+        gpu_direct = self._gpu_direct_actor_model_resize_enabled()
+        if gpu_direct:
+            # The training state moves GPU-to-GPU inside the rebuild; nothing is written to or read from
+            # disk and a failure aborts the run instead of falling back.
+            optimizer_stage_metrics: dict[str, float | str | int] = {}
+            checkpoint_step_folder = None
+        else:
+            checkpoint_step_folder = self._dynamic_resize_checkpoint_step_folder()
+            with marked_timer("dynamic_resize_save_checkpoint", self.timing_raw, color="green"):
+                self._save_checkpoint(save_full_model_for_dynamic_resize=True)
+                metrics.update(self._prepare_dynamic_resize_handoff_session(checkpoint_step_folder))
+                optimizer_stage_metrics = self._stage_dynamic_resize_optimizer_handoff(checkpoint_step_folder)
+                metrics.update(optimizer_stage_metrics)
 
-        await self._destroy_dynamic_resize_runtime()
+        await self._destroy_dynamic_resize_runtime(actor_target=actor_target)
+
         with marked_timer("dynamic_resize_rebuild_runtime", self.timing_raw, color="green"):
-            self._rebuild_dynamic_resize_runtime(actor_size=actor_target, rollout_size=rollout_target)
-            self._load_dynamic_resize_checkpoint(checkpoint_step_folder)
-            metrics.update(self._complete_dynamic_resize_handoff_session(checkpoint_step_folder))
-            metrics.update(
-                {
-                    key: value
-                    for key, value in optimizer_stage_metrics.items()
-                    if key.startswith("resize/handoff_optimizer_stage")
-                }
-            )
-            if optimizer_stage_metrics.get("resize/handoff_error") and not metrics.get("resize/handoff_error"):
-                metrics["resize/handoff_error"] = optimizer_stage_metrics["resize/handoff_error"]
+            self._latest_gpu_direct_resize_metrics = {}
+            if self.hybrid_engine:
+                await self._rebuild_hybrid_dynamic_resize_runtime(
+                    actor_size=actor_target,
+                    rollout_size=rollout_target,
+                )
+            else:
+                self._rebuild_dynamic_resize_runtime(actor_size=actor_target, rollout_size=rollout_target)
+
+            if gpu_direct:
+                metrics.update(self._latest_gpu_direct_resize_metrics)
+            else:
+                self._load_dynamic_resize_checkpoint(checkpoint_step_folder)
+                metrics.update(self._complete_dynamic_resize_handoff_session(checkpoint_step_folder))
+                metrics.update(
+                    {
+                        key: value
+                        for key, value in optimizer_stage_metrics.items()
+                        if key.startswith("resize/handoff_optimizer_stage")
+                    }
+                )
+                if optimizer_stage_metrics.get("resize/handoff_error") and not metrics.get("resize/handoff_error"):
+                    metrics["resize/handoff_error"] = optimizer_stage_metrics["resize/handoff_error"]
 
         with marked_timer("dynamic_resize_update_weights", self.timing_raw, color="green"):
             await self.checkpoint_manager.update_weights(self.global_steps)
 
+        self._active_dynamic_resize_topology = {"actor_size": actor_target, "rollout_size": rollout_target}
+        # After the handoff-session metrics, which carry defaults for these keys.
+        metrics.update(getattr(self, "_latest_rollout_rebuild_metrics", None) or {})
         metrics.update(
             {
+                "resize/hard_switch_seconds": time.perf_counter() - switch_start,
                 "resize/schedule_applied": 1.0,
                 "resize/pending_resource_switch": 0.0,
                 "resize/hard_switch_success": 1.0,
@@ -1029,9 +1327,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 continue
 
             if self._dynamic_resize_hard_switch_enabled():
-                metrics.update(
-                    await self._apply_dynamic_resize_hard_switch(item=item, required_action=required_action)
-                )
+                metrics.update(await self._apply_dynamic_resize_hard_switch(item=item, required_action=required_action))
                 continue
 
             reason = "dynamic_resize_hard_switch_disabled"
@@ -1066,7 +1362,15 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
     def _init_resource_pools(self):
         self.resource_pool_manager.create_resource_pool()
         self._dynamic_resize_rollout_resource_pool = None
-        if dynamic_resize_shared_pool_enabled(self.config):
+        if dynamic_resize_shared_pool_enabled(self.config) and getattr(self, "hybrid_engine", False):
+            topology = getattr(self.resource_pool_manager, "dynamic_resize_topology", None)
+            if topology is None:
+                raise ValueError("trainer.dynamic_resize.shared_pool requires dynamic resize pool topology")
+            self._active_dynamic_resize_topology = {
+                "actor_size": topology.initial_actor_size,
+                "rollout_size": topology.initial_rollout_size,
+            }
+        elif dynamic_resize_shared_pool_enabled(self.config):
             topology = getattr(self.resource_pool_manager, "dynamic_resize_topology", None)
             if topology is None:
                 raise ValueError("trainer.dynamic_resize.shared_pool requires dynamic resize pool topology")
@@ -1094,7 +1398,12 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         }
 
     def _create_actor_rollout_classes(self):
-        for role in [Role.Actor]:
+        if not self.hybrid_engine:
+            actor_role = Role.Actor
+        else:
+            actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
+        self.actor_role = actor_role
+        for role in [actor_role]:
             resource_pool = self.resource_pool_manager.get_resource_pool(role)
             role_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[role],
@@ -1104,9 +1413,27 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             self.resource_pool_to_cls[resource_pool][str(role)] = role_cls
 
     def _init_models(self):
+        # Shared-pool dynamic resize: build the training runtimes directly on the initial actor ranks
+        # instead of on every physical rank followed by a shrink.
+        initial_actor_ranks = None
+        if dynamic_resize_shared_pool_enabled(self.config) and self.hybrid_engine:
+            topology = self.resource_pool_manager.dynamic_resize_topology
+            self._physical_actor_rollout_wg = self.all_wg[str(self.actor_role)]  # needed by the split check
+            rollout_world_size = self._validate_hybrid_split(
+                actor_size=topology.initial_actor_size,
+                rollout_size=topology.initial_rollout_size,
+            )
+            initial_actor_ranks = list(range(topology.initial_actor_size))
+            # Before any training runtime exists: vLLM sizes its memory budget against the free memory it
+            # sees at start-up, so the replicas on the initial actor GPUs can only be launched now.
+            self._prelaunch_hybrid_rollout_pool(dormant_below=topology.initial_actor_size // rollout_world_size)
+
         if self.use_critic:
             self.critic_wg = self.all_wg[str(Role.Critic)]
-            self.critic_wg.reset()
+            if initial_actor_ranks is None:
+                self.critic_wg.reset()
+            else:
+                self.critic_wg.reset_on(initial_actor_ranks)
             # assign critic loss
             from functools import partial
 
@@ -1115,44 +1442,110 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             value_loss_ = partial(value_loss, config=self.orig_critic_cfg)
             self.critic_wg.set_loss_fn(value_loss_)
 
-        if self.use_reference_policy and not self.ref_in_actor:
+        if self.use_reference_policy and not self.ref_in_actor and self.actor_role != Role.ActorRolloutRef:
             self.ref_policy_wg = self.all_wg[str(Role.RefPolicy)]
-            self.ref_policy_wg.init_model()
+            self.ref_policy_wg.init_model(actor_ranks=initial_actor_ranks)
 
         self.rm_wg = None
         if self.use_rm:
             self.rm_wg = self.all_wg[str(Role.RewardModel)]
             self.rm_wg.init_model()
 
-        self.actor_wg = self.all_wg[str(Role.Actor)]
-        self.actor_wg.init_model()
+        self.actor_wg = self.all_wg[str(self.actor_role)]
+        self._physical_actor_rollout_wg = self.actor_wg
+        self.actor_wg.init_model(actor_ranks=initial_actor_ranks)
         self.actor_rollout_wg = self.actor_wg
+        if self.actor_role == Role.ActorRolloutRef:
+            self.ref_policy_wg = self.actor_rollout_wg
+
+        if self.use_critic:
+            self._physical_critic_wg = self.critic_wg
+        if self.use_reference_policy and not self.ref_in_actor and self.actor_role != Role.ActorRolloutRef:
+            self._physical_ref_policy_wg = self.ref_policy_wg
+
+        if initial_actor_ranks is not None:
+            if self._gpu_direct_actor_model_resize_enabled():
+                # Fail at startup, not at the first resize, if an engine cannot move shard-to-shard.
+                self._physical_actor_rollout_wg.check_gpu_direct_resize_supported()
+                if getattr(self, "_physical_critic_wg", None) is not None:
+                    self._physical_critic_wg.check_gpu_direct_resize_supported()
+            # The runtimes already live on the initial ranks; only the logical subgroups are needed.
+            self.actor_wg = self._physical_actor_rollout_wg.subgroup(initial_actor_ranks, name_prefix="hybrid_actor")
+            self.actor_rollout_wg = self.actor_wg
+            if self.actor_role == Role.ActorRolloutRef:
+                self.ref_policy_wg = self.actor_wg
+            if getattr(self, "_physical_critic_wg", None) is not None:
+                self.critic_wg = self._physical_critic_wg.subgroup(initial_actor_ranks, name_prefix="hybrid_critic")
+            if getattr(self, "_physical_ref_policy_wg", None) is not None:
+                self.ref_policy_wg = self._physical_ref_policy_wg.subgroup(
+                    initial_actor_ranks, name_prefix="hybrid_ref"
+                )
+            self._set_hybrid_rollout_subgroup(actor_size=len(initial_actor_ranks))
+            self._active_dynamic_resize_topology = {
+                "actor_size": topology.initial_actor_size,
+                "rollout_size": topology.initial_rollout_size,
+            }
 
     def _init_async_rollout_manager(self):
-        # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
-        # agent_reward_loop: streaming reward computation with actor rollout
-        # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
-        enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
-
-        # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
-        # to stream reward computation with actor rollout
-        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
-
         # create async rollout manager and request scheduler
         assert self.config.actor_rollout_ref.rollout.mode == "async"
+        rollout_worker_group = (
+            getattr(self, "_runtime_rollout_worker_group", self.actor_rollout_wg) if self.hybrid_engine else None
+        )
+        rollout_start_rank = 0
+        active_topology = getattr(self, "_active_dynamic_resize_topology", None)
+        if self.hybrid_engine and active_topology is not None and rollout_worker_group is not self.actor_rollout_wg:
+            rollout_world_size = (
+                self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
+                * self.config.actor_rollout_ref.rollout.data_parallel_size
+                * self.config.actor_rollout_ref.rollout.pipeline_model_parallel_size
+            )
+            rollout_start_rank = int(active_topology["actor_size"]) // rollout_world_size
 
-        # Support custom AgentLoopManager via config
+        prelaunched = getattr(self, "_prelaunched_llm_server_manager", None)
+        if prelaunched is not None:
+            self.llm_server_manager = prelaunched
+            self._prelaunched_llm_server_manager = None
+        else:
+            self.llm_server_manager = LLMServerManager.create(
+                config=self.config,
+                worker_group=rollout_worker_group,
+                rollout_resource_pool=getattr(self, "_dynamic_resize_rollout_resource_pool", None),
+                start_rank=rollout_start_rank,
+            )
+        self.async_rollout_mode = True
+        self._init_agent_loop_manager()
+
+    def _prelaunch_hybrid_rollout_pool(self, *, dormant_below: int) -> None:
+        """Launch one vLLM replica on every GPU pair of the shared pool, parking those on the actor GPUs.
+
+        With ``handoff.dormant_rollout_replicas`` every pair gets its replica once, at start-up: the ones on
+        the initial actor GPUs (``replica_rank < dormant_below``) go to sleep right away and are woken by the
+        first switch that hands their GPUs to rollout, so no switch ever launches a replica. Launching all
+        pairs concurrently costs the same wall time as launching the rollout pairs alone.
+        ``_init_async_rollout_manager`` adopts the manager built here.
+        """
+        self._prelaunched_llm_server_manager = None
+        if not self._host_staging_config.dormant_rollout_replicas:
+            return
+        self._prelaunched_llm_server_manager = LLMServerManager.create(
+            config=self.config,
+            worker_group=self._physical_actor_rollout_wg,
+            rollout_resource_pool=getattr(self, "_dynamic_resize_rollout_resource_pool", None),
+            dormant_below=dormant_below,
+        )
+
+    def _init_agent_loop_manager(self):
+        """Create agent-loop workers for the current rollout server client."""
+        enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
+        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
+
         manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
         if manager_class_fqn:
             AgentLoopManager = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
         else:
             from verl.experimental.agent_loop import AgentLoopManager
 
-        self.llm_server_manager = LLMServerManager.create(
-            config=self.config,
-            rollout_resource_pool=getattr(self, "_dynamic_resize_rollout_resource_pool", None),
-        )
-        self.async_rollout_mode = True
         self.async_rollout_manager = AgentLoopManager.create(
             config=self.config,
             llm_client=self.llm_server_manager.get_client(),

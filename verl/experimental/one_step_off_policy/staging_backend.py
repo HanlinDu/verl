@@ -1,3 +1,17 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Host-side staging metadata helpers for one-step-off dynamic resize."""
 
 from __future__ import annotations
@@ -10,7 +24,6 @@ from dataclasses import asdict, dataclass
 from typing import Any, Iterator
 
 import torch
-
 
 HOST_STAGING_MANIFEST = "host_staging_manifest.json"
 _PAGED_STATE_SUFFIX = "_pages.json"
@@ -33,9 +46,16 @@ class HostStagingConfig:
     device_preload_threshold: float = 0.9
     cleanup_after_load: bool = True
     preclear_rollout_kv_cache: bool = True
+    # gpu_direct only: move one FSDP2 unit at a time so the peak is max(old, new) + one unit instead
+    # of old + new shards. Touches FSDP2 internals; keep off unless memory is tight.
+    gpu_direct_low_memory: bool = False
+    # Hybrid resize: launch one vLLM replica per GPU pair at start-up and keep the ones on training GPUs asleep
+    # (weights + KV cache freed, server processes and communicators kept), so a switch only sleeps / wakes
+    # replicas instead of killing / relaunching them. Costs about a CUDA context (~1 GB) per training GPU.
+    dormant_rollout_replicas: bool = True
 
     @classmethod
-    def from_dict(cls, cfg: dict[str, Any] | None) -> "HostStagingConfig":
+    def from_dict(cls, cfg: dict[str, Any] | None) -> HostStagingConfig:
         cfg = cfg or {}
         return cls(
             enable=bool(cfg.get("enable", True)),
@@ -43,7 +63,9 @@ class HostStagingConfig:
             service_name=_normalize_optional_string(cfg.get("service_name")),
             chunk_mb=max(int(cfg.get("chunk_mb", 256)), 1),
             stage_optimizer=bool(cfg.get("stage_optimizer", True)),
-            optimizer_restore_policy=_normalize_optimizer_restore_policy(cfg.get("optimizer_restore_policy", "deferred")),
+            optimizer_restore_policy=_normalize_optimizer_restore_policy(
+                cfg.get("optimizer_restore_policy", "deferred")
+            ),
             progressive_swap=bool(cfg.get("progressive_swap", True)),
             async_optimizer_preload=bool(cfg.get("async_optimizer_preload", True)),
             optimizer_full_state_restore=bool(cfg.get("optimizer_full_state_restore", True)),
@@ -52,6 +74,8 @@ class HostStagingConfig:
             device_preload_threshold=min(max(float(cfg.get("device_preload_threshold", 0.9)), 0.0), 1.0),
             cleanup_after_load=bool(cfg.get("cleanup_after_load", True)),
             preclear_rollout_kv_cache=bool(cfg.get("preclear_rollout_kv_cache", True)),
+            gpu_direct_low_memory=bool(cfg.get("gpu_direct_low_memory", False)),
+            dormant_rollout_replicas=bool(cfg.get("dormant_rollout_replicas", True)),
         )
 
     def should_restore_optimizer_on_load(self) -> bool:
@@ -99,14 +123,16 @@ class RestoreSessionManifest:
         return data
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> "RestoreSessionManifest":
+    def from_dict(cls, data: dict[str, Any] | None) -> RestoreSessionManifest:
         data = data or {}
         return cls(
             session_id=str(data.get("session_id") or uuid.uuid4().hex),
             backend=str(data.get("backend", "disk_fallback")),
             service_name=_normalize_optional_string(data.get("service_name")),
             status=str(data.get("status", "staged")),
-            optimizer_restore_policy=_normalize_optimizer_restore_policy(data.get("optimizer_restore_policy", "deferred")),
+            optimizer_restore_policy=_normalize_optimizer_restore_policy(
+                data.get("optimizer_restore_policy", "deferred")
+            ),
             model_page_count=max(int(data.get("model_page_count", 0)), 0),
             optimizer_page_count=max(int(data.get("optimizer_page_count", 0)), 0),
             staged_model_bytes=max(int(data.get("staged_model_bytes", 0)), 0),
@@ -432,7 +458,9 @@ def iter_paged_state_dict(
             for idx in range(len(file_names)):
                 page = next_future.result()
                 if idx + 1 < len(file_names):
-                    next_future = executor.submit(load_paged_state_page, stage_dir, file_names[idx + 1], pin_memory=True)
+                    next_future = executor.submit(
+                        load_paged_state_page, stage_dir, file_names[idx + 1], pin_memory=True
+                    )
                 yield page
         return
 
@@ -509,7 +537,7 @@ def _estimate_object_bytes(value: Any) -> int:
         return int(value.numel() * value.element_size())
     if isinstance(value, dict):
         return sum(_estimate_object_bytes(item) for item in value.values())
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return sum(_estimate_object_bytes(item) for item in value)
     return 1
 

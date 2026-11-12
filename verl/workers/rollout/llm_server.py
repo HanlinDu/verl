@@ -370,6 +370,10 @@ class LLMServerManager:
             else init standalone server with a new resource pool.
         rollout_resource_pool (RayResourcePool): Resource pool for the server replicas, only needed for TensorRT-LLM.
         start_rank (int): First ``replica_rank`` to assign.  Defaults to 0.
+        dormant_below (int): Hybrid pre-launched pool: the replicas with ``replica_rank < dormant_below`` sit
+            on GPUs that currently belong to the training side. They are launched together with the others
+            and put to sleep at once (weights + KV cache freed, server actors kept) so that a later resize
+            only has to wake them. Needs vLLM with sleep mode; otherwise those replicas are not launched.
     """
 
     def __init__(
@@ -378,6 +382,7 @@ class LLMServerManager:
         worker_group: RayWorkerGroup = None,
         rollout_resource_pool: RayResourcePool = None,
         start_rank: int = 0,
+        dormant_below: int = 0,
     ):
         self.config = config
         self.rollout_config = config.actor_rollout_ref.rollout
@@ -385,6 +390,11 @@ class LLMServerManager:
         self.worker_group = worker_group
         self.rollout_resource_pool = rollout_resource_pool
         self.start_rank = start_rank
+        self.dormant_below = dormant_below
+        # Hybrid replicas parked asleep (no weights / KV cache on the GPU) with their server actors and
+        # communicators alive, keyed by replica_rank: pre-launched below ``dormant_below`` at start-up or
+        # retired by ``retire_hybrid_replicas_below(dormant=True)``.
+        self._dormant_replicas: dict[int, RolloutReplica] = {}
 
         assert worker_group is not None or self.rollout_config.nnodes > 0, "nnodes must be > 0 in standalone mode"
 
@@ -404,16 +414,8 @@ class LLMServerManager:
         await instance._init_global_load_balancer()
         return instance
 
-    async def _initialize_llm_servers(self, start_rank: int = None):
-        """Initialize the LLM server replicas.
-
-        Args:
-            start_rank: First ``replica_rank`` to assign.  Defaults to ``self.start_rank``
-                so standalone replicas can avoid Ray named-actor collisions with hybrid
-                replicas (which start at 0) when both coexist (e.g. separate async).
-        """
-        if start_rank is None:
-            start_rank = self.start_rank
+    def replica_world_size(self) -> int:
+        """Number of workers (GPUs) one replica occupies."""
         rollout_world_size = (
             self.rollout_config.tensor_model_parallel_size
             * self.rollout_config.data_parallel_size
@@ -435,6 +437,19 @@ class LLMServerManager:
                 * self.rollout_config.data_parallel_size
                 * self.rollout_config.pipeline_model_parallel_size
             )
+        return rollout_world_size
+
+    async def _initialize_llm_servers(self, start_rank: int = None):
+        """Initialize the LLM server replicas.
+
+        Args:
+            start_rank: First ``replica_rank`` to assign.  Defaults to ``self.start_rank``
+                so standalone replicas can avoid Ray named-actor collisions with hybrid
+                replicas (which start at 0) when both coexist (e.g. separate async).
+        """
+        if start_rank is None:
+            start_rank = self.start_rank
+        rollout_world_size = self.replica_world_size()
         if self.worker_group:
             world_size = self.worker_group.world_size
         elif self.rollout_resource_pool is not None:
@@ -452,9 +467,33 @@ class LLMServerManager:
             )
             for replica_rank in range(num_replicas)
         ]
+        for local_rank, server in enumerate(self.rollout_replicas):
+            # ``replica_rank`` may include a server-name offset after dynamic
+            # resize, while worker slicing is always local to this group.
+            server.worker_group_rank = local_rank
+
+        # Pre-launched pool (hybrid dynamic resize): the slices below ``dormant_below`` are training GPUs
+        # right now. Their replicas are launched concurrently with the active ones -- the only moment those
+        # GPUs are empty enough for vLLM to size its memory budget -- and parked asleep immediately.
+        dormant_below, self.dormant_below = self.dormant_below, 0
+        if dormant_below and not self.supports_dormant_replicas():
+            logger.warning(
+                "pre-launching dormant rollout replicas needs vllm with enable_sleep_mode; launching only replicas %s",
+                [server.replica_rank for server in self.rollout_replicas if server.replica_rank >= dormant_below],
+            )
+            self.rollout_replicas = [server for server in self.rollout_replicas if server.replica_rank >= dormant_below]
+            dormant_below = 0
 
         if self.worker_group and self.rollout_config.name != "trtllm":
             await asyncio.gather(*[server.init_hybrid(self.worker_group) for server in self.rollout_replicas])
+            if dormant_below:
+                parked = [server for server in self.rollout_replicas if server.replica_rank < dormant_below]
+                await self._sleep_replicas(parked)
+                self.rollout_replicas = [server for server in self.rollout_replicas if server not in parked]
+                logger.info(
+                    "LLMServerManager: pre-launched replicas %s and parked them asleep on the training GPUs",
+                    [server.replica_rank for server in parked],
+                )
         # TODO: unify trtllm to init_hybrid
         elif self.worker_group and self.rollout_config.name == "trtllm":
             await asyncio.gather(
@@ -523,3 +562,228 @@ class LLMServerManager:
     async def stop_profile(self):
         """Stop profiling on all rollout replicas."""
         await asyncio.gather(*[replica.stop_profile() for replica in self.rollout_replicas])
+
+    def _refresh_server_lists(self) -> None:
+        self.rollout_replicas.sort(key=lambda replica: replica.replica_rank)
+        self.server_handles = [replica.server_handle for replica in self.rollout_replicas]
+        self.server_addresses = [replica.server_address for replica in self.rollout_replicas]
+
+    @auto_await
+    async def retire_hybrid_replicas_below(self, physical_rank: int, dormant: bool = False) -> dict[str, list[int]]:
+        """Take the hybrid replicas whose first physical worker rank is below ``physical_rank`` out of service.
+
+        In the hybrid layout ``replica_rank`` is the physical-slice id (``physical_rank // replica_world_size``;
+        the fused workers' ``ServerAdapter`` derives it the same way to find its server actor), so the
+        replicas on GPUs that are about to become training ranks are exactly those below the new actor size.
+        Call this *before* the training side allocates on those GPUs. The other replicas keep running.
+
+        With ``dormant`` (vLLM with sleep mode) the replicas are put to sleep instead of killed: weights and
+        KV cache are freed but the server actors and their TP communicators stay, so when the slice becomes
+        a rollout slice again ``rebuild_hybrid_runtime`` wakes them in seconds instead of relaunching (~1 GB
+        of CUDA context per GPU stays allocated meanwhile). Returns ``{"shutdown": ranks, "slept": ranks}``.
+        """
+        if self.worker_group is None:
+            raise RuntimeError("retire_hybrid_replicas_below requires a hybrid worker group")
+        world_size = self.replica_world_size()
+        retiring = [replica for replica in self.rollout_replicas if replica.replica_rank * world_size < physical_rank]
+        if not retiring:
+            return {"shutdown": [], "slept": []}
+        if dormant and not self.supports_dormant_replicas():
+            logger.warning(
+                "dormant rollout replicas need vllm with enable_sleep_mode; shutting down replicas %s instead",
+                [replica.replica_rank for replica in retiring],
+            )
+            dormant = False
+        if dormant:
+            await self._sleep_replicas(retiring)
+        else:
+            await self._shutdown_replicas(retiring)
+        retired_ids = {id(replica) for replica in retiring}
+        self.rollout_replicas = [replica for replica in self.rollout_replicas if id(replica) not in retired_ids]
+        self._refresh_server_lists()
+        ranks = [replica.replica_rank for replica in retiring]
+        return {"shutdown": [] if dormant else ranks, "slept": ranks if dormant else []}
+
+    def supports_dormant_replicas(self) -> bool:
+        """Whether retired hybrid replicas can be parked asleep instead of killed."""
+        return self.rollout_config.name == "vllm" and bool(getattr(self.rollout_config, "enable_sleep_mode", True))
+
+    async def _sleep_replicas(self, replicas: list[RolloutReplica]) -> None:
+        """Park ``replicas``: abort their requests, free weights + KV cache, drop them from the load balancer."""
+        addresses = [replica.server_address for replica in replicas if replica.server_address]
+        for replica in replicas:
+            try:
+                await replica.abort_all_requests()
+            except Exception as exc:
+                logger.warning("failed to abort requests before parking replica %s: %s", replica.replica_rank, exc)
+        await asyncio.gather(*[replica.sleep(force=True) for replica in replicas])
+        load_balancer = getattr(self, "global_load_balancer", None)
+        if load_balancer is not None and addresses:
+            await load_balancer.remove_servers.remote(addresses)
+        for replica in replicas:
+            self._dormant_replicas[replica.replica_rank] = replica
+
+    async def _shutdown_replicas(self, replicas: list[RolloutReplica]) -> None:
+        """Kill the server actors of ``replicas`` and drop them from the load balancer (workers survive)."""
+        addresses = [replica.server_address for replica in replicas if replica.server_address]
+        await asyncio.gather(*[replica.shutdown_runtime(kill_workers=False) for replica in replicas])
+        load_balancer = getattr(self, "global_load_balancer", None)
+        if load_balancer is not None and addresses:
+            await load_balancer.remove_servers.remote(addresses)
+        for replica in replicas:
+            self._dormant_replicas.pop(replica.replica_rank, None)
+
+    @auto_await
+    async def rebuild_hybrid_runtime(self, worker_group: RayWorkerGroup, start_rank: int = 0) -> dict[str, Any]:
+        """Re-point the hybrid rollout topology at ``worker_group``, keeping replicas that still own the
+        same physical workers.
+
+        A replica's TP/DP/PP communicators live inside the replica and do not depend on the
+        actor/rollout split, so a replica whose slice is still part of the new group keeps its server
+        actors, weights and KV cache. Replicas that fell out of the group are shut down (normally already
+        done by ``retire_hybrid_replicas_below`` before the training side reclaimed their GPUs), dormant
+        replicas whose slice is back are woken (their weights arrive with the next weight sync), slices with
+        no usable replica are launched (with the pre-launched pool this only happens when the backend cannot
+        sleep or a parked replica lost its servers), and the load balancer is updated in place. Returns the
+        kept/retired/woken/launched ranks.
+        """
+        if self.worker_group is None:
+            raise RuntimeError("rebuild_hybrid_runtime requires a hybrid worker group")
+        if self.rollout_config.name == "trtllm":
+            return await self._rebuild_hybrid_runtime_from_scratch(worker_group, start_rank)
+
+        world_size = self.replica_world_size()
+        plan = plan_hybrid_replica_reuse(
+            self.rollout_replicas, worker_group.workers, start_rank, world_size, dormant=self._dormant_replicas
+        )
+        if plan.retire:
+            await self._shutdown_replicas(plan.retire)
+        for local_rank, replica in plan.keep:
+            replica.worker_group_rank = local_rank
+
+        woken: list[RolloutReplica] = []
+        for local_rank, replica in plan.wake:
+            replica.worker_group_rank = local_rank
+            woken.append(replica)
+        launched: list[RolloutReplica] = []
+        for local_rank, replica_rank in plan.launch:
+            replica = self.rollout_replica_class(
+                replica_rank=replica_rank,
+                config=self.rollout_config,
+                model_config=self.model_config,
+                gpus_per_node=self.rollout_config.n_gpus_per_node,
+            )
+            replica.worker_group_rank = local_rank
+            launched.append(replica)
+        # Waking re-maps weight + KV memory on GPUs the training side has already released; the weights
+        # themselves are garbage until the caller's weight sync, exactly like a freshly launched replica.
+        await asyncio.gather(
+            *[replica.wake_up() for replica in woken], *[replica.init_hybrid(worker_group) for replica in launched]
+        )
+        for replica in woken:
+            self._dormant_replicas.pop(replica.replica_rank, None)
+
+        self.worker_group = worker_group
+        self.start_rank = start_rank
+        self.rollout_replicas = [replica for _, replica in plan.keep] + woken + launched
+        self._refresh_server_lists()
+
+        load_balancer = getattr(self, "global_load_balancer", None)
+        if load_balancer is None:
+            await self._init_global_load_balancer()
+        elif woken or launched:
+            await load_balancer.add_servers.remote(
+                {replica.server_address: replica.server_handle for replica in woken + launched}
+            )
+        if self.rollout_config.prometheus.enable:
+            update_prometheus_config(self.rollout_config.prometheus, self.server_addresses, self.rollout_config.name)
+        logger.info(
+            "rebuild_hybrid_runtime: kept replicas %s, retired %s, woken %s, launched %s, still dormant %s",
+            [replica.replica_rank for _, replica in plan.keep],
+            [replica.replica_rank for replica in plan.retire],
+            [replica.replica_rank for replica in woken],
+            [replica.replica_rank for replica in launched],
+            sorted(self._dormant_replicas),
+        )
+        return {
+            "kept": [replica.replica_rank for _, replica in plan.keep],
+            "retired": [replica.replica_rank for replica in plan.retire],
+            "woken": [replica.replica_rank for replica in woken],
+            "launched": [replica.replica_rank for replica in launched],
+        }
+
+    async def _rebuild_hybrid_runtime_from_scratch(
+        self, worker_group: RayWorkerGroup, start_rank: int
+    ) -> dict[str, Any]:
+        """Replace every server actor and the load balancer (backends whose launch path is not incremental)."""
+        retired = [replica.replica_rank for replica in self.rollout_replicas]
+        await asyncio.gather(*[replica.shutdown_runtime(kill_workers=False) for replica in self.rollout_replicas])
+
+        load_balancer = getattr(self, "global_load_balancer", None)
+        if load_balancer is not None:
+            ray.kill(load_balancer, no_restart=True)
+
+        self.worker_group = worker_group
+        self.start_rank = start_rank
+        self.rollout_replicas = []
+        self.server_handles = []
+        self.server_addresses = []
+        await self._initialize_llm_servers()
+        await self._init_global_load_balancer()
+        return {"kept": [], "retired": retired, "launched": [replica.replica_rank for replica in self.rollout_replicas]}
+
+
+class HybridReplicaPlan:
+    """Which replicas survive a hybrid topology change (kept), which must go (retire), which dormant ones to
+    wake, and which slices to launch from scratch."""
+
+    def __init__(self):
+        self.keep: list[tuple[int, RolloutReplica]] = []  # (local index in the new group, replica)
+        self.retire: list[RolloutReplica] = []
+        self.wake: list[tuple[int, RolloutReplica]] = []  # (local index in the new group, dormant replica)
+        self.launch: list[tuple[int, int]] = []  # (local index in the new group, replica_rank)
+
+
+def _same_actor_handles(left, right) -> bool:
+    key = lambda handle: getattr(handle, "_actor_id", None) or id(handle)  # noqa: E731
+    return len(left) == len(right) and all(key(a) == key(b) for a, b in zip(left, right, strict=False))
+
+
+def _owns_slice(replica, slice_workers) -> bool:
+    return bool(replica.servers) and _same_actor_handles(replica.workers, slice_workers)
+
+
+def plan_hybrid_replica_reuse(
+    replicas, new_workers, start_rank: int, world_size: int, dormant: dict[int, RolloutReplica] | None = None
+) -> HybridReplicaPlan:
+    """Match the live ``replicas`` (and parked ``dormant`` ones) against the slices of ``new_workers``.
+
+    Slice ``local`` of the new group gets ``replica_rank = start_rank + local``; a live replica with that
+    rank whose workers are exactly that slice (and whose servers are still up) is kept, a dormant one is
+    woken. Anything else with a rank in the new range is retired and the slice relaunched; live ranks
+    outside the range are retired, dormant ranks outside the range stay parked.
+    """
+    plan = HybridReplicaPlan()
+    live_by_rank = {replica.replica_rank: replica for replica in replicas}
+    dormant_by_rank = dict(dormant or {})
+    num_replicas = len(new_workers) // world_size
+    new_ranks = set()
+    for local in range(num_replicas):
+        replica_rank = start_rank + local
+        new_ranks.add(replica_rank)
+        slice_workers = new_workers[local * world_size : (local + 1) * world_size]
+        replica = live_by_rank.get(replica_rank)
+        if replica is not None and _owns_slice(replica, slice_workers):
+            plan.keep.append((local, replica))
+            continue
+        if replica is not None:
+            plan.retire.append(replica)
+        sleeping = dormant_by_rank.get(replica_rank)
+        if sleeping is not None and _owns_slice(sleeping, slice_workers):
+            plan.wake.append((local, sleeping))
+            continue
+        if sleeping is not None:
+            plan.retire.append(sleeping)
+        plan.launch.append((local, replica_rank))
+    plan.retire.extend(replica for replica in replicas if replica.replica_rank not in new_ranks)
+    return plan

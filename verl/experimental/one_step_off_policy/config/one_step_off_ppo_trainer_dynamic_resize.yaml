@@ -15,6 +15,8 @@ rollout:
 
 # To adapt to the current logic of AgentLoopManager
 actor_rollout_ref:
+  hybrid_engine: true
+
   dynamic_resize:
     enable: ${trainer.dynamic_resize.enable}
     trace:
@@ -53,13 +55,26 @@ trainer:
       enable: true
     handoff:
       enable: true
-      backend: disk_fallback
+      # gpu_direct: FSDP2 (fsdp_size=-1), actor expansion and shrink. The actor (and token-classification
+      # critic) runtime -- params, optimizer state, buffers, scheduler -- moves shard-to-shard over NCCL;
+      # no checkpoint is written or read for the switch and a failure aborts the run.
+      # VERL_RESIZE_VERIFY=1 additionally compares every moved tensor (checksums) and the scalar state
+      # (step, param_groups, LR scheduler) with the source.
+      backend: gpu_direct
+      # Move one FSDP2 unit (decoder layer) at a time: peak device memory max(old, new) + one unit instead
+      # of old + new shards. Same communication; relies on FSDP2 internals, so off by default.
+      gpu_direct_low_memory: false
+      # Hybrid resize: one vLLM replica per GPU pair is launched at start-up (before the training runtimes,
+      # so the actor GPUs are still empty); replicas on training GPUs sleep (weights + KV cache freed,
+      # processes and NCCL communicators kept) and a switch only sleeps / wakes them in seconds. Leaves ~1 GB
+      # of CUDA context per training GPU; set false to launch / kill replicas per switch instead.
+      dormant_rollout_replicas: true
       chunk_mb: 256
-      stage_optimizer: true
+      stage_optimizer: false
       optimizer_restore_policy: deferred
       progressive_swap: true
       async_optimizer_preload: true
-      optimizer_full_state_restore: true
+      optimizer_full_state_restore: false
       preload_queue_depth: 2
       host_preload_threshold: 0.85
       device_preload_threshold: 0.9

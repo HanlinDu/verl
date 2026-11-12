@@ -795,8 +795,11 @@ class vLLMHttpServer:
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip wake_up in standalone mode")
 
-    async def sleep(self):
-        if self.node_rank != 0 or not self.config.free_cache_engine:
+    async def sleep(self, force: bool = False):
+        """Free weights and KV cache. ``force`` ignores ``free_cache_engine`` for a replica that is leaving the
+        hybrid rollout pool during a dynamic resize (its GPUs become training ranks); ``wake_up`` + a weight
+        sync bring it back."""
+        if self.node_rank != 0 or (not force and not self.config.free_cache_engine):
             return
 
         if self.rollout_mode == RolloutMode.HYBRID:
@@ -1239,11 +1242,11 @@ class vLLMReplica(RolloutReplica):
             else f"{server_address}:{server_port}"
         )
 
-    async def sleep(self):
-        """Sleep each rollout server."""
+    async def sleep(self, force: bool = False):
+        """Sleep each rollout server; ``force`` also with ``free_cache_engine=False`` (see ``vLLMHttpServer.sleep``)."""
         # Drain DP engines for safe sleep.
         await self.servers[0].wait_for_requests_to_drain.remote()
-        await asyncio.gather(*[server.sleep.remote() for server in self.servers])
+        await asyncio.gather(*[server.sleep.remote(force=force) for server in self.servers])
 
     async def abort_all_requests(self) -> dict[str, Any]:
         """Abort all ongoing generation requests across all servers.
