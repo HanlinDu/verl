@@ -15,6 +15,7 @@ concurrency:
 
 jobs:
   base-policy:
+    name: drv1-policy
     if: github.repository == 'HanlinDu/verl'
     runs-on: ubuntu-latest
     steps:
@@ -29,6 +30,7 @@ jobs:
           fi
 
   cpu:
+    name: drv1-cpu
     if: github.repository == 'HanlinDu/verl'
     runs-on: ubuntu-latest
     timeout-minutes: 20
