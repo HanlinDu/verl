@@ -144,9 +144,14 @@ class NCCLCheckpointEngine(CheckpointEngine):
         return MasterMetadata(zmq_ip=self.ip, zmq_port=self.listen_port) if self.is_master else None
 
     def finalize(self):
-        """Destroy the NCCL process group if rebuild_group is True."""
+        """Destroy the NCCL process group if rebuild_group is True.
+
+        Idempotent: with ``rebuild_group=True`` this runs after every ``update_weights`` (setting
+        ``rank`` to None) and again from ``reconfigure_checkpoint_engine`` when a resize retires the engine.
+        """
         if self.rebuild_group:
-            if self.rank >= 0:
+            rank = getattr(self, "rank", None)
+            if rank is not None and rank >= 0:
                 collective.destroy_collective_group(self.group_name)
             self.rank = None
             self.world_size = None

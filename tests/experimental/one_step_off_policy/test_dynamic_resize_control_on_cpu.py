@@ -1,23 +1,43 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
+import logging
+import os
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
 
+import pytest
 from omegaconf import OmegaConf
 
+from verl.experimental.one_step_off_policy.ray_trainer import OneStepOffRayTrainer
 from verl.experimental.one_step_off_policy.resize_budget import (
     ResizeBudgetConfig,
     ResizeBudgetController,
     ResizeBudgetSnapshot,
 )
 from verl.experimental.one_step_off_policy.resize_controller import (
-    ACTION_HOLD,
-    ACTION_TO_CODE,
     ACTION_EXPAND_ROLLOUT,
     ACTION_EXPAND_TRAIN,
+    ACTION_HOLD,
+    ACTION_TO_CODE,
     ResizeController,
     ResizeControllerConfig,
 )
 from verl.experimental.one_step_off_policy.resize_metrics import build_resize_observation
-from verl.experimental.one_step_off_policy.ray_trainer import OneStepOffRayTrainer
 from verl.experimental.one_step_off_policy.staging_backend import (
     HostStagingConfig,
     create_restore_session_manifest,
@@ -87,9 +107,7 @@ def test_resize_observation_uses_rollout_and_train_timing_sections():
 
 def test_one_step_off_configs_define_disabled_dynamic_resize_by_default():
     fsdp_cfg = OmegaConf.load("verl/experimental/one_step_off_policy/config/one_step_off_ppo_trainer.yaml")
-    megatron_cfg = OmegaConf.load(
-        "verl/experimental/one_step_off_policy/config/one_step_off_ppo_megatron_trainer.yaml"
-    )
+    megatron_cfg = OmegaConf.load("verl/experimental/one_step_off_policy/config/one_step_off_ppo_megatron_trainer.yaml")
 
     assert fsdp_cfg.trainer.dynamic_resize.enable is False
     assert megatron_cfg.trainer.dynamic_resize.enable is False
@@ -100,6 +118,177 @@ def test_one_step_off_configs_define_disabled_dynamic_resize_by_default():
     assert fsdp_cfg.trainer.dynamic_resize.handoff.backend == "disk_fallback"
     assert fsdp_cfg.trainer.dynamic_resize.handoff.stage_optimizer is False
     assert fsdp_cfg.trainer.dynamic_resize.schedule == []
+
+
+def test_dynamic_resize_recipe_enables_phase_one_gpu_direct_model_handoff():
+    cfg = OmegaConf.load("verl/experimental/one_step_off_policy/config/one_step_off_ppo_trainer_dynamic_resize.yaml")
+
+    assert cfg.trainer.dynamic_resize.handoff.backend == "gpu_direct"
+    assert cfg.trainer.dynamic_resize.handoff.stage_optimizer is False
+    assert cfg.trainer.dynamic_resize.handoff.optimizer_full_state_restore is False
+
+
+def _gpu_direct_worker_results(old_ranks, new_ranks, world_size=8):
+    results = []
+    for rank in range(world_size):
+        if rank in new_ranks:
+            results.append(
+                {
+                    "rank": rank,
+                    "status": "member",
+                    "tensor_count": 7,
+                    "optimizer_tensor_count": 14,
+                    "net_recv_bytes": 0 if rank in old_ranks else 100,
+                    "self_copy_bytes": 50 if rank in old_ranks else 0,
+                    "transfer_seconds": 0.5 + 0.1 * rank,
+                }
+            )
+        elif rank in old_ranks:
+            results.append({"rank": rank, "status": "sender", "tensor_count": 7, "net_recv_bytes": 0})
+        else:
+            results.append({"rank": rank, "status": "non_member"})
+    return results
+
+
+def test_gpu_direct_resize_moves_actor_runtime_between_active_and_target_ranks():
+    class _PhysicalWorkerGroup:
+        def __init__(self):
+            self.calls = []
+
+        def resize_actor_runtime(self, old_ranks, new_ranks, low_memory=False):
+            self.calls.append((old_ranks, new_ranks, low_memory))
+            return _gpu_direct_worker_results(old_ranks, new_ranks)
+
+    trainer = object.__new__(OneStepOffRayTrainer)
+    trainer._active_dynamic_resize_topology = {"actor_size": 4, "rollout_size": 4}
+    trainer._physical_actor_rollout_wg = _PhysicalWorkerGroup()
+    trainer._host_staging_config = HostStagingConfig.from_dict({"backend": "gpu_direct", "gpu_direct_low_memory": True})
+
+    metrics = trainer._resize_actor_runtime_gpu_direct([0, 1, 2, 3, 4, 5])
+    assert trainer._physical_actor_rollout_wg.calls == [([0, 1, 2, 3], [0, 1, 2, 3, 4, 5], True)]
+    assert metrics["resize/gpu_direct_status"] == "moved"
+    assert metrics["resize/gpu_direct_tensor_count"] == 7.0
+    assert metrics["resize/gpu_direct_optimizer_tensor_count"] == 14.0
+    assert metrics["resize/gpu_direct_net_recv_bytes"] == 200.0  # only the two joining ranks pull data
+    assert metrics["resize/gpu_direct_self_copy_bytes"] == 200.0
+    assert metrics["resize/gpu_direct_transfer_seconds"] == 1.0
+
+    # shrink goes through the same path
+    trainer._active_dynamic_resize_topology = {"actor_size": 6, "rollout_size": 2}
+    metrics = trainer._resize_actor_runtime_gpu_direct([0, 1])
+    assert trainer._physical_actor_rollout_wg.calls[-1] == ([0, 1, 2, 3, 4, 5], [0, 1], True)
+    assert metrics["resize/gpu_direct_status"] == "moved"
+
+
+_TRAINER_LOGGER = logging.getLogger(OneStepOffRayTrainer.__module__)
+
+
+def test_gpu_direct_resize_logs_the_move_its_verification_and_every_rank(caplog):
+    class _PhysicalWorkerGroup:
+        def resize_actor_runtime(self, old_ranks, new_ranks, low_memory=False):
+            results = _gpu_direct_worker_results(old_ranks, new_ranks)
+            for result in results:
+                if result["status"] == "member":
+                    result.update(verified=1, verified_scalar_count=22)
+            return results
+
+        resize_runtime = resize_actor_runtime  # the critic worker group
+
+    trainer = object.__new__(OneStepOffRayTrainer)
+    trainer._active_dynamic_resize_topology = {"actor_size": 4, "rollout_size": 4}
+    trainer._physical_actor_rollout_wg = trainer._physical_critic_wg = _PhysicalWorkerGroup()
+    trainer._host_staging_config = HostStagingConfig.from_dict({"backend": "gpu_direct"})
+
+    with caplog.at_level(logging.DEBUG, logger=_TRAINER_LOGGER.name):
+        trainer._resize_actor_runtime_gpu_direct([0, 1, 2, 3, 4, 5])
+        trainer._resize_critic_runtime_gpu_direct([0, 1, 2, 3, 4, 5])
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert (
+        "[one-step-off][resize] actor runtime moved [0, 1, 2, 3] -> [0, 1, 2, 3, 4, 5] ranks on GPU: tensors=7 "
+        "optimizer_tensors=14 net_recv_bytes=200 self_copy_bytes=200 seconds=1.00 verified=1 verified_scalars=22"
+    ) in messages
+    assert (
+        "[one-step-off][resize] critic runtime moved [0, 1, 2, 3] -> [0, 1, 2, 3, 4, 5] ranks on GPU: tensors=7 "
+        "net_recv_bytes=200 seconds=1.00 verified=1 verified_scalars=22"
+    ) in messages
+    # DEBUG adds what every physical rank reported: members, senders and bystanders
+    for role in ("actor", "critic"):
+        per_rank = [message for message in messages if message.startswith(f"[one-step-off][resize] {role} rank ")]
+        assert len(per_rank) == 8
+        assert per_rank[5].startswith(f"[one-step-off][resize] {role} rank 5: ")
+        assert "'net_recv_bytes': 100" in per_rank[5]
+        assert "'status': 'non_member'" in per_rank[7]
+
+
+def test_verl_logging_level_reaches_the_resize_log_lines_of_the_trainer():
+    """The level is read from the environment when the module is imported, hence the fresh interpreter."""
+    script = textwrap.dedent(
+        """
+        from verl.experimental.one_step_off_policy.ray_trainer import OneStepOffRayTrainer
+        from verl.experimental.one_step_off_policy.staging_backend import HostStagingConfig
+
+
+        class Workers:
+            def resize_actor_runtime(self, old_ranks, new_ranks, low_memory=False):
+                return [{"rank": rank, "status": "member", "tensor_count": 7} for rank in new_ranks]
+
+
+        trainer = object.__new__(OneStepOffRayTrainer)
+        trainer._active_dynamic_resize_topology = {"actor_size": 4, "rollout_size": 4}
+        trainer._physical_actor_rollout_wg = Workers()
+        trainer._host_staging_config = HostStagingConfig.from_dict({"backend": "gpu_direct"})
+        trainer._resize_actor_runtime_gpu_direct([0, 1])
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env={**os.environ, "VERL_LOGGING_LEVEL": "INFO"},
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "[one-step-off][resize] actor runtime moved [0, 1, 2, 3] -> [0, 1] ranks on GPU" in result.stderr
+
+
+@pytest.mark.skipif("VERL_LOGGING_LEVEL" in os.environ, reason="the environment asks for a log level")
+def test_resize_log_lines_of_the_trainer_are_off_by_default():
+    assert not _TRAINER_LOGGER.isEnabledFor(logging.INFO)
+
+
+def test_gpu_direct_resize_fails_fast_on_incomplete_member_set():
+    class _PhysicalWorkerGroup:
+        def resize_actor_runtime(self, old_ranks, new_ranks, low_memory=False):
+            return _gpu_direct_worker_results(old_ranks, new_ranks[:-1])
+
+    trainer = object.__new__(OneStepOffRayTrainer)
+    trainer._active_dynamic_resize_topology = {"actor_size": 4, "rollout_size": 4}
+    trainer._physical_actor_rollout_wg = _PhysicalWorkerGroup()
+    trainer._host_staging_config = HostStagingConfig.from_dict({"backend": "gpu_direct"})
+
+    with pytest.raises(RuntimeError, match="expected 6"):
+        trainer._resize_actor_runtime_gpu_direct([0, 1, 2, 3, 4, 5])
+
+
+def test_dynamic_resize_checkpoint_load_restores_actor_and_critic():
+    class _WorkerGroup:
+        def __init__(self):
+            self.calls = []
+
+        def load_checkpoint(self, path, del_local_after_load):
+            self.calls.append((path, del_local_after_load))
+
+    trainer = object.__new__(OneStepOffRayTrainer)
+    trainer.actor_rollout_wg = _WorkerGroup()
+    trainer.critic_wg = _WorkerGroup()
+    trainer.use_critic = True
+
+    trainer._load_dynamic_resize_checkpoint("/tmp/global_step_1")
+
+    assert trainer.actor_rollout_wg.calls == [("/tmp/global_step_1/actor", False)]
+    assert trainer.critic_wg.calls == [("/tmp/global_step_1/critic", False)]
 
 
 def test_dynamic_resize_handoff_metrics_reflect_disabled_default_and_pinned_backend():

@@ -36,6 +36,10 @@ class Actor(Worker):
         data.batch["a"] += self.rank
         return data
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_rank(self):
+        return self.rank
+
 
 @ray.remote
 class Critic(Worker):
@@ -76,6 +80,10 @@ def test_colocated_workers():
 
     colocated_actor_wg = spawn_wg["actor"]
     colocated_critic_wg = spawn_wg["critic"]
+
+    actor_subgroup = colocated_actor_wg.subgroup([0])
+    assert actor_subgroup.world_size == 1
+    assert actor_subgroup.get_rank() == [0]
 
     actor_output = colocated_actor_wg.add(data)
     critic_output = colocated_critic_wg.sub(data)

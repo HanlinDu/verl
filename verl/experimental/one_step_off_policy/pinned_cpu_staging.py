@@ -1,3 +1,17 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Pinned CPU staging service for one-step-off dynamic resize."""
 
 from __future__ import annotations
@@ -17,7 +31,6 @@ from verl.experimental.one_step_off_policy.staging_backend import (
     update_restore_session_manifest,
     write_paged_state_manifest,
 )
-
 
 PINNED_CPU_STAGING_NAMESPACE = "verl_pinned_cpu_staging"
 
@@ -40,7 +53,7 @@ def _count_pinned_tensors(value: Any) -> int:
         return 1 if value.is_pinned() else 0
     if isinstance(value, dict):
         return sum(_count_pinned_tensors(item) for item in value.values())
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return sum(_count_pinned_tensors(item) for item in value)
     return 0
 
@@ -50,7 +63,7 @@ def _estimate_bytes(value: Any) -> int:
         return int(value.numel() * value.element_size())
     if isinstance(value, dict):
         return sum(_estimate_bytes(item) for item in value.values())
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return sum(_estimate_bytes(item) for item in value)
     return 1
 
@@ -223,7 +236,9 @@ class PinnedCPUStagingService:
 
     def _refresh_stats(self, session: dict[str, Any]) -> None:
         session["stats"]["object_count"] = len(session["objects"])
-        session["stats"]["pinned_tensor_count"] = sum(_count_pinned_tensors(item) for item in session["objects"].values())
+        session["stats"]["pinned_tensor_count"] = sum(
+            _count_pinned_tensors(item) for item in session["objects"].values()
+        )
         session["stats"]["total_bytes"] = sum(_estimate_bytes(item) for item in session["objects"].values())
 
 

@@ -473,7 +473,13 @@ def get_fsdp_full_state_dict(model: torch.nn.Module, offload_to_cpu: bool = True
         raise NotImplementedError(f"Unknown FSDP version {fsdp_version}")
 
 
-def fsdp2_load_full_state_dict(model: torch.nn.Module, full_state: dict, device_mesh=None, cpu_offload=None):
+def fsdp2_load_full_state_dict(
+    model: torch.nn.Module,
+    full_state: dict,
+    device_mesh=None,
+    cpu_offload=None,
+    process_group=None,
+):
     """
     Loads the full state dict (could be only on rank 0) into the sharded model. This is done by broadcasting the
     parameters from rank 0 to all other ranks. This function modifies the model in-place.
@@ -490,14 +496,17 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_state: dict, device_
         # use torch 2.7.0 copy from verl/third_party/torch/distributed/checkpoint
         from verl.third_party.torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
-    # To broadcast, it needs to be instantiated in the GPU.
-    if dist.get_rank() == 0:
+    # Preserve rank-zero-only loading for the ordinary WORLD runtime. The
+    # state-dict helper broadcasts on WORLD, so a resize subgroup instead
+    # supplies full_state on every member and disables that broadcast.
+    broadcast_from_rank0 = process_group is None
+    if not broadcast_from_rank0 or dist.get_rank() == 0:
         model = model.to(device=get_device_id(), non_blocking=True)
     else:
         model = model.to_empty(device=get_device_id())
 
     cpu_offload = cpu_offload is not None
-    options = StateDictOptions(full_state_dict=True, cpu_offload=cpu_offload, broadcast_from_rank0=True)
+    options = StateDictOptions(full_state_dict=True, cpu_offload=cpu_offload, broadcast_from_rank0=broadcast_from_rank0)
     set_model_state_dict(model, full_state, options=options)
 
     # rotary_emb is not in state_dict, so we need to broadcast it manually
@@ -507,7 +516,8 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_state: dict, device_
     # mismatch on the same broadcast collective = NCCL deadlock.
     bufs = sorted(model.named_buffers(), key=lambda x: x[0])
     for name, buf in bufs:
-        dist.broadcast(buf, src=0)
+        source_rank = dist.get_global_rank(process_group, 0) if process_group is not None else 0
+        dist.broadcast(buf, src=source_rank, group=process_group)
 
     if cpu_offload:
         model.to("cpu", non_blocking=True)
