@@ -19,23 +19,43 @@ jobs:
     if: github.repository == 'HanlinDu/verl'
     runs-on: ubuntu-latest
     steps:
-      - name: Require v1 as the integration target
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify integration target, ancestry, and patch whitespace
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           if [[ "$EVENT_NAME" == pull_request && "$BASE_REF" != v1 ]]; then
             echo 'Research integration pull requests must target v1.' >&2
             exit 1
+          fi
+          git merge-base --is-ancestor a91542dc59686d243843040dac4390c29a68c873 HEAD
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            git diff --check "$BASE_SHA" HEAD
+          fi
+      - name: Check licenses on added or modified Python files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          compare="${BASE_SHA:-HEAD^}"
+          mapfile -d '' -t files < <(git diff --name-only --diff-filter=AM -z "$compare" HEAD -- '*.py')
+          if (( ${#files[@]} )); then
+            python3 tests/special_sanity/check_license.py --directories "${files[@]}"
           fi
 
   cpu:
     name: drv1-cpu
     if: github.repository == 'HanlinDu/verl'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
         with:
           python-version: '3.12'
@@ -45,7 +65,10 @@ jobs:
           uv venv --python 3.12
           uv pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
           uv pip install pytest pytest-asyncio hydra-core numpy packaging \
-            tensordict==0.10.0 transformers==4.57.1 ray==2.49.2 psutil
+            tensordict==0.10.0 transformers==4.57.1 'ray[default]==2.49.2' psutil \
+            accelerate codetiming datasets dill pandas peft pyarrow pylatexenc \
+            torchdata wandb tensorboard uvicorn fastapi pyzmq msgspec cachetools pillow
+          uv pip install --no-deps -e .
       - name: Run migration regression suites
         run: |
           .venv/bin/python - <<'PY'
@@ -54,9 +77,12 @@ jobs:
           import sys
 
           tests = [
+              'tests/experimental/one_step_off_policy',
+              'tests/workers/test_training_worker_resize_snapshot_on_cpu.py',
+              'tests/workers/rollout/test_replica_on_cpu.py',
+              'tests/workers/rollout/test_hybrid_replica_reuse_on_cpu.py',
               'tests/utils/test_fsdp_resize_on_cpu.py',
               'tests/utils/test_fsdp_load_scope_on_cpu.py',
-              'tests/experimental/one_step_off_policy/test_dynamic_resize_migration_on_cpu.py',
           ]
           follow_up = [
               'tests/utils/test_resize_route_on_cpu.py',
