@@ -66,7 +66,7 @@ def compute_1d_shard_range(dim_size: int, world_size: int, rank: int) -> tuple[i
     if rank < 0 or rank >= world_size:
         raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
 
-    shard_size, offset = Shard._local_shard_size_and_offset(dim_size, world_size, rank)
+    shard_size, offset = Shard(0)._local_shard_size_and_offset(dim_size, world_size, rank)
     return int(offset), int(shard_size)
 
 

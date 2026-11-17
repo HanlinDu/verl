@@ -362,6 +362,9 @@ intact until the transfer is verified.
 
 ### Preconditions (`check_gpu_direct_resize_supported`, checked at startup)
 
+FP16 loss scaling is unsupported: a resize does not transfer the GradScaler state, so scaled runtimes
+are rejected at startup instead of silently resetting the scale. Use BF16 or FP32.
+
 * `actor.strategy=fsdp2` with `fsdp_size=-1` (one-dimensional mesh, `Shard(0)` only);
 * parameters and optimizer state on GPU (no `param_offload` / `optimizer_offload` / FSDP2 `CPUOffloadPolicy`);
 * no LoRA, `ulysses_sequence_parallel_size=1`, CUDA;

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 import ray
 import torch
 
@@ -27,14 +28,20 @@ from verl.experimental.one_step_off_policy.staging_backend import (
 )
 
 
-def _reinit_ray(*, local_mode: bool) -> None:
+@pytest.fixture(autouse=True)
+def shutdown_ray_after_test():
+    yield
+    ray.shutdown()
+
+
+def _reinit_ray() -> None:
     if ray.is_initialized():
         ray.shutdown()
-    ray.init(local_mode=local_mode, ignore_reinit_error=True)
+    ray.init(num_cpus=2, include_dashboard=False, ignore_reinit_error=True)
 
 
 def test_pinned_cpu_staging_service_roundtrip():
-    _reinit_ray(local_mode=True)
+    _reinit_ray()
 
     service_name = f"test-pinned-cpu-{uuid.uuid4().hex}"
     service = get_or_create_pinned_cpu_staging_service(service_name)
@@ -66,7 +73,7 @@ def test_pinned_cpu_staging_service_roundtrip():
 
 
 def test_pinned_cpu_staging_service_exports_optimizer_pages(tmp_path):
-    _reinit_ray(local_mode=True)
+    _reinit_ray()
 
     service_name = f"test-pinned-cpu-optim-{uuid.uuid4().hex}"
     service = get_or_create_pinned_cpu_staging_service(service_name)

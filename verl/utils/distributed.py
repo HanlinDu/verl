@@ -100,9 +100,15 @@ def clear_dtensor_dispatch_caches():
     op_cache = getattr(op_cache, "cache", op_cache)
     if hasattr(op_cache, "cache_clear"):
         op_cache.cache_clear()
-    meta_cache = getattr(propagator, "_propagate_tensor_meta", None)
-    if hasattr(meta_cache, "cache_clear"):
-        meta_cache.cache_clear()
+    for name in ("_propagate_tensor_meta", "_propagate_tensor_meta_cached"):
+        meta_cache = getattr(propagator, name, None)
+        if hasattr(meta_cache, "cache_clear"):
+            meta_cache.cache_clear()
+    # Newer torch releases also dispatch DTensor operations through a C++ cache.
+    # Clearing only the Python cache leaves specs pointing at retired meshes.
+    clear_native_cache = getattr(torch._C, "_clear_DTensor_sharding_propagator_cache", None)
+    if clear_native_cache is not None:
+        clear_native_cache()
     try:
         from torch.distributed.tensor._redistribute import _gen_transform_infos
 

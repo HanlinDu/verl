@@ -337,3 +337,17 @@ def test_unverified_transfer_does_not_read_the_scalar_state(one_rank_transfer, m
     assert stats["verified_scalar_count"] == 0
     assert float(new.optimizer.state[new.module.bias]["step"]) == 2.0
     assert new.lr_scheduler.last_epoch == 2
+
+
+def test_recreated_mesh_uses_live_group_after_dispatch_cache_clear(one_rank_world):
+    """Tensor factories must not reuse a mesh whose communicator was destroyed."""
+    for _ in range(3):
+        group = dist.new_group([0])
+        try:
+            mesh = _one_rank_mesh(group)
+            value = DTensor.from_local(torch.ones(6, 2), mesh, [Shard(0)])
+            result = torch.empty_like(value)
+            assert result.device_mesh.get_group() is group
+        finally:
+            dist.destroy_process_group(group)
+            clear_dtensor_dispatch_caches()

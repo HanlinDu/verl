@@ -242,3 +242,50 @@ def test_quiesce_failure_stops_before_workers_are_destroyed():
     with pytest.raises(RuntimeError, match="quiescent"):
         asyncio.run(trainer._destroy_dynamic_resize_runtime())
     trainer._kill_ray_actors.assert_not_called()
+
+
+@pytest.mark.parametrize("rank", [None, -1, 0])
+def test_hccl_finalize_can_run_twice_after_runtime_reconfiguration(rank):
+    communicator = SimpleNamespace(comm=object(), destroyComm=Mock())
+    empty_cache = Mock()
+    cls = _load_methods(
+        "verl/checkpoint_engine/hccl_checkpoint_engine.py",
+        "HCCLCheckpointEngine",
+        {"finalize"},
+        torch=SimpleNamespace(npu=SimpleNamespace(empty_cache=empty_cache)),
+    )
+    engine = cls()
+    engine.rebuild_group = True
+    engine.rank = rank
+    engine.pyhccl = communicator
+    engine.send_buf = object()
+    engine.recv_buf = object()
+    engine.finalize()
+    engine.finalize()
+    assert communicator.destroyComm.call_count == (1 if rank == 0 else 0)
+    assert engine.rank is None and engine.world_size is None
+    assert engine.send_buf is None and engine.recv_buf is None
+    assert empty_cache.call_count == 2
+
+
+@pytest.mark.parametrize("loss_scaling", [False, True])
+def test_gpu_direct_resize_rejects_loss_scaling_instead_of_resetting_it(loss_scaling):
+    cls = _load_methods(
+        "verl/workers/engine/fsdp/transformer_impl.py",
+        "FSDPEngine",
+        {"check_gpu_direct_resize_supported"},
+        device_name="cuda",
+    )
+    engine = cls()
+    engine.engine_config = SimpleNamespace(strategy="fsdp2", ulysses_sequence_parallel_size=1, fsdp_size=-1)
+    engine.model_config = SimpleNamespace(lora={}, lora_adapter_path=None, model_type="language_model")
+    engine._is_lora = False
+    engine._is_offload_param = False
+    engine._is_offload_optimizer = False
+    engine._uses_fsdp2_cpu_offload_policy = False
+    engine.scaler = object() if loss_scaling else None
+    if loss_scaling:
+        with pytest.raises(NotImplementedError, match="fp16 loss scaling"):
+            engine.check_gpu_direct_resize_supported()
+    else:
+        engine.check_gpu_direct_resize_supported()

@@ -221,6 +221,8 @@ class FSDPEngine(BaseEngine):
             raise NotImplementedError("GPU-direct resize supports CUDA only")
         if self.engine_config.strategy != "fsdp2":
             raise NotImplementedError("GPU-direct resize supports FSDP2 only")
+        if self.scaler is not None:
+            raise NotImplementedError("GPU-direct resize does not support fp16 loss scaling")
         if (
             self._is_lora
             or int(self.model_config.lora.get("rank", 0) or 0) > 0
