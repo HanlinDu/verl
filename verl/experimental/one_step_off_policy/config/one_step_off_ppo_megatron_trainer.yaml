@@ -58,6 +58,10 @@ trainer:
       path: ""
       run_name: ""
       flush: false
+    # Declared for config overrides; does not enable shared-pool hybrid runtime support.
+    memory_probe:
+      enable: false
+      timeout_s: 5.0
     budget_protection:
       enable: false
       memory_budget_ratio: 0.85

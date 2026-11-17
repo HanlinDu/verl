@@ -49,6 +49,10 @@ trainer:
       path: ""
       run_name: ""
       flush: false
+    # Opt-in per-physical-card diagnostics; also requires shared hybrid workers and a trace path.
+    memory_probe:
+      enable: false
+      timeout_s: 5.0
     phased_init:
       enable: true
     async_comm_prewarm:

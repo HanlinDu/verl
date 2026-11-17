@@ -58,6 +58,10 @@ trainer:
       path: ""
       run_name: ""
       flush: false
+    # Diagnostics only on the shared-pool hybrid dynamic-resize path.
+    memory_probe:
+      enable: false
+      timeout_s: 5.0
     budget_protection:
       enable: false
       memory_budget_ratio: 0.85

@@ -81,9 +81,21 @@ The launcher has two versions, and this one variable selects between them:
   2. verl logs everything: `VERL_LOGGING_LEVEL` defaults to `DEBUG` (a value the caller exports is
      kept). That includes the trainer's `[one-step-off][resize]` lines with the transfer statistics of
      every rank, the server manager's replica plan and the workers' memory lines.
-  3. The resize trace is on (`trainer.dynamic_resize.trace`): `$CKPT_DIR/resize_trace.jsonl` gets two
-     records per step, `resize_observation` and `resize_schedule`, with all `resize/*` metrics of the
-     step.
+  3. The resize trace is on (`trainer.dynamic_resize.trace`): `$CKPT_DIR/resize_trace.jsonl` gets the
+     `resize_observation` and `resize_schedule` records for each step, with all `resize/*` metrics of
+     the step. Scheduled items first write `resize_schedule_gate`, including the first runtime target
+     validation; refused gates do not create successful hard-switch records. An attempted hard switch
+     writes an outer `resize_hard_switch` record and one record for each executed phase:
+     `resize_hard_switch_handoff_save` and `resize_hard_switch_restore` on disk/handoff backends, plus
+     `resize_hard_switch_destroy`, `resize_hard_switch_rebuild`, and `resize_hard_switch_update_weights`.
+     Every span carries `status`, `error_type`, and `error_message`. Phase metadata identifies the target
+     actor/rollout sizes, backend, and `gpu_direct` flag; the outer span wraps the actual switch invocation.
+     `error_message` is empty on success. On failure it holds the exception text, keeping the first
+     2000 characters plus a truncation marker; unprintable exception text is replaced with a safe
+     placeholder. Interruptions such as `KeyboardInterrupt` and `SystemExit` are recorded as errors
+     and then re-raised unchanged. A trace write failure logs a warning and drops that record; it does
+     not abort the operation or replace the original exception. Existing observation and schedule
+     record names and fields are unchanged; readers must allow additional phase records.
 
 More switches are added as further stages with the same shape as `stage0` in the yaml:
 
@@ -95,6 +107,91 @@ TOTAL_TRAINING_STEPS=8 bash .../run_dynamic_resize.sh \
   +$S.stage3.rollout_pool.mode=split +$S.stage3.rollout_pool.from_pool=shared_pool \
   +$S.stage3.rollout_pool.index=1 +$S.stage3.rollout_pool.size=[6,2] +$S.stage3.release_old=false
 ```
+
+## Optional per-card memory snapshots
+
+Memory diagnostics are separate from resize verification and the budget controller. They are **off by
+default**, including when `VERL_RESIZE_VERIFY=1`. Enable them with a trace file on the shared-pool hybrid
+dynamic-resize recipe:
+
+```yaml
+trainer:
+  dynamic_resize:
+    enable: true
+    shared_pool:
+      enable: true
+    trace:
+      enable: true
+      path: /path/to/resize_trace.jsonl
+    memory_probe:
+      enable: true
+      timeout_s: 5.0
+```
+
+`actor_rollout_ref.hybrid_engine` must also be true. Missing any of these gates disables the probe without
+identity or memory RPCs. When `memory_probe.enable` is true, an invalid, non-finite or non-positive
+`timeout_s` is a configuration error even if another gate disables sampling. The ordinary FSDP and
+Megatron one-step-off configs declare the disabled keys for overrides; that does not enable another
+runtime path or backend.
+
+Each boundary appends a `gpu_cards_snapshot` record with `kind="snapshot"`, `phase`, `step`,
+`ts_start_ns`, `ts_end_ns`, `timeout_s`, `expected`, `observed`, `errors`, `expected_count`,
+`observed_count` and `complete`. Startup phases are `startup_prelaunch` (before any rollout prelaunch),
+`startup_parked` (after the prelaunch/parking operation), `startup_runtime_ready` (after training runtime
+initialization), and `startup_after_sync` (after the initial successful weight sync, before validation or
+the first generation). The last boundary is omitted if critic warmup skips that initial sync. Resize
+phases are `resize_before_destroy`, `resize_after_destroy`, `resize_after_rebuild`, and
+`resize_after_sync`. They run between the existing quiescent operations, without changing generation,
+handoff or weight-sync ordering. After destruction/parking, actor membership still describes the old
+training runtime; after rebuilding it describes the target runtime even though the topology is committed
+only after successful weight sync.
+
+The expected count comes independently from the physical worker group's `world_size`. Before the first
+memory RPC, the controller asks the raw Ray worker handles for their immutable physical rank, runtime
+node ID and raw GPU allocation. It requires exactly one nonempty raw GPU token per worker and distinct
+`(node_id, accelerator_id_raw)` pairs; neither hostname nor the process-local device ordinal identifies a
+card. A successful map is cached while physical actor handles remain the same, never the counters. A
+failed map is not cached: the record retains known ranks, missing allocation evidence and
+`identity_observed`, skips memory dispatch, and may try again at the next boundary. Snapshot dispatch
+uses the generated physical worker-group method, preserving WorkerDict/fused role-prefix routing.
+
+Every expected entry carries nonexclusive `membership` flags: `actor`, `rollout_active`, and
+`rollout_dormant`. The existing `LLMServerManager` supplies rollout membership from its live and parked
+replicas' physical actor IDs, without more RPCs or another engine pool. A card can be both `actor=true`
+and `rollout_dormant=true`. Parked replicas remain excluded from the manager's live weight-sync list.
+If membership cannot be read, unknown flags are null and the snapshot is incomplete, not silently false.
+
+Each observed row includes identity, `sampled_at_ns`, `pid`, `process_scope="hybrid_worker"`, and two
+different counter scopes:
+
+* `driver.free_bytes`, `driver.total_bytes`, and `driver.used_bytes = total_bytes - free_bytes` describe
+  the **whole device**, including vLLM processes, other colocated workers and unrelated device users.
+* `process_torch.allocated_bytes` and `process_torch.reserved_bytes` describe only the **hybrid worker
+  process's PyTorch allocator**. They are not vLLM process usage or a total over all training processes.
+
+The reads use `get_torch_device()`'s current device, with no new tensor allocation or CUDA synchronize.
+They are not atomic: cards are sampled at different times, and even driver/allocator reads within a row
+are sequential. Compare timestamps rather than treating a boundary as an instantaneous cluster image.
+No cross-card or cross-process memory total is inferred from these counters.
+
+Identity dispatch, memory dispatch and readiness/reads share one deadline per boundary (default five
+seconds); the fanout is nonblocking and completed results are read individually. A missing/failed worker
+does not erase ready samples, and no unready reference gets an unbounded second `ray.get`. Pending probe
+calls are not cancelled by terminating training actors. The overhead is one allocation query per
+physical worker when building the cache, plus one memory RPC per physical worker at each sampled
+boundary and bounded waiting. This diagnoses memory at boundaries, not peaks during model load or
+generation.
+
+Missing, duplicate or wrong identities, dispatch/read/wait failures, timeouts, unsupported GPU allocation
+or counter backends, unavailable counters, and malformed/non-ok samples produce `complete=false` with
+explicit errors. Missing values are null or absent, never invented zeroes. Ordinary probe failures warn
+and preserve incomplete evidence without deciding whether training or resize succeeds; cancellation and
+other `BaseException` interruptions still propagate. Trace-file failures use the existing best-effort
+sink and warning behavior. These records are evidence, **not permission to resize**.
+
+Runtime node/GPU identifiers, PIDs and exception text can expose infrastructure information. Keep raw
+traces private and redact these fields before sharing examples; do not publish local runtime records as
+test or documentation fixtures.
 
 ## Environment requirements and test commands
 
@@ -206,7 +303,8 @@ reports `resize/enabled:0.0` instead. In addition:
   verified=1 verified_scalars=330` with the ranks of that switch (330 entries for the Qwen3-0.6B actor;
   with the critic a `critic runtime moved` line as well) and one
   `[one-step-off][resize] actor rank N: {...}` line per GPU of the pool.
-  `$RUN/ckpt/resize_trace.jsonl` has two lines per step.
+  `$RUN/ckpt/resize_trace.jsonl` has the two per-step records and one record for each executed
+  hard-switch phase on a switching step.
 * Plain version: no `[one-step-off][resize]` line and no `resize_trace.jsonl`; the switch lines report
   `resize/gpu_direct_verified:0.0`.
 * `gpu_direct` leaves no `global_step_*` directory in `CKPT_DIR` unless `trainer.save_freq` asks for

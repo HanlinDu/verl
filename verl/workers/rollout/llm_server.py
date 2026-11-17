@@ -553,6 +553,33 @@ class LLMServerManager:
         """Get the LLM server replicas."""
         return self.rollout_replicas
 
+    def get_hybrid_memory_membership(self, physical_workers: list) -> dict[int, dict[str, bool]]:
+        """Return active/dormant membership by physical Ray actor IDs, without RPCs."""
+        if self.worker_group is None:
+            raise RuntimeError("hybrid memory membership requires a hybrid worker group")
+        rank_by_actor_id = {}
+        for rank, worker in enumerate(physical_workers):
+            actor_id = worker._actor_id
+            if actor_id is None or actor_id in rank_by_actor_id:
+                raise ValueError("hybrid memory membership requires unique physical Ray actor IDs")
+            rank_by_actor_id[actor_id] = rank
+        membership = {
+            rank: {"rollout_active": False, "rollout_dormant": False} for rank in range(len(physical_workers))
+        }
+        for label, replicas in (
+            ("rollout_active", self.rollout_replicas),
+            ("rollout_dormant", self._dormant_replicas.values()),
+        ):
+            for replica in replicas:
+                if not replica.workers:
+                    raise ValueError("hybrid rollout replica has no physical worker membership")
+                for worker in replica.workers:
+                    actor_id = worker._actor_id
+                    if actor_id not in rank_by_actor_id:
+                        raise ValueError("rollout replica contains a worker outside the physical hybrid group")
+                    membership[rank_by_actor_id[actor_id]][label] = True
+        return membership
+
     @auto_await
     async def start_profile(self, **kwargs):
         """Start profiling on all rollout replicas."""

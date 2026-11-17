@@ -18,13 +18,14 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import socket
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Iterator
 
-from omegaconf import OmegaConf
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -36,7 +37,8 @@ class ResizeTraceConfig:
 
 
 def build_resize_trace_config(config: Any) -> ResizeTraceConfig:
-    trace_cfg = None
+    from omegaconf import OmegaConf
+
     try:
         trace_cfg = OmegaConf.select(config, "trainer.dynamic_resize.trace")
     except Exception:
@@ -88,22 +90,43 @@ def _dataclass_is_instance(value: Any) -> bool:
 def append_resize_trace(config: ResizeTraceConfig, payload: dict[str, Any]) -> None:
     if not config.enabled or not config.path:
         return
-    os.makedirs(os.path.dirname(config.path), exist_ok=True)
-    record = {
-        "kind": "span",
-        "run_name": config.run_name,
-        "host": socket.gethostname(),
-        "pid": os.getpid(),
-        **{str(k): _json_safe(v) for k, v in payload.items()},
-    }
-    line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
-    fd = os.open(config.path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o644)
     try:
-        os.write(fd, line.encode("utf-8"))
-        if config.flush:
-            os.fsync(fd)
-    finally:
-        os.close(fd)
+        os.makedirs(os.path.dirname(config.path), exist_ok=True)
+        record = {
+            "kind": "span",
+            "run_name": config.run_name,
+            "host": socket.gethostname(),
+            "pid": os.getpid(),
+            **{str(k): _json_safe(v) for k, v in payload.items()},
+        }
+        line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+        fd = os.open(config.path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, line.encode("utf-8"))
+            if config.flush:
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+    except Exception as exc:
+        logger.warning(
+            "[one-step-off][resize][trace] failed to write trace record event=%s error=%s",
+            payload.get("event", ""),
+            type(exc).__name__,
+        )
+
+
+_ERROR_MESSAGE_LIMIT = 2000
+
+
+def _safe_error_message(exc: BaseException) -> str:
+    try:
+        message = str(exc)
+    except BaseException:
+        return f"<unprintable {type(exc).__name__}>"
+    if len(message) <= _ERROR_MESSAGE_LIMIT:
+        return message
+    omitted = len(message) - _ERROR_MESSAGE_LIMIT
+    return f"{message[:_ERROR_MESSAGE_LIMIT]}... [truncated {omitted} chars]"
 
 
 @contextlib.contextmanager
@@ -121,11 +144,13 @@ def resize_trace_span(
 
     started_wall_ns = time.time_ns()
     started_mono_ns = time.monotonic_ns()
-    exc_type = None
+    exc_type = ""
+    error_message = ""
     try:
         yield
-    except Exception as exc:  # pragma: no cover - passthrough with trace side effect
+    except BaseException as exc:
         exc_type = type(exc).__name__
+        error_message = _safe_error_message(exc)
         raise
     finally:
         ended_wall_ns = time.time_ns()
@@ -140,7 +165,8 @@ def resize_trace_span(
                 "ts_end_ns": ended_wall_ns,
                 "dur_ms": round((ended_mono_ns - started_mono_ns) / 1_000_000.0, 3),
                 "status": "error" if exc_type else "ok",
-                "error_type": exc_type or "",
+                "error_type": exc_type,
+                "error_message": error_message,
                 "metadata": metadata or {},
             },
         )
