@@ -15,6 +15,7 @@ import functools
 import logging
 import os
 import shutil
+import time
 from contextlib import nullcontext
 from copy import deepcopy
 from functools import partial
@@ -22,6 +23,7 @@ from itertools import chain
 from typing import Optional
 
 import psutil
+import ray
 import torch
 from codetiming import Timer
 from omegaconf import DictConfig, open_dict
@@ -34,7 +36,13 @@ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_data
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_device_id, get_device_name, get_torch_device, set_expandable_segments
+from verl.utils.device import (
+    get_device_id,
+    get_device_name,
+    get_resource_name,
+    get_torch_device,
+    set_expandable_segments,
+)
 from verl.utils.distributed import (
     clear_dtensor_dispatch_caches,
     initialize_global_process_group_ray,
@@ -726,6 +734,51 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         DistProfilerExtension.__init__(
             self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
+        )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def get_hybrid_card_snapshot(self) -> dict:
+        """Sample this physical card; torch counters belong only to this hybrid process."""
+        from verl.experimental.one_step_off_policy.memory_probe import capture_memory_snapshot
+        from verl.experimental.one_step_off_policy.trace_utils import _safe_error_message
+
+        node_id, accelerator_id_raw = "", ""
+        try:
+            context = ray.get_runtime_context()
+            node_id = context.get_node_id()
+            allocated = context.get_accelerator_ids().get("GPU", [])
+            if not isinstance(node_id, str) or not node_id:
+                raise RuntimeError("Ray node identity is unavailable for the hybrid memory probe")
+            if (
+                not isinstance(allocated, list | tuple)
+                or len(allocated) != 1
+                or not isinstance(allocated[0], str)
+                or not allocated[0]
+            ):
+                raise RuntimeError("hybrid memory probe requires exactly one raw Ray GPU allocation")
+            accelerator_id_raw = allocated[0]
+            if get_device_name() == "cpu" or get_resource_name() != "GPU":
+                raise RuntimeError("hybrid memory probe requires a GPU memory counter backend")
+            device_module = get_torch_device()
+        except Exception as exc:
+            return {
+                "physical_rank": self.rank,
+                "node_id": node_id,
+                "accelerator_id_raw": accelerator_id_raw,
+                "process_scope": "hybrid_worker",
+                "sampled_at_ns": time.time_ns(),
+                "pid": os.getpid(),
+                "driver": {"free_bytes": None, "total_bytes": None, "used_bytes": None},
+                "process_torch": {"allocated_bytes": None, "reserved_bytes": None},
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "error_message": _safe_error_message(exc),
+            }
+        return capture_memory_snapshot(
+            physical_rank=self.rank,
+            node_id=node_id,
+            accelerator_id_raw=accelerator_id_raw,
+            device_module=device_module,
         )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

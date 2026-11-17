@@ -21,6 +21,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -36,6 +37,7 @@ from torch.utils.data import Dataset, Sampler
 from tqdm import tqdm
 
 from verl import DataProto
+from verl.experimental.one_step_off_policy.memory_probe import summarize_memory_snapshot
 from verl.experimental.one_step_off_policy.resize_budget import (
     ResizeBudgetConfig,
     ResizeBudgetController,
@@ -60,6 +62,7 @@ from verl.experimental.one_step_off_policy.staging_backend import (
     write_paged_state_manifest,
 )
 from verl.experimental.one_step_off_policy.trace_utils import (
+    _safe_error_message,
     append_resize_trace,
     build_resize_trace_config,
     resize_trace_span,
@@ -187,6 +190,8 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             self._dynamic_resize_cfg.get("handoff", {"enable": False})
         )
         self._resize_trace_config = build_resize_trace_config(self.config)
+        self._memory_probe_timeout_s = self._build_memory_probe_timeout_s()
+        self._hybrid_memory_identity_cache = None
         self._latest_resize_control_metrics: dict[str, float | str | int] = self._default_resize_control_metrics()
         self._latest_resize_budget_metrics: dict[str, float | str | int] = self._default_resize_budget_metrics()
         self._latest_resize_handoff_metrics: dict[str, float | str | int] = self._default_resize_handoff_metrics()
@@ -205,6 +210,308 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
 
     def _get_dynamic_resize_cfg(self) -> dict[str, Any]:
         return self._cfg_to_plain_dict(OmegaConf.select(self.config, "trainer.dynamic_resize"))
+
+    def _build_memory_probe_timeout_s(self) -> float | None:
+        probe_cfg = self._dynamic_resize_cfg.get("memory_probe", {}) or {}
+        if not probe_cfg.get("enable", False):
+            return None
+        raw_timeout = probe_cfg.get("timeout_s", 5.0)
+        try:
+            if isinstance(raw_timeout, bool):
+                raise ValueError("boolean timeout")
+            timeout_s = float(raw_timeout)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("trainer.dynamic_resize.memory_probe.timeout_s must be finite and positive") from exc
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("trainer.dynamic_resize.memory_probe.timeout_s must be finite and positive")
+        shared_pool = self._dynamic_resize_cfg.get("shared_pool", False)
+        shared_enabled = shared_pool.get("enable", False) if isinstance(shared_pool, dict) else bool(shared_pool)
+        if not (
+            self._dynamic_resize_enabled
+            and shared_enabled
+            and self.hybrid_engine
+            and self._resize_trace_config.enabled
+            and self._resize_trace_config.path.strip()
+        ):
+            return None
+        return timeout_s
+
+    @staticmethod
+    def _hybrid_memory_error(stage: str, exc: Exception, *, physical_rank: int | None = None) -> dict:
+        error = {"stage": stage, "error_type": type(exc).__name__, "error_message": _safe_error_message(exc)}
+        if physical_rank is not None:
+            error["physical_rank"] = physical_rank
+        return error
+
+    def _collect_hybrid_memory_refs(
+        self, refs_by_rank: list[tuple[int, Any]], *, deadline: float, stage: str
+    ) -> tuple[list[tuple[int, Any]], list[dict]]:
+        """Read ready references individually under the boundary's single total deadline."""
+        pending = {ref: rank for rank, ref in refs_by_rank}
+        results, errors = [], []
+        wait_failed = False
+        while pending:
+            remaining = max(deadline - time.monotonic(), 0.0)
+            try:
+                ready, _ = ray.wait(list(pending), num_returns=1, timeout=remaining)
+            except Exception as exc:
+                errors.append(self._hybrid_memory_error(f"{stage}_wait", exc))
+                wait_failed = True
+                break
+            if not ready:
+                break
+            for ref in ready:
+                rank = pending.pop(ref)
+                try:
+                    value = ray.get(ref, timeout=max(deadline - time.monotonic(), 0.0))
+                except Exception as exc:
+                    errors.append(self._hybrid_memory_error(f"{stage}_read", exc, physical_rank=rank))
+                else:
+                    results.append((rank, value))
+        for rank in pending.values():
+            errors.append(
+                self._hybrid_memory_error(
+                    f"{stage}_unread" if wait_failed else f"{stage}_timeout",
+                    RuntimeError("probe reference could not be read after a readiness failure")
+                    if wait_failed
+                    else TimeoutError("probe reference was not ready before the deadline"),
+                    physical_rank=rank,
+                )
+            )
+        return results, errors
+
+    def _get_hybrid_memory_identities(
+        self, physical_wg, *, world_size: int, deadline: float
+    ) -> tuple[list[dict], list[dict], list[dict]]:
+        """Cache allocations only after validating every raw physical worker independently."""
+        workers = physical_wg.workers
+        actor_ids = tuple(worker._actor_id for worker in workers)
+        cache_key = (world_size, actor_ids)
+        cache = getattr(self, "_hybrid_memory_identity_cache", None)
+        if cache is not None and cache[0] == cache_key:
+            return cache[1], [], []
+        self._hybrid_memory_identity_cache = None
+        errors, refs = [], []
+        if (
+            len(workers) != world_size
+            or any(actor_id is None for actor_id in actor_ids)
+            or len(set(actor_ids)) != world_size
+        ):
+            errors.append(
+                self._hybrid_memory_error(
+                    "identity_validation", ValueError("raw physical worker handles do not match the known world size")
+                )
+            )
+
+        def allocation_identity(worker):
+            context = ray.get_runtime_context()
+            return {
+                "physical_rank": worker.rank,
+                "node_id": context.get_node_id(),
+                "accelerator_ids_raw": context.get_accelerator_ids().get("GPU", []),
+            }
+
+        for rank, worker in enumerate(workers):
+            if time.monotonic() >= deadline:
+                errors.append(
+                    self._hybrid_memory_error(
+                        "identity_timeout", TimeoutError("identity dispatch deadline expired"), physical_rank=rank
+                    )
+                )
+                continue
+            try:
+                refs.append((rank, worker.__ray_call__.remote(allocation_identity)))
+            except Exception as exc:
+                errors.append(self._hybrid_memory_error("identity_dispatch", exc, physical_rank=rank))
+        rows, read_errors = self._collect_hybrid_memory_refs(refs, deadline=deadline, stage="identity")
+        errors.extend(read_errors)
+        identities, identity_observed, cards, ranks = [], [], set(), set()
+        for handle_rank, row in sorted(rows):
+            identity_observed.append(row)
+            if not isinstance(row, dict):
+                errors.append(
+                    self._hybrid_memory_error(
+                        "identity_validation",
+                        ValueError("malformed physical allocation result"),
+                        physical_rank=handle_rank,
+                    )
+                )
+                continue
+            rank, node_id, allocated = (row.get(key) for key in ("physical_rank", "node_id", "accelerator_ids_raw"))
+            if (
+                type(rank) is not int
+                or rank != handle_rank
+                or rank >= world_size
+                or not isinstance(node_id, str)
+                or not node_id
+                or not isinstance(allocated, list | tuple)
+                or len(allocated) != 1
+                or not isinstance(allocated[0], str)
+                or not allocated[0]
+            ):
+                errors.append(
+                    self._hybrid_memory_error(
+                        "identity_validation",
+                        ValueError("rank, node or single raw GPU allocation is invalid"),
+                        physical_rank=handle_rank,
+                    )
+                )
+                continue
+            card = (node_id, allocated[0])
+            if rank in ranks or card in cards:
+                errors.append(
+                    self._hybrid_memory_error(
+                        "identity_validation",
+                        ValueError("duplicate physical rank or node/GPU allocation"),
+                        physical_rank=handle_rank,
+                    )
+                )
+            ranks.add(rank)
+            cards.add(card)
+            identities.append({"physical_rank": rank, "node_id": node_id, "accelerator_id_raw": allocated[0]})
+        if ranks != set(range(world_size)):
+            errors.append(
+                self._hybrid_memory_error(
+                    "identity_validation", ValueError("independent physical allocation map is incomplete")
+                )
+            )
+        if errors:
+            return identities, identity_observed, errors
+        self._hybrid_memory_identity_cache = (cache_key, identities)
+        return identities, identity_observed, []
+
+    def _sample_hybrid_memory(self, phase: str, *, actor_size: int | None = None) -> dict | None:
+        timeout_s = getattr(self, "_memory_probe_timeout_s", None)
+        if timeout_s is None:
+            return None
+        expected, observed, errors, identity_observed = [], [], [], []
+        world_size = None
+        started_ns = time.time_ns()
+        deadline = time.monotonic() + timeout_s
+        try:
+            physical_wg = self._physical_actor_rollout_wg
+            world_size = physical_wg.world_size
+            if type(world_size) is not int or world_size <= 0:
+                raise ValueError("physical hybrid world size is unavailable")
+            try:
+                identities, identity_observed, identity_errors = self._get_hybrid_memory_identities(
+                    physical_wg, world_size=world_size, deadline=deadline
+                )
+            except Exception as exc:
+                identities = []
+                identity_errors = [self._hybrid_memory_error("identity_validation", exc)]
+            errors.extend(identity_errors)
+            manager = getattr(self, "llm_server_manager", None) or getattr(
+                self, "_prelaunched_llm_server_manager", None
+            )
+            membership = None
+            if manager is not None:
+                try:
+                    membership = manager.get_hybrid_memory_membership(physical_wg.workers)
+                    if (
+                        not isinstance(membership, dict)
+                        or set(membership) != set(range(world_size))
+                        or any(
+                            not isinstance(flags, dict)
+                            or any(
+                                type(flags.get(label)) is not bool for label in ("rollout_active", "rollout_dormant")
+                            )
+                            for flags in membership.values()
+                        )
+                    ):
+                        raise ValueError("hybrid rollout membership is incomplete or malformed")
+                except Exception as exc:
+                    membership = None
+                    errors.append(self._hybrid_memory_error("membership", exc))
+            if actor_size is None:
+                actor_size = (getattr(self, "_active_dynamic_resize_topology", None) or {}).get("actor_size")
+            if type(actor_size) is not int or not 0 <= actor_size <= world_size:
+                errors.append(
+                    self._hybrid_memory_error("membership", ValueError("actor membership size is unavailable"))
+                )
+                actor_size = None
+            identity_by_rank = {identity["physical_rank"]: identity for identity in identities}
+            # Keep every independently expected rank even when its allocation evidence is missing.
+            for rank in range(world_size):
+                rollout_membership = (
+                    {"rollout_active": False, "rollout_dormant": False}
+                    if manager is None
+                    else {"rollout_active": None, "rollout_dormant": None}
+                )
+                if membership is not None:
+                    rollout_membership = membership[rank]
+                expected.append(
+                    {
+                        "physical_rank": rank,
+                        "node_id": identity_by_rank.get(rank, {}).get("node_id"),
+                        "accelerator_id_raw": identity_by_rank.get(rank, {}).get("accelerator_id_raw"),
+                        "membership": {
+                            "actor": rank < actor_size if actor_size is not None else None,
+                            **rollout_membership,
+                        },
+                    }
+                )
+            if not identity_errors:
+                if time.monotonic() >= deadline:
+                    errors.append(
+                        self._hybrid_memory_error(
+                            "snapshot_timeout", TimeoutError("probe deadline expired before sampling")
+                        )
+                    )
+                else:
+                    try:
+                        refs = physical_wg.get_hybrid_card_snapshot()
+                        if not isinstance(refs, list | tuple):
+                            raise ValueError("nonblocking hybrid snapshot dispatch did not return a reference list")
+                    except Exception as exc:
+                        errors.append(self._hybrid_memory_error("snapshot_dispatch", exc))
+                    else:
+                        if len(refs) != world_size:
+                            errors.append(
+                                self._hybrid_memory_error(
+                                    "snapshot_dispatch",
+                                    ValueError("snapshot reference count differs from physical world size"),
+                                )
+                            )
+                        rows, read_errors = self._collect_hybrid_memory_refs(
+                            list(enumerate(refs)), deadline=deadline, stage="snapshot"
+                        )
+                        observed.extend(row for _, row in rows)
+                        errors.extend(read_errors)
+        except Exception as exc:
+            errors.append(self._hybrid_memory_error("collector", exc))
+        try:
+            summary = summarize_memory_snapshot(expected, observed, errors)
+        except Exception as exc:
+            # Retain collected evidence even if the diagnostic summarizer itself fails.
+            errors.append(self._hybrid_memory_error("summary", exc))
+            summary = {
+                "expected": expected,
+                "observed": observed,
+                "errors": errors,
+                "expected_count": len(expected),
+                "observed_count": len(observed),
+                "complete": False,
+            }
+        if type(world_size) is int and world_size > 0:
+            summary["expected_count"] = world_size
+        record = {
+            "event": "gpu_cards_snapshot",
+            "kind": "snapshot",
+            "phase": phase,
+            "step": getattr(self, "global_steps", 0),
+            "ts_start_ns": started_ns,
+            "ts_end_ns": time.time_ns(),
+            "timeout_s": timeout_s,
+            "identity_observed": identity_observed,
+            **summary,
+        }
+        append_resize_trace(self._resize_trace_config, record)
+        if not record["complete"]:
+            logger.warning(
+                "[one-step-off][memory] incomplete hybrid snapshot phase=%s errors=%s", phase, len(record["errors"])
+            )
+        return record
 
     def _build_resize_controller(self) -> ResizeController | None:
         if not self._dynamic_resize_enabled:
@@ -1259,6 +1566,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                     optimizer_stage_metrics = self._stage_dynamic_resize_optimizer_handoff(checkpoint_step_folder)
                     metrics.update(optimizer_stage_metrics)
 
+        memory_probe_enabled = getattr(self, "_memory_probe_timeout_s", None) is not None
+        if memory_probe_enabled:
+            old_actor_size = (getattr(self, "_active_dynamic_resize_topology", None) or {}).get("actor_size")
+            self._sample_hybrid_memory("resize_before_destroy", actor_size=old_actor_size)
         with resize_trace_span(
             self._resize_trace_config,
             "resize_hard_switch_destroy",
@@ -1266,6 +1577,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             metadata=trace_metadata,
         ):
             await self._destroy_dynamic_resize_runtime(actor_target=actor_target)
+        if memory_probe_enabled:
+            # Parking replicas does not move the physical actor runtime; that happens in the rebuild.
+            self._sample_hybrid_memory("resize_after_destroy", actor_size=old_actor_size)
+
         with marked_timer("dynamic_resize_rebuild_runtime", self.timing_raw, color="green"):
             self._latest_gpu_direct_resize_metrics = {}
             with resize_trace_span(
@@ -1281,6 +1596,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                     )
                 else:
                     self._rebuild_dynamic_resize_runtime(actor_size=actor_target, rollout_size=rollout_target)
+            if memory_probe_enabled:
+                self._sample_hybrid_memory("resize_after_rebuild", actor_size=actor_target)
+
             if gpu_direct:
                 metrics.update(self._latest_gpu_direct_resize_metrics)
             else:
@@ -1310,6 +1628,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         ):
             with marked_timer("dynamic_resize_update_weights", self.timing_raw, color="green"):
                 await self.checkpoint_manager.update_weights(self.global_steps)
+        if memory_probe_enabled:
+            self._sample_hybrid_memory("resize_after_sync", actor_size=actor_target)
+
         self._active_dynamic_resize_topology = {"actor_size": actor_target, "rollout_size": rollout_target}
         # After the handoff-session metrics, which carry defaults for these keys.
         metrics.update(getattr(self, "_latest_rollout_rebuild_metrics", None) or {})
@@ -1477,14 +1798,22 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             initial_actor_ranks = list(range(topology.initial_actor_size))
             # Before any training runtime exists: vLLM sizes its memory budget against the free memory it
             # sees at start-up, so the replicas on the initial actor GPUs can only be launched now.
-            self._prelaunch_hybrid_rollout_pool(dormant_below=topology.initial_actor_size // rollout_world_size)
+            self._sample_hybrid_memory("startup_prelaunch", actor_size=topology.initial_actor_size)
+            with resize_trace_span(
+                self._resize_trace_config, "startup_rollout_prelaunch", step=getattr(self, "global_steps", 0)
+            ):
+                self._prelaunch_hybrid_rollout_pool(dormant_below=topology.initial_actor_size // rollout_world_size)
+            self._sample_hybrid_memory("startup_parked", actor_size=topology.initial_actor_size)
 
         if self.use_critic:
             self.critic_wg = self.all_wg[str(Role.Critic)]
-            if initial_actor_ranks is None:
-                self.critic_wg.reset()
-            else:
-                self.critic_wg.reset_on(initial_actor_ranks)
+            with resize_trace_span(
+                self._resize_trace_config, "startup_critic_runtime_init", step=getattr(self, "global_steps", 0)
+            ):
+                if initial_actor_ranks is None:
+                    self.critic_wg.reset()
+                else:
+                    self.critic_wg.reset_on(initial_actor_ranks)
             # assign critic loss
             from functools import partial
 
@@ -1495,7 +1824,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
 
         if self.use_reference_policy and not self.ref_in_actor and self.actor_role != Role.ActorRolloutRef:
             self.ref_policy_wg = self.all_wg[str(Role.RefPolicy)]
-            self.ref_policy_wg.init_model(actor_ranks=initial_actor_ranks)
+            with resize_trace_span(
+                self._resize_trace_config, "startup_reference_runtime_init", step=getattr(self, "global_steps", 0)
+            ):
+                self.ref_policy_wg.init_model(actor_ranks=initial_actor_ranks)
 
         self.rm_wg = None
         if self.use_rm:
@@ -1504,7 +1836,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
 
         self.actor_wg = self.all_wg[str(self.actor_role)]
         self._physical_actor_rollout_wg = self.actor_wg
-        self.actor_wg.init_model(actor_ranks=initial_actor_ranks)
+        with resize_trace_span(
+            self._resize_trace_config, "startup_actor_runtime_init", step=getattr(self, "global_steps", 0)
+        ):
+            self.actor_wg.init_model(actor_ranks=initial_actor_ranks)
         self.actor_rollout_wg = self.actor_wg
         if self.actor_role == Role.ActorRolloutRef:
             self.ref_policy_wg = self.actor_rollout_wg
@@ -1536,6 +1871,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 "actor_size": topology.initial_actor_size,
                 "rollout_size": topology.initial_rollout_size,
             }
+            self._sample_hybrid_memory("startup_runtime_ready", actor_size=topology.initial_actor_size)
 
     def _init_async_rollout_manager(self):
         # create async rollout manager and request scheduler
@@ -1693,6 +2029,8 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
         self._fit_update_weights()
+        if self.config.trainer.critic_warmup <= self.global_steps:
+            self._sample_hybrid_memory("startup_after_sync")
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
