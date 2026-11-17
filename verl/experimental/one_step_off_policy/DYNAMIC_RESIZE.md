@@ -81,9 +81,21 @@ The launcher has two versions, and this one variable selects between them:
   2. verl logs everything: `VERL_LOGGING_LEVEL` defaults to `DEBUG` (a value the caller exports is
      kept). That includes the trainer's `[one-step-off][resize]` lines with the transfer statistics of
      every rank, the server manager's replica plan and the workers' memory lines.
-  3. The resize trace is on (`trainer.dynamic_resize.trace`): `$CKPT_DIR/resize_trace.jsonl` gets two
-     records per step, `resize_observation` and `resize_schedule`, with all `resize/*` metrics of the
-     step.
+  3. The resize trace is on (`trainer.dynamic_resize.trace`): `$CKPT_DIR/resize_trace.jsonl` gets the
+     `resize_observation` and `resize_schedule` records for each step, with all `resize/*` metrics of
+     the step. Scheduled items first write `resize_schedule_gate`, including the first runtime target
+     validation; refused gates do not create successful hard-switch records. An attempted hard switch
+     writes an outer `resize_hard_switch` record and one record for each executed phase:
+     `resize_hard_switch_handoff_save` and `resize_hard_switch_restore` on disk/handoff backends, plus
+     `resize_hard_switch_destroy`, `resize_hard_switch_rebuild`, and `resize_hard_switch_update_weights`.
+     Every span carries `status`, `error_type`, and `error_message`. Phase metadata identifies the target
+     actor/rollout sizes, backend, and `gpu_direct` flag; the outer span wraps the actual switch invocation.
+     `error_message` is empty on success. On failure it holds the exception text, keeping the first
+     2000 characters plus a truncation marker; unprintable exception text is replaced with a safe
+     placeholder. Interruptions such as `KeyboardInterrupt` and `SystemExit` are recorded as errors
+     and then re-raised unchanged. A trace write failure logs a warning and drops that record; it does
+     not abort the operation or replace the original exception. Existing observation and schedule
+     record names and fields are unchanged; readers must allow additional phase records.
 
 More switches are added as further stages with the same shape as `stage0` in the yaml:
 
@@ -206,7 +218,7 @@ reports `resize/enabled:0.0` instead. In addition:
   verified=1 verified_scalars=330` with the ranks of that switch (330 entries for the Qwen3-0.6B actor;
   with the critic a `critic runtime moved` line as well) and one
   `[one-step-off][resize] actor rank N: {...}` line per GPU of the pool.
-  `$RUN/ckpt/resize_trace.jsonl` has two lines per step.
+  `$RUN/ckpt/resize_trace.jsonl` retains observation/schedule records and adds gate and executed phase records.
 * Plain version: no `[one-step-off][resize]` line and no `resize_trace.jsonl`; the switch lines report
   `resize/gpu_direct_verified:0.0`.
 * `gpu_direct` leaves no `global_step_*` directory in `CKPT_DIR` unless `trainer.save_freq` asks for

@@ -139,6 +139,10 @@ def test_gpu_direct_hard_switch_moves_state_without_a_checkpoint_round_trip():
     def marked_timer(*_args, **_kwargs):
         yield
 
+    @contextmanager
+    def resize_trace_span(*_args, **_kwargs):
+        yield
+
     cls = _load_methods(
         TRAINER,
         "OneStepOffRayTrainer",
@@ -146,6 +150,7 @@ def test_gpu_direct_hard_switch_moves_state_without_a_checkpoint_round_trip():
         Any=Any,
         time=time,
         marked_timer=marked_timer,
+        resize_trace_span=resize_trace_span,
         dynamic_resize_shared_pool_enabled=lambda config: True,
     )
     trainer = cls()
@@ -154,6 +159,8 @@ def test_gpu_direct_hard_switch_moves_state_without_a_checkpoint_round_trip():
     trainer.global_steps = 2
     trainer.hybrid_engine = True
     trainer._resize_controller = None
+    trainer._resize_trace_config = SimpleNamespace(enabled=False)
+    trainer._host_staging_config = SimpleNamespace(effective_backend=lambda: "gpu_direct")
     trainer._active_dynamic_resize_topology = {"actor_size": 4, "rollout_size": 4}
     trainer._dynamic_resize_target_sizes = lambda item: (6, 2)
     trainer._gpu_direct_actor_model_resize_enabled = lambda: True
