@@ -59,7 +59,11 @@ from verl.experimental.one_step_off_policy.staging_backend import (
     write_host_staging_manifest,
     write_paged_state_manifest,
 )
-from verl.experimental.one_step_off_policy.trace_utils import append_resize_trace, build_resize_trace_config
+from verl.experimental.one_step_off_policy.trace_utils import (
+    append_resize_trace,
+    build_resize_trace_config,
+    resize_trace_span,
+)
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.experimental.separation.utils import dynamic_resize_shared_pool_enabled
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
@@ -1228,6 +1232,14 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
 
         switch_start = time.perf_counter()
         gpu_direct = self._gpu_direct_actor_model_resize_enabled()
+        trace_metadata = None
+        if self._resize_trace_config.enabled:
+            trace_metadata = {
+                "target_actor_size": actor_target,
+                "target_rollout_size": rollout_target,
+                "backend": self._host_staging_config.effective_backend(),
+                "gpu_direct": gpu_direct,
+            }
         if gpu_direct:
             # The training state moves GPU-to-GPU inside the rebuild; nothing is written to or read from
             # disk and a failure aborts the run instead of falling back.
@@ -1235,42 +1247,69 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             checkpoint_step_folder = None
         else:
             checkpoint_step_folder = self._dynamic_resize_checkpoint_step_folder()
-            with marked_timer("dynamic_resize_save_checkpoint", self.timing_raw, color="green"):
-                self._save_checkpoint(save_full_model_for_dynamic_resize=True)
-                metrics.update(self._prepare_dynamic_resize_handoff_session(checkpoint_step_folder))
-                optimizer_stage_metrics = self._stage_dynamic_resize_optimizer_handoff(checkpoint_step_folder)
-                metrics.update(optimizer_stage_metrics)
+            with resize_trace_span(
+                self._resize_trace_config,
+                "resize_hard_switch_handoff_save",
+                step=self.global_steps,
+                metadata=trace_metadata,
+            ):
+                with marked_timer("dynamic_resize_save_checkpoint", self.timing_raw, color="green"):
+                    self._save_checkpoint(save_full_model_for_dynamic_resize=True)
+                    metrics.update(self._prepare_dynamic_resize_handoff_session(checkpoint_step_folder))
+                    optimizer_stage_metrics = self._stage_dynamic_resize_optimizer_handoff(checkpoint_step_folder)
+                    metrics.update(optimizer_stage_metrics)
 
-        await self._destroy_dynamic_resize_runtime(actor_target=actor_target)
-
+        with resize_trace_span(
+            self._resize_trace_config,
+            "resize_hard_switch_destroy",
+            step=self.global_steps,
+            metadata=trace_metadata,
+        ):
+            await self._destroy_dynamic_resize_runtime(actor_target=actor_target)
         with marked_timer("dynamic_resize_rebuild_runtime", self.timing_raw, color="green"):
             self._latest_gpu_direct_resize_metrics = {}
-            if self.hybrid_engine:
-                await self._rebuild_hybrid_dynamic_resize_runtime(
-                    actor_size=actor_target,
-                    rollout_size=rollout_target,
-                )
-            else:
-                self._rebuild_dynamic_resize_runtime(actor_size=actor_target, rollout_size=rollout_target)
-
+            with resize_trace_span(
+                self._resize_trace_config,
+                "resize_hard_switch_rebuild",
+                step=self.global_steps,
+                metadata=trace_metadata,
+            ):
+                if self.hybrid_engine:
+                    await self._rebuild_hybrid_dynamic_resize_runtime(
+                        actor_size=actor_target,
+                        rollout_size=rollout_target,
+                    )
+                else:
+                    self._rebuild_dynamic_resize_runtime(actor_size=actor_target, rollout_size=rollout_target)
             if gpu_direct:
                 metrics.update(self._latest_gpu_direct_resize_metrics)
             else:
-                self._load_dynamic_resize_checkpoint(checkpoint_step_folder)
-                metrics.update(self._complete_dynamic_resize_handoff_session(checkpoint_step_folder))
-                metrics.update(
-                    {
-                        key: value
-                        for key, value in optimizer_stage_metrics.items()
-                        if key.startswith("resize/handoff_optimizer_stage")
-                    }
-                )
-                if optimizer_stage_metrics.get("resize/handoff_error") and not metrics.get("resize/handoff_error"):
-                    metrics["resize/handoff_error"] = optimizer_stage_metrics["resize/handoff_error"]
+                with resize_trace_span(
+                    self._resize_trace_config,
+                    "resize_hard_switch_restore",
+                    step=self.global_steps,
+                    metadata=trace_metadata,
+                ):
+                    self._load_dynamic_resize_checkpoint(checkpoint_step_folder)
+                    metrics.update(self._complete_dynamic_resize_handoff_session(checkpoint_step_folder))
+                    metrics.update(
+                        {
+                            key: value
+                            for key, value in optimizer_stage_metrics.items()
+                            if key.startswith("resize/handoff_optimizer_stage")
+                        }
+                    )
+                    if optimizer_stage_metrics.get("resize/handoff_error") and not metrics.get("resize/handoff_error"):
+                        metrics["resize/handoff_error"] = optimizer_stage_metrics["resize/handoff_error"]
 
-        with marked_timer("dynamic_resize_update_weights", self.timing_raw, color="green"):
-            await self.checkpoint_manager.update_weights(self.global_steps)
-
+        with resize_trace_span(
+            self._resize_trace_config,
+            "resize_hard_switch_update_weights",
+            step=self.global_steps,
+            metadata=trace_metadata,
+        ):
+            with marked_timer("dynamic_resize_update_weights", self.timing_raw, color="green"):
+                await self.checkpoint_manager.update_weights(self.global_steps)
         self._active_dynamic_resize_topology = {"actor_size": actor_target, "rollout_size": rollout_target}
         # After the handoff-session metrics, which carry defaults for these keys.
         metrics.update(getattr(self, "_latest_rollout_rebuild_metrics", None) or {})
@@ -1307,7 +1346,12 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 continue
             schedule_seen = True
 
-            gate_pass, required_action, gate_metrics = self._gate_dynamic_resize_schedule_item(item)
+            with resize_trace_span(
+                self._resize_trace_config,
+                "resize_schedule_gate",
+                step=self.global_steps,
+            ):
+                gate_pass, required_action, gate_metrics = self._gate_dynamic_resize_schedule_item(item)
             metrics.update(gate_metrics)
             if not gate_pass:
                 logger.info(
@@ -1327,7 +1371,14 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 continue
 
             if self._dynamic_resize_hard_switch_enabled():
-                metrics.update(await self._apply_dynamic_resize_hard_switch(item=item, required_action=required_action))
+                with resize_trace_span(
+                    self._resize_trace_config,
+                    "resize_hard_switch",
+                    step=self.global_steps,
+                ):
+                    metrics.update(
+                        await self._apply_dynamic_resize_hard_switch(item=item, required_action=required_action)
+                    )
                 continue
 
             reason = "dynamic_resize_hard_switch_disabled"
