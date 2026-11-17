@@ -46,7 +46,12 @@ class OneStepTaskRunner:
 
         OmegaConf.resolve(config)
 
-        role_worker_mapping, ray_worker_group_cls = create_role_worker_mapping(config)
+        use_hybrid_worker = bool(config.actor_rollout_ref.hybrid_engine) and bool(
+            OmegaConf.select(config, "trainer.dynamic_resize.enable", default=False)
+        )
+        role_worker_mapping, ray_worker_group_cls = create_role_worker_mapping(
+            config, use_hybrid_worker=use_hybrid_worker
+        )
 
         # validate config
         validate_config(
@@ -69,7 +74,11 @@ class OneStepTaskRunner:
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
-        resource_pool_manager = create_resource_pool_manager(config, role_worker_mapping.keys())
+        resource_pool_manager = create_resource_pool_manager(
+            config,
+            role_worker_mapping.keys(),
+            use_hybrid_pool=use_hybrid_worker,
+        )
 
         from verl.utils.dataset.rl_dataset import collate_fn
 

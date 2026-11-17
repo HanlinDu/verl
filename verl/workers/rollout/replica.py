@@ -120,6 +120,7 @@ class RolloutReplica(ABC):
         self.name_suffix = f"_{name_suffix}" if name_suffix else ""
 
         self.rollout_mode: RolloutMode = None
+        self.worker_group_rank = replica_rank
         self.workers: list[ActorHandle] = []
         self.resource_pool: RayResourcePool = None
         self.bundle_indices: list[int] = []
@@ -135,8 +136,9 @@ class RolloutReplica(ABC):
             worker_group: RayWorkerGroup, fused workers where training engine(fsdp/megatron) have been initialized.
         """
         self.rollout_mode = RolloutMode.HYBRID
+        worker_group_rank = getattr(self, "worker_group_rank", self.replica_rank)
         self.workers = worker_group.workers[
-            self.world_size * self.replica_rank : self.world_size * (self.replica_rank + 1)
+            self.world_size * worker_group_rank : self.world_size * (worker_group_rank + 1)
         ]
         await self.launch_servers()
 
@@ -149,11 +151,12 @@ class RolloutReplica(ABC):
             bundle_indices: list[int], bundle indices for this rollout replica.
         """
         self.rollout_mode = RolloutMode.HYBRID
+        worker_group_rank = getattr(self, "worker_group_rank", self.replica_rank)
         self.workers = worker_group.workers[
-            self.world_size * self.replica_rank : self.world_size * (self.replica_rank + 1)
+            self.world_size * worker_group_rank : self.world_size * (worker_group_rank + 1)
         ]
         self.resource_pool = resource_pool
-        self.bundle_indices = [self.replica_rank * self.world_size + idx for idx in range(self.world_size)]
+        self.bundle_indices = [worker_group_rank * self.world_size + idx for idx in range(self.world_size)]
         await self.launch_servers()
 
     # TODO(sgm): this should be the default solution, but need to make the RolloutMode more clear.
@@ -268,8 +271,15 @@ class RolloutReplica(ABC):
         """Wake up each rollout server."""
         await asyncio.gather(*[server.wake_up.remote() for server in self.servers])
 
-    async def sleep(self):
-        """Sleep each rollout server."""
+    async def sleep(self, force: bool = False):
+        """Sleep each rollout server.
+
+        ``force`` frees the memory even when ``free_cache_engine`` is off (dynamic resize parks a replica whose
+        GPUs become training ranks); backends that cannot do that must say so instead of silently keeping the
+        memory.
+        """
+        if force:
+            raise NotImplementedError(f"{type(self).__name__} cannot sleep with free_cache_engine=False")
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
 
     async def abort_all_requests(self):
@@ -299,6 +309,30 @@ class RolloutReplica(ABC):
     async def stop_profile(self):
         """Stop profiling on the replica."""
         await asyncio.gather(*[server.stop_profile.remote() for server in self.servers])
+
+    async def shutdown_runtime(self, kill_workers: bool = False):
+        """Stop rollout server actors while optionally retaining worker handles.
+
+        Hybrid replicas use shared ``ActorRolloutRefWorker`` handles as their
+        physical workers. Those handles must survive a topology change; only
+        the server actors and their inference runtime are replaced.
+        """
+        if self.servers:
+            try:
+                await self.abort_all_requests()
+            except Exception as exc:
+                logger.warning("failed to abort requests before rollout shutdown: %s", exc)
+            for server in self.servers:
+                ray.kill(server, no_restart=True)
+
+        if kill_workers:
+            for worker in self.workers:
+                ray.kill(worker, no_restart=True)
+
+        self.servers = []
+        self.workers = [] if kill_workers else self.workers
+        self._server_handle = None
+        self._server_address = None
 
 
 class RolloutReplicaRegistry:
