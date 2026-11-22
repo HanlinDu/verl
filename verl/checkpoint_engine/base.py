@@ -29,6 +29,13 @@ from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutCo
 from verl.workers.rollout import BaseRollout, RolloutReplica, get_rollout_class
 from verl.workers.rollout.utils import ensure_async_iterator
 
+# Checkpoint-engine backend names that accept an explicit collective group.
+# Kept here so resize callers do not hard-code device/backend literals.
+NAMED_GROUP_CHECKPOINT_BACKENDS = frozenset({"nccl", "hccl"})
+
+# Backends whose lifecycle can rebuild their communication group on resize.
+REBUILD_GROUP_CHECKPOINT_BACKENDS = NAMED_GROUP_CHECKPOINT_BACKENDS | frozenset({"kimi_ckpt_engine", "mooncake"})
+
 
 @dataclass
 class TensorMeta:

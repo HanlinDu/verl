@@ -1618,9 +1618,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "release_old": False,
         }
         with marked_timer("startup_fused_restore", timing_raw):
-            restore_metrics = await self._apply_dynamic_resize_hard_switch(
-                item=restore, required_action="expand_train"
-            )
+            restore_metrics = await self._apply_dynamic_resize_hard_switch(item=restore, required_action="expand_train")
         if restore_metrics.get("resize/hard_switch_success") != 1.0:
             raise RuntimeError("startup-fused first batch failed to restore the actor/rollout split")
         if (self._active_actor_size(), self._active_rollout_size()) != (4, 4):

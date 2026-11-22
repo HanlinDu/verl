@@ -302,6 +302,17 @@ For a fresh single-node eight-GPU dynamic-resize run, set `VERL_STARTUP_FUSED_FI
 
 The first batch is generated once on the 2/6 split. After the responses and rollout log probabilities are joined to that batch, the trainer restores 4/4 before balancing rows or updating the actor. An incomplete batch or unsuccessful restore stops the run. Subsequent schedule entries use the ordinary training loop. This option targets fresh starts and does not select switch times or promise a speedup.
 
+### Validating startup-resize changes
+
+Use `pre-commit run --all-files` for the full repository checks; the configuration pins Ruff to 0.12.2.
+Install `pre-commit` and `hydra-core`, then install this checkout with `pip install --no-deps -e .`,
+as the CI job does. The checks cover inherited files too, including their contributor license headers.
+Checkpoint backend group/rebuild membership is declared in `verl/checkpoint_engine/base.py`,
+not inferred from the current device: resizing must preserve the configured backend's behavior.
+Run `python3 -m pytest tests/experimental/one_step_off_policy/test_startup_fused_on_cpu.py`
+for first-batch alignment and transient-checkpoint checks. These use CPU substitutes and are not GPU training proof.
+
+
 ## Functional Support
 
 | Category           | Support Situation                                                                                               |

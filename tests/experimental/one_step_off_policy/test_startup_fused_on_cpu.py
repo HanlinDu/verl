@@ -1,3 +1,16 @@
+# Copyright 2026 Individual Contributor: LeonardW-sl
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """CPU regression for the fused startup first batch on the ordinary trainer flow.
 
 The test executes the real ``fit``, ``_async_gen_next_batch``,
@@ -163,8 +176,8 @@ def _strip_imports(node):
     import anywhere else would pull a heavy module at execution time, so it is
     reported instead of silently resolved.
     """
-    node.body = [stmt for stmt in node.body if not isinstance(stmt, (ast.Import, ast.ImportFrom))]
-    nested = [stmt for stmt in ast.walk(node) if isinstance(stmt, (ast.Import, ast.ImportFrom))]
+    node.body = [stmt for stmt in node.body if not isinstance(stmt, ast.Import | ast.ImportFrom)]
+    nested = [stmt for stmt in ast.walk(node) if isinstance(stmt, ast.Import | ast.ImportFrom)]
     if nested:
         raise AssertionError(f"{node.name} imports outside its body; extend the harness namespace instead")
     return node
@@ -312,9 +325,9 @@ def _install_trainer(namespace, *, fused, faults=(), apply_port=None):
     trainer._active_rollout_size = lambda: active_topology[1]
 
     generated, trained, switches, order = [], [], [], []
-    trainer._fit_update_actor = lambda batch: trained.append(
-        (trainer.global_steps, tuple(active_topology), batch.digest())
-    ) or batch
+    trainer._fit_update_actor = (
+        lambda batch: trained.append((trainer.global_steps, tuple(active_topology), batch.digest())) or batch
+    )
 
     async def generate(batch):
         index = len(generated) + 1
@@ -327,9 +340,7 @@ def _install_trainer(namespace, *, fused, faults=(), apply_port=None):
         probabilities = not ("missing_probability" in faults and index == 1)
         output = _Batch(rows, responses, probabilities=probabilities)
         # The rollout engine echoes the request's non-tensor fields (uid/index).
-        output.non_tensor_batch = {
-            key: list(values)[: len(rows)] for key, values in batch.non_tensor_batch.items()
-        }
+        output.non_tensor_batch = {key: list(values)[: len(rows)] for key, values in batch.non_tensor_batch.items()}
         return output
 
     async def apply(item, required_action):
@@ -344,11 +355,7 @@ def _install_trainer(namespace, *, fused, faults=(), apply_port=None):
             metrics = await apply_port(item, required_action)
         else:
             metrics = await apply(item, required_action)
-        if (
-            item is not None
-            and "wrong_topology" not in faults
-            and metrics.get("resize/hard_switch_success") == 1.0
-        ):
+        if item is not None and "wrong_topology" not in faults and metrics.get("resize/hard_switch_success") == 1.0:
             active_topology[:] = item["actor_pool"]["size"]
         return metrics
 
@@ -569,9 +576,7 @@ def test_transient_cleanup_keeps_previous_checkpoint_and_latest_pointer(tmp_path
     ("pending", "required_action", "transient"),
     [(True, "expand_train", True), (False, "scheduled", False)],
 )
-def test_hard_switch_uses_the_scratch_checkpoint_only_on_the_first_step(
-    tmp_path, pending, required_action, transient
-):
+def test_hard_switch_uses_the_scratch_checkpoint_only_on_the_first_step(tmp_path, pending, required_action, transient):
     namespace = _load_methods()
     previous = tmp_path / "global_step_0"
     previous.mkdir()
@@ -589,9 +594,7 @@ def test_hard_switch_uses_the_scratch_checkpoint_only_on_the_first_step(
         return {"resize/hard_switch_success": 1.0}
 
     trainer._apply_dynamic_resize_hard_switch_impl = impl
-    metrics = asyncio.run(
-        trainer._apply_dynamic_resize_hard_switch(item={"step": 1}, required_action=required_action)
-    )
+    metrics = asyncio.run(trainer._apply_dynamic_resize_hard_switch(item={"step": 1}, required_action=required_action))
 
     assert metrics == {"resize/hard_switch_success": 1.0}
     [(seen_action, folder, seen_transient)] = seen

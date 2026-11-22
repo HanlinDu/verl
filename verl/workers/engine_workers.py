@@ -29,6 +29,7 @@ from tensordict import NonTensorData, TensorDict
 from torch.distributed.device_mesh import init_device_mesh
 
 from verl.checkpoint_engine import CheckpointEngineRegistry
+from verl.checkpoint_engine.base import NAMED_GROUP_CHECKPOINT_BACKENDS, REBUILD_GROUP_CHECKPOINT_BACKENDS
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
@@ -738,9 +739,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             backend = self.config.rollout.checkpoint_engine.backend
             bucket_size = self.config.rollout.checkpoint_engine.update_weights_bucket_megabytes << 20
             engine_kwargs = dict(self.config.rollout.checkpoint_engine.engine_kwargs.get(backend, {}))
-            if group_name is not None and backend in {"nccl", "hccl"}:
+            if group_name is not None and backend in NAMED_GROUP_CHECKPOINT_BACKENDS:
                 engine_kwargs["group_name"] = group_name
-            if backend in {"nccl", "hccl", "kimi_ckpt_engine", "mooncake"}:
+            if backend in REBUILD_GROUP_CHECKPOINT_BACKENDS:
                 engine_kwargs["rebuild_group"] = rebuild_group
             import_external_libs(self.config.rollout.checkpoint_engine.custom_backend_module or None)
             self.checkpoint_engine = CheckpointEngineRegistry.new(
