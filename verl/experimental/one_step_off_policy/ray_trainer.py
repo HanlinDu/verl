@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import uuid
 from contextlib import nullcontext
 from pprint import pprint
@@ -584,6 +585,71 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             checkpoint_folder = os.path.join(os.getcwd(), checkpoint_folder)
         return os.path.join(checkpoint_folder, f"global_step_{self.global_steps}")
 
+    def _dynamic_resize_transient_checkpoint_folder(self) -> str:
+        """Scratch folder for a resize checkpoint that must not seed a resume.
+
+        It is deliberately outside the ``global_step_<N>`` namespace: the
+        normal resume path only follows ``latest_checkpointed_iteration.txt``,
+        and keeping this folder separate also prevents retention or a later
+        normal save from treating it as a training checkpoint.
+        """
+        checkpoint_folder = self.config.trainer.default_local_dir
+        if not os.path.isabs(checkpoint_folder):
+            checkpoint_folder = os.path.join(os.getcwd(), checkpoint_folder)
+        return os.path.join(
+            checkpoint_folder,
+            ".dynamic_resize_transient",
+            f"global_step_{self.global_steps}_{uuid.uuid4().hex}",
+        )
+
+    def _save_dynamic_resize_transient_checkpoint(self, checkpoint_step_folder: str) -> None:
+        """Save only worker state needed to rebuild the actor runtime.
+
+        Unlike ``_save_checkpoint`` this does not write dataloader state, a
+        remote/HDFS copy, or ``latest_checkpointed_iteration.txt``, and the
+        workers do not register the folder for retention. The checkpoint is
+        therefore usable by the current hard switch but is never selected by
+        the next process start.
+        """
+        strategy = str(OmegaConf.select(self.config, "actor_rollout_ref.actor.strategy", default=""))
+        if strategy not in {"fsdp", "fsdp2"}:
+            raise RuntimeError(
+                "transient resize checkpoint saving currently requires actor_rollout_ref.actor.strategy "
+                f"in {{fsdp, fsdp2}}, got {strategy!r}"
+            )
+        actor_path = os.path.join(checkpoint_step_folder, "actor")
+        self.actor_rollout_wg.save_checkpoint(
+            actor_path,
+            None,
+            self.global_steps,
+            max_ckpt_to_keep=None,
+            save_full_model_for_dynamic_resize=True,
+            transient=True,
+        )
+        if self.use_critic:
+            critic_path = os.path.join(checkpoint_step_folder, str(Role.Critic))
+            self.critic_wg.save_checkpoint(
+                critic_path,
+                None,
+                self.global_steps,
+                max_ckpt_to_keep=None,
+                save_full_model_for_dynamic_resize=True,
+                transient=True,
+            )
+
+    @staticmethod
+    def _remove_dynamic_resize_transient_checkpoint(checkpoint_step_folder: str) -> None:
+        try:
+            shutil.rmtree(checkpoint_step_folder)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            logger.warning(
+                "[one-step-off][resize] failed to remove transient checkpoint %s: %s",
+                checkpoint_step_folder,
+                exc,
+            )
+
     @staticmethod
     def _dynamic_resize_handoff_stage_dir(global_step_folder: str) -> str:
         return os.path.join(global_step_folder, "dynamic_resize_handoff")
@@ -1133,6 +1199,28 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
     async def _apply_dynamic_resize_hard_switch(
         self, *, item: dict[str, Any], required_action: str
     ) -> dict[str, float | str | int]:
+        """Run a hard switch, using an isolated scratch checkpoint on the opt-in first step."""
+        transient = bool(getattr(self, "_startup_fused_first_batch_pending", False))
+        transient_folder = self._dynamic_resize_transient_checkpoint_folder() if transient else None
+        try:
+            return await self._apply_dynamic_resize_hard_switch_impl(
+                item=item,
+                required_action=required_action,
+                checkpoint_step_folder=transient_folder,
+                transient=transient,
+            )
+        finally:
+            if transient_folder is not None:
+                self._remove_dynamic_resize_transient_checkpoint(transient_folder)
+
+    async def _apply_dynamic_resize_hard_switch_impl(
+        self,
+        *,
+        item: dict[str, Any],
+        required_action: str,
+        checkpoint_step_folder: str | None = None,
+        transient: bool = False,
+    ) -> dict[str, float | str | int]:
         actor_target, rollout_target = self._dynamic_resize_target_sizes(item)
         metrics: dict[str, float | str | int] = {
             "resize/hard_switch_enabled": 1.0,
@@ -1145,9 +1233,12 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             metrics.update({"resize/unsupported_reason": reason, "resize/pending_resource_switch": 1.0})
             return metrics
 
-        checkpoint_step_folder = self._dynamic_resize_checkpoint_step_folder()
+        checkpoint_step_folder = checkpoint_step_folder or self._dynamic_resize_checkpoint_step_folder()
         with marked_timer("dynamic_resize_save_checkpoint", self.timing_raw, color="green"):
-            self._save_checkpoint(save_full_model_for_dynamic_resize=True)
+            if transient:
+                self._save_dynamic_resize_transient_checkpoint(checkpoint_step_folder)
+            else:
+                self._save_checkpoint(save_full_model_for_dynamic_resize=True)
             metrics.update(self._prepare_dynamic_resize_handoff_session(checkpoint_step_folder))
             optimizer_stage_metrics = self._stage_dynamic_resize_optimizer_handoff(checkpoint_step_folder)
             metrics.update(optimizer_stage_metrics)
@@ -1485,6 +1576,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
         batch = batch.union(gen_batch_output)
 
+        if getattr(self, "_startup_fused_first_batch_pending", False):
+            await self._restore_startup_fused_batch(batch, metrics, timing_raw)
+
         if "response_mask" not in batch.batch.keys():
             batch.batch["response_mask"] = compute_response_mask(batch)
         # Balance the number of valid tokens across DP ranks.
@@ -1502,6 +1596,37 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
 
         # Return the original, now-modified `batch` and the `future_reward`
         return metrics, timing_raw, epoch, batch, future_reward
+
+    async def _restore_startup_fused_batch(self, batch, metrics, timing_raw):
+        """Restore the training split after generation, before balancing the retained rows."""
+        layout = (self._active_actor_size(), self._active_rollout_size())
+        if self.global_steps != 1 or layout != (2, 6):
+            raise RuntimeError(
+                f"startup-fused first batch requires step one with an active actor/rollout split of 2/6, got "
+                f"step={self.global_steps} split={layout}"
+            )
+        expected = int(self.config.data.train_batch_size) * int(self.config.actor_rollout_ref.rollout.n)
+        if len(batch) != expected or not {"responses", "rollout_log_probs"}.issubset(batch.batch.keys()):
+            raise RuntimeError(
+                "startup-fused first batch requires the complete first generation including rollout_log_probs, "
+                f"got {len(batch)} samples of {expected} with keys {sorted(batch.batch.keys())}"
+            )
+        restore = {
+            "step": 1,
+            "actor_pool": {"mode": "split", "from_pool": "shared_pool", "index": 0, "size": [4, 4]},
+            "rollout_pool": {"mode": "split", "from_pool": "shared_pool", "index": 1, "size": [4, 4]},
+            "release_old": False,
+        }
+        with marked_timer("startup_fused_restore", timing_raw):
+            restore_metrics = await self._apply_dynamic_resize_hard_switch(
+                item=restore, required_action="expand_train"
+            )
+        if restore_metrics.get("resize/hard_switch_success") != 1.0:
+            raise RuntimeError("startup-fused first batch failed to restore the actor/rollout split")
+        if (self._active_actor_size(), self._active_rollout_size()) != (4, 4):
+            raise RuntimeError("startup-fused first batch restore returned without the required 4/4 split")
+        metrics.update(restore_metrics)
+        self._startup_fused_first_batch_pending = False
 
     @staticmethod
     @ray.remote
@@ -1530,6 +1655,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
+        self._startup_fused_first_batch_pending = os.environ.get("VERL_STARTUP_FUSED_FIRST_BATCH") == "1"
+        if self._startup_fused_first_batch_pending and self.global_steps != 0:
+            raise RuntimeError("startup-fused first batch requires a fresh training run")
         self._fit_update_weights()
 
         # perform validation before training

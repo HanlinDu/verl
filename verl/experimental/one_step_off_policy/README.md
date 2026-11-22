@@ -296,6 +296,12 @@ python3 -m verl.experimental.one_step_off_policy.async_main_ppo \
      > - When `trainer.n_gpus_per_node + rollout.n_gpus_per_node > physical_gpus_per_node`,
      >   the required node count is `trainer.nnodes + rollout.nnodes`
 
+### Retain the first generation across startup resize
+
+For a fresh single-node eight-GPU dynamic-resize run, set `VERL_STARTUP_FUSED_FIRST_BATCH=1` in the trainer driver's environment. Configure `trainer.n_gpus_per_node=2`, `rollout.n_gpus_per_node=6`, the shared pool and hard switch, and `actor_rollout_ref.rollout.calculate_log_probs=true`. The flag defaults to off. Clear it to return to the ordinary startup path with your usual pool sizes.
+
+The first batch is generated once on the 2/6 split. After the responses and rollout log probabilities are joined to that batch, the trainer restores 4/4 before balancing rows or updating the actor. An incomplete batch or unsuccessful restore stops the run. Subsequent schedule entries use the ordinary training loop. This option targets fresh starts and does not select switch times or promise a speedup.
+
 ## Functional Support
 
 | Category           | Support Situation                                                                                               |

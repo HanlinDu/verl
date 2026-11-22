@@ -322,6 +322,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         global_step: int = 0,
         max_ckpt_to_keep=None,
         save_full_model_for_dynamic_resize: bool = False,
+        transient: bool = False,
     ):
         """
         Save an FSDP checkpoint for this rank.
@@ -339,14 +340,20 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             hdfs_path: Unused (for API compatibility).
             global_step: Current training step (used for bookkeeping).
             max_ckpt_to_keep: Number of recent checkpoints to retain.
+            save_full_model_for_dynamic_resize: Also write the rank-0 full model
+                used by the dynamic-resize rebuild path.
+            transient: Save a scratch checkpoint without retention bookkeeping.
+                It never registers as a resumable checkpoint and never deletes a
+                previously saved checkpoint.
         """
         if local_path is None:
             return
 
-        # record the previous global step
-        self.previous_global_step = global_step
+        if not transient:
+            # record the previous global step for normal resumable saves only
+            self.previous_global_step = global_step
 
-        if self.rank == 0:
+        if self.rank == 0 and not transient:
             self.ensure_checkpoint_capacity(max_ckpt_to_keep)
 
         local_path = local_mkdir_safe(local_path)
@@ -510,5 +517,5 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             # wait for rank0 to dump hf_model to local
             torch.distributed.barrier(group=self.process_group)
 
-        if self.rank == 0:
+        if self.rank == 0 and not transient:
             self.register_checkpoint(local_path, max_ckpt_to_keep)
