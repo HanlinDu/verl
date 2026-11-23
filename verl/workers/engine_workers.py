@@ -655,6 +655,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         global_step=0,
         max_ckpt_to_keep=None,
         save_full_model_for_dynamic_resize=False,
+        transient=False,
     ):
         return self.engine.save_checkpoint(
             local_path,
@@ -662,6 +663,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
             global_step,
             max_ckpt_to_keep,
             save_full_model_for_dynamic_resize=save_full_model_for_dynamic_resize,
+            **({"transient": True} if transient else {}),
         )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -1046,6 +1048,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         global_step=0,
         max_ckpt_to_keep=None,
         save_full_model_for_dynamic_resize=False,
+        transient=False,
     ):
         assert "actor" in self.role, "save_checkpoint only support actor role"
         self.actor.save_checkpoint(
@@ -1054,6 +1057,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             global_step,
             max_ckpt_to_keep,
             save_full_model_for_dynamic_resize=save_full_model_for_dynamic_resize,
+            **({"transient": True} if transient else {}),
         )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

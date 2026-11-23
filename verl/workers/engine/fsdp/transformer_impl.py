@@ -1008,6 +1008,7 @@ class FSDPEngine(BaseEngine):
         global_step: int = 0,
         max_ckpt_to_keep: Optional[int] = None,
         save_full_model_for_dynamic_resize: bool = False,
+        transient: bool = False,
         **kwargs,
     ) -> None:
         """
@@ -1025,6 +1026,7 @@ class FSDPEngine(BaseEngine):
             global_step=global_step,
             max_ckpt_to_keep=max_ckpt_to_keep,
             save_full_model_for_dynamic_resize=save_full_model_for_dynamic_resize,
+            transient=transient,
         )
 
         torch.distributed.barrier(group=getattr(self, "process_group", None))

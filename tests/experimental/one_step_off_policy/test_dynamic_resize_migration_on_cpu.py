@@ -142,7 +142,7 @@ def test_gpu_direct_hard_switch_moves_state_without_a_checkpoint_round_trip():
     cls = _load_methods(
         TRAINER,
         "OneStepOffRayTrainer",
-        {"_apply_dynamic_resize_hard_switch"},
+        {"_apply_dynamic_resize_hard_switch", "_apply_dynamic_resize_hard_switch_impl"},
         Any=Any,
         time=time,
         marked_timer=marked_timer,

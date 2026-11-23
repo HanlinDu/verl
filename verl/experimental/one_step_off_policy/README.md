@@ -305,6 +305,14 @@ is the configuration and `shell/run_dynamic_resize.sh` a single-node example (en
 model, data, pool size and the switch schedule, and `VERL_RESIZE_VERIFY=1` its verification version; extra
 command-line arguments are forwarded to hydra).
 
+### Retain the first generation across startup resize
+
+For a fresh single-node eight-GPU dynamic-resize run, set `VERL_STARTUP_FUSED_FIRST_BATCH=1` in the trainer driver's environment. Configure `trainer.n_gpus_per_node=2`, `rollout.n_gpus_per_node=6`, the shared pool and hard switch, and `actor_rollout_ref.rollout.calculate_log_probs=true`. The flag defaults to off. Clear it to return to the ordinary startup path with your usual pool sizes.
+
+The first batch is generated once on the 2/6 split. After the responses and rollout log probabilities are joined to that batch, the trainer restores 4/4 before balancing rows or updating the actor. An incomplete batch or unsuccessful restore stops the run. Subsequent schedule entries use the ordinary training loop. This option targets fresh starts and does not select switch times or promise a speedup.
+
+The restore keeps the configured handoff semantics: `backend: gpu_direct` moves the live actor state without writing or reading a checkpoint, while checkpoint-backed handoff uses a transient checkpoint outside the resumable `global_step_<N>` namespace and removes it before training continues.
+
 ## Functional Support
 
 | Category           | Support Situation                                                                                               |
